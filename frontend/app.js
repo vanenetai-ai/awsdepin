@@ -87,10 +87,12 @@ let accountsCache = [];
 let selectedAccounts = new Set();
 
 async function loadAccounts() {
+    const grid = document.getElementById('accounts-grid');
+    if (grid) grid.innerHTML = '<div class="loading-spinner"><div class="spinner"></div><span>加载账号中...</span></div>';
     try {
         accountsCache = await api('/accounts');
         renderAccountCards(accountsCache);
-    } catch (e) { toast(e.message, 'error'); }
+    } catch (e) { toast(e.message, 'error'); if (grid) grid.innerHTML = ''; }
 }
 
 function renderAccountCards(list) {
@@ -180,21 +182,27 @@ async function batchDeleteSelected() {
 }
 
 async function detectAccount(id) {
+    const btn = event?.target;
+    if (btn) btn.classList.add('loading');
     toast('正在检测账号信息...', 'info');
     try {
         const res = await api(`/accounts/${id}/detect`, { method: 'POST' });
         toast(`检测完成: ${res.email || res.name}`);
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
+    finally { if (btn) btn.classList.remove('loading'); }
 }
 
 async function detectAllAccounts() {
+    const btn = event?.target;
+    if (btn) { btn.classList.add('loading'); btn.textContent = '检测中...'; }
     toast('正在并发检测所有账号...', 'info');
     try {
         const res = await api('/accounts/detect-all', { method: 'POST' });
         toast(`检测完成: ${res.detected} 成功, ${res.errors} 失败`);
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
+    finally { if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
 }
 
 async function showVcpuDetail(id) {

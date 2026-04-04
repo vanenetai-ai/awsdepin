@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 线程池用于并发执行 AWS 等阻塞操作
-executor = ThreadPoolExecutor(max_workers=20)
+executor = ThreadPoolExecutor(max_workers=50)
 
 
 @asynccontextmanager
