@@ -1,6 +1,19 @@
 version: '3.8'
 
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: aws-depin-db
+    environment:
+      POSTGRES_USER: depin
+      POSTGRES_PASSWORD: depin123
+      POSTGRES_DB: depin
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -10,11 +23,12 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      - ./backend/depin_scripts:/app/depin_scripts
     env_file:
       - .env
     environment:
-      - DATABASE_URL=sqlite:///./data/app.db
+      - DATABASE_URL=postgresql://depin:depin123@db:5432/depin
+    depends_on:
+      - db
     restart: unless-stopped
 
   frontend:
@@ -28,3 +42,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  pgdata:

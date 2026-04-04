@@ -2,11 +2,14 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://depin:depin123@localhost:5432/depin")
 
-os.makedirs("data", exist_ok=True)
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    os.makedirs("data", exist_ok=True)
+    connect_args = {"check_same_thread": False}
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_size=20, max_overflow=10)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
