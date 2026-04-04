@@ -683,7 +683,7 @@ async def test_proxy(proxy_id: int, user: User = Depends(get_current_user), db: 
             auth = f"{proxy.username}:{proxy.password}@"
         proxy_url = f"{proxy.protocol}://{auth}{proxy.host}:{proxy.port}"
         try:
-            with hx.Client(proxy=proxy_url, timeout=15) as client:
+            with hx.Client(proxies={"http://": proxy_url, "https://": proxy_url}, timeout=15) as client:
                 resp = client.get("https://api.ipify.org?format=json")
                 ip = resp.json().get("ip", "unknown")
                 return {"ok": True, "ip": ip, "proxy": f"{proxy.host}:{proxy.port}"}
@@ -708,7 +708,7 @@ async def test_all_proxies(user: User = Depends(get_current_user), db: Session =
                 auth = f"{p.username}:{p.password}@"
             proxy_url = f"{p.protocol}://{auth}{p.host}:{p.port}"
             try:
-                with hx.Client(proxy=proxy_url, timeout=10) as client:
+                with hx.Client(proxies={"http://": proxy_url, "https://": proxy_url}, timeout=10) as client:
                     resp = client.get("https://api.ipify.org?format=json")
                     ip = resp.json().get("ip", "unknown")
                     return {"id": p.id, "ok": True, "ip": ip}
