@@ -337,17 +337,26 @@ class AwsManager:
             try:
                 import time, csv, io
                 iam = self._get_client("iam")
-                iam.generate_credential_report()
-                time.sleep(2)  # 等待报告生成
+                try:
+                    iam.generate_credential_report()
+                except Exception:
+                    pass
+                time.sleep(3)  # 等待报告生成
                 resp = iam.get_credential_report()
                 report = resp["Content"].decode("utf-8")
                 reader = csv.DictReader(io.StringIO(report))
                 for row in reader:
-                    if row.get("user") == "<root_account>":
-                        arn_val = row.get("arn", "")
-                        # root ARN 格式: arn:aws:iam::ACCOUNT_ID:root
-                        # 但 credential report 没有直接的邮箱字段
-                        # 不过 user 列有时包含邮箱
+                    user = row.get("user", "")
+                    arn_val = row.get("arn", "")
+                    # root 账号的 user 列就是邮箱地址
+                    if ":root" in arn_val or user == "<root_account>":
+                        # 某些报告中 user 列直接是邮箱
+                        if "@" in user:
+                            result["email"] = user
+                            break
+                    # 也检查其他用户行中是否有邮箱格式的 user
+                    elif "@" in user:
+                        result["email"] = user
                         break
             except Exception:
                 pass

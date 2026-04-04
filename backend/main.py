@@ -205,13 +205,31 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
 
 @app.post("/api/accounts")
 async def create_account(data: AccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # 检查代理池是否有可用代理
+    from proxy_manager import ProxyManager
+    pm = ProxyManager(db)
+    if not pm.get_all():
+        raise HTTPException(400, "请先添加代理！账号操作必须通过代理进行")
+
     account = AwsAccount(user_id=user.id, **data.model_dump())
     db.add(account)
     db.commit()
     db.refresh(account)
-    # 并发验证凭证
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, lambda: AwsManager(account, db, use_proxy=False).verify_credentials())
+
+    # 验证凭证 + 自动检测账号信息 (使用代理)
+    def _verify_and_detect():
+        mgr = AwsManager(account, db, use_proxy=True)
+        result = mgr.verify_credentials()
+        if result.get("valid"):
+            try:
+                mgr.detect_account_info()
+            except Exception as e:
+                logger.warning(f"Auto detect failed for account {account.id}: {e}")
+        return result
+
+    result = await loop.run_in_executor(executor, _verify_and_detect)
+    db.refresh(account)
     return {"id": account.id, "name": account.name, "verify": result}
 
 @app.put("/api/accounts/{account_id}")
@@ -232,6 +250,12 @@ def delete_account(account_id: int, user: User = Depends(get_current_user), db: 
 @app.post("/api/accounts/batch")
 async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """批量添加账号 - 支持多种格式，每行一个"""
+    # 检查代理池
+    from proxy_manager import ProxyManager
+    pm = ProxyManager(db)
+    if not pm.get_all():
+        raise HTTPException(400, "请先添加代理！账号操作必须通过代理进行")
+
     lines = [l.strip() for l in data.text.strip().split('\n') if l.strip()]
     created, errors = [], []
     loop = asyncio.get_event_loop()
@@ -240,11 +264,9 @@ async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(g
         try:
             parts = line.split()
             if len(parts) == 2:
-                # AccessKeyId SecretAccessKey
                 name = f"account-{idx+1}"
                 ak, sk = parts[0], parts[1]
             elif len(parts) >= 3:
-                # 名称 AccessKeyId SecretAccessKey [...]
                 name, ak, sk = parts[0], parts[1], parts[2]
             else:
                 errors.append({"line": idx+1, "error": "格式错误，至少需要 AccessKeyId 和 SecretAccessKey"})
@@ -259,12 +281,20 @@ async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(g
             db.commit()
             db.refresh(account)
 
-            # 并发验证
-            result = await loop.run_in_executor(
-                executor,
-                lambda a=account: AwsManager(a, db, use_proxy=True).verify_credentials()
-            )
-            created.append({"id": account.id, "name": name, "verify": result})
+            # 验证 + 自动检测 (使用代理)
+            def _verify_and_detect(a=account):
+                mgr = AwsManager(a, db, use_proxy=True)
+                result = mgr.verify_credentials()
+                if result.get("valid"):
+                    try:
+                        mgr.detect_account_info()
+                    except Exception:
+                        pass
+                return result
+
+            result = await loop.run_in_executor(executor, _verify_and_detect)
+            db.refresh(account)
+            created.append({"id": account.id, "name": account.email or name, "verify": result})
         except Exception as e:
             errors.append({"line": idx+1, "error": str(e)})
 
