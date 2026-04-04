@@ -168,26 +168,39 @@ def _get_user_proxy(db: Session, user: User, proxy_id: int) -> Proxy:
 def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     from aws_manager import COUNTRY_FLAGS
     accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).order_by(AwsAccount.id).all()
-    return [
-        {
-            "id": a.id, "name": a.name, "default_region": a.default_region,
-            "is_active": a.is_active, "created_at": str(a.created_at),
-            "access_key_id": a.access_key_id[:16] + "..." if len(a.access_key_id) > 16 else a.access_key_id,
-            "instance_count": len(a.instances),
-            "email": a.email or "",
-            "aws_account_id": a.aws_account_id or "",
-            "arn": a.arn or "",
-            "register_country": a.register_country or "",
-            "country_flag": COUNTRY_FLAGS.get(a.register_country or "", ""),
-            "register_time": str(a.register_time) if a.register_time else None,
-            "added_at": str(a.added_at) if a.added_at else str(a.created_at),
-            "note": a.note or "",
-            "group_name": a.group_name or "",
-            "total_vcpus": a.total_vcpus or 0,
-            "vcpu_data": a.vcpu_data,
-        }
-        for a in accounts
-    ]
+    result = []
+    for a in accounts:
+        try:
+            result.append({
+                "id": a.id, "name": a.name, "default_region": a.default_region,
+                "is_active": a.is_active, "created_at": str(a.created_at),
+                "access_key_id": a.access_key_id[:16] + "..." if len(a.access_key_id) > 16 else a.access_key_id,
+                "instance_count": len(a.instances),
+                "email": getattr(a, 'email', '') or "",
+                "aws_account_id": getattr(a, 'aws_account_id', '') or "",
+                "arn": getattr(a, 'arn', '') or "",
+                "register_country": getattr(a, 'register_country', '') or "",
+                "country_flag": COUNTRY_FLAGS.get(getattr(a, 'register_country', '') or "", ""),
+                "register_time": str(a.register_time) if getattr(a, 'register_time', None) else None,
+                "added_at": str(a.added_at) if getattr(a, 'added_at', None) else str(a.created_at),
+                "note": getattr(a, 'note', '') or "",
+                "group_name": getattr(a, 'group_name', '') or "",
+                "total_vcpus": getattr(a, 'total_vcpus', 0) or 0,
+                "vcpu_data": getattr(a, 'vcpu_data', None),
+            })
+        except Exception as e:
+            logger.error(f"Error serializing account {a.id}: {e}")
+            result.append({
+                "id": a.id, "name": a.name, "default_region": a.default_region,
+                "is_active": a.is_active, "created_at": str(a.created_at),
+                "access_key_id": a.access_key_id[:16] + "...",
+                "instance_count": len(a.instances),
+                "email": "", "aws_account_id": "", "arn": "",
+                "register_country": "", "country_flag": "",
+                "register_time": None, "added_at": str(a.created_at),
+                "note": "", "group_name": "", "total_vcpus": 0, "vcpu_data": None,
+            })
+    return result
 
 @app.post("/api/accounts")
 async def create_account(data: AccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
