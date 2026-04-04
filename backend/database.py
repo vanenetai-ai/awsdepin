@@ -44,6 +44,7 @@ def _migrate_db():
         ("aws_accounts", "note", "TEXT DEFAULT ''"),
         ("aws_accounts", "group_name", "VARCHAR(100) DEFAULT ''"),
         ("aws_accounts", "total_vcpus", "INTEGER DEFAULT 0"),
+        ("aws_accounts", "max_on_demand", "INTEGER DEFAULT 0"),
         ("aws_accounts", "vcpu_data", "JSON" if not DATABASE_URL.startswith("postgres") else "JSONB"),
     ]
 
