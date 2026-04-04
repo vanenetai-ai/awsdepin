@@ -312,12 +312,13 @@ class AwsManager:
             logger.error(f"STS failed: {e}")
             return result
 
-        # 方法1: IAM 账号别名
+        # 方法1: Account get-contact-information (最直接，需要账单权限)
         try:
-            iam = self._get_client("iam")
-            aliases = iam.list_account_aliases().get("AccountAliases", [])
-            if aliases:
-                result["email"] = aliases[0]
+            account_client = self._get_client("account", "us-east-1")
+            contact = account_client.get_contact_information()
+            email = contact.get("ContactInformation", {}).get("EmailAddress", "")
+            if email:
+                result["email"] = email
         except Exception:
             pass
 
@@ -332,7 +333,17 @@ class AwsManager:
             except Exception:
                 pass
 
-        # 方法3: IAM credential report 获取 root 邮箱
+        # 方法3: IAM 账号别名
+        if not result["email"]:
+            try:
+                iam = self._get_client("iam")
+                aliases = iam.list_account_aliases().get("AccountAliases", [])
+                if aliases:
+                    result["email"] = aliases[0]
+            except Exception:
+                pass
+
+        # 方法4: IAM credential report 获取 root 邮箱
         if not result["email"]:
             try:
                 import time, csv, io
@@ -400,18 +411,17 @@ class AwsManager:
 
     def get_account_country(self) -> str:
         """尝试检测账号注册国家"""
+        # 方法1: 通过 account contact information 获取国家代码
         try:
-            # 通过 organizations
-            sts = self._get_client("sts")
-            identity = sts.get_caller_identity()
-            account_id = identity["Account"]
-            org = self._get_client("organizations")
-            acct = org.describe_account(AccountId=account_id)
-            # organizations 没有直接的 country 字段，但可以从 billing 推断
+            account_client = self._get_client("account", "us-east-1")
+            contact = account_client.get_contact_information()
+            country = contact.get("ContactInformation", {}).get("CountryCode", "")
+            if country:
+                return country
         except Exception:
             pass
 
-        # 通过默认区域推断国家
+        # 方法2: 通过默认区域推断国家
         region = self.account.default_region
         region_country = {
             "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
