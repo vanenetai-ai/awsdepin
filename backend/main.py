@@ -401,8 +401,9 @@ def list_instances(account_id: Optional[int] = None, user: User = Depends(get_cu
             "region": i.region, "instance_type": i.instance_type, "state": i.state,
             "public_ip": i.public_ip, "private_ip": i.private_ip,
             "created_at": str(i.created_at),
-            "account_name": i.account.name if i.account else "",
+            "account_name": i.account.email or i.account.name if i.account else "",
             "task_count": len(i.depin_tasks),
+            "projects": ", ".join(set(t.project.name for t in i.depin_tasks if t.project)) or "-",
         }
         for i in instances
     ]
@@ -864,6 +865,20 @@ async def batch_deploy(data: BatchDeployRequest, user: User = Depends(get_curren
 
     await asyncio.gather(*[_deploy_one(i) for i in data.instance_ids])
     return {"deployed": results, "errors": errors}
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """删除部署任务"""
+    task = (
+        db.query(DepinTask).join(Instance).join(AwsAccount)
+        .filter(DepinTask.id == task_id, AwsAccount.user_id == user.id)
+        .first()
+    )
+    if not task:
+        raise HTTPException(404, "Task not found")
+    db.delete(task)
+    db.commit()
+    return {"ok": True}
 
 @app.post("/api/tasks/{task_id}/health")
 async def check_task_health(task_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):

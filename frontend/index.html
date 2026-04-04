@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405d">
+    <link rel="stylesheet" href="style.css?v=20260405e">
 </head>
 <body>
     <nav class="sidebar">
@@ -68,7 +68,7 @@
                     <thead>
                         <tr>
                             <th>ID</th><th>账号</th><th>实例ID</th><th>区域</th>
-                            <th>类型</th><th>状态</th><th>公网IP</th><th>任务</th><th>操作</th>
+                            <th>类型</th><th>状态</th><th>公网IP</th><th>项目</th><th>任务</th><th>操作</th>
                         </tr>
                     </thead>
                     <tbody></tbody>
@@ -203,6 +203,10 @@
                         <option value="m5.large">m5.large (2C/8G)</option>
                     </select>
                 </div>
+                <div class="form-group">
+                    <label>数量 (批量启动)</label>
+                    <input type="number" id="launch-count" value="1" min="1" max="20" placeholder="1">
+                </div>
                 <button type="submit" class="btn btn-primary btn-block">启动实例</button>
             </form>
         </div>
@@ -280,8 +284,8 @@
             </div>
             <form onsubmit="deployTask(event)">
                 <div class="form-group">
-                    <label>选择实例</label>
-                    <select id="deploy-instance"></select>
+                    <label>选择实例 (可多选，按住 Ctrl 批量部署)</label>
+                    <select id="deploy-instance" multiple size="5" style="min-height:100px"></select>
                 </div>
                 <div class="form-group">
                     <label>选择项目</label>
@@ -391,6 +395,6 @@
 
     <div class="toast-container" id="toast-container"></div>
 
-    <script src="app.js?v=20260405d"></script>
+    <script src="app.js?v=20260405e"></script>
 </body>
 </html>

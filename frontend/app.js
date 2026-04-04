@@ -319,7 +319,8 @@ async function loadInstances() {
         const list = await api('/instances');
         document.querySelector('#instances-table tbody').innerHTML = list.map(i => `<tr>
             <td>${i.id}</td><td>${i.account_name}</td><td><code>${i.instance_id || '-'}</code></td><td>${i.region}</td>
-            <td>${i.instance_type}</td><td>${stateBadge(i.state)}</td><td>${i.public_ip || '-'}</td><td>${i.task_count}</td>
+            <td>${i.instance_type}</td><td>${stateBadge(i.state)}</td><td>${i.public_ip || '-'}</td>
+            <td>${i.projects || '-'}</td><td>${i.task_count}</td>
             <td class="action-btns">
                 <button class="btn btn-sm btn-secondary" onclick="syncInstance(${i.id})">同步</button>
                 ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="startInstance(${i.id})">启动</button>` : ''}
@@ -328,7 +329,25 @@ async function loadInstances() {
             </td></tr>`).join('');
     } catch (e) { toast(e.message, 'error'); }
 }
-async function launchInstance(e) { e.preventDefault(); try { const data = { account_id: parseInt(document.getElementById('launch-account').value), region: document.getElementById('launch-region').value || null, instance_type: document.getElementById('launch-type').value }; const res = await api('/instances/launch', { method: 'POST', body: JSON.stringify(data) }); hideModal('launch-modal'); toast(`实例已启动: ${res.instance_id}`); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
+async function launchInstance(e) {
+    e.preventDefault();
+    try {
+        const count = parseInt(document.getElementById('launch-count').value) || 1;
+        const accountId = parseInt(document.getElementById('launch-account').value);
+        const region = document.getElementById('launch-region').value || null;
+        const instanceType = document.getElementById('launch-type').value;
+        if (count > 1) {
+            const res = await api('/instances/batch-launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType, count }) });
+            hideModal('launch-modal');
+            toast(`批量启动: ${res.launched?.length || 0} 成功, ${res.errors?.length || 0} 失败`);
+        } else {
+            const res = await api('/instances/launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType }) });
+            hideModal('launch-modal');
+            toast(`实例已启动: ${res.instance_id}`);
+        }
+        loadInstances();
+    } catch (e) { toast(e.message, 'error'); }
+}
 async function syncInstance(id) { try { const res = await api(`/instances/${id}/sync`, { method: 'POST' }); toast(`已同步: ${res.state}`); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
 async function startInstance(id) { try { await api(`/instances/${id}/start`, { method: 'POST' }); toast('启动指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
 async function stopInstance(id) { try { await api(`/instances/${id}/stop`, { method: 'POST' }); toast('停止指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
@@ -396,10 +415,36 @@ async function loadTasks() {
         document.querySelector('#tasks-table tbody').innerHTML = list.map(t => `<tr>
             <td>${t.id}</td><td>${t.project_name}</td><td>${t.instance_ip || '-'}</td><td>${stateBadge(t.status)}</td>
             <td title="${t.log || ''}">${(t.log || '-').substring(0, 40)}</td><td>${t.created_at}</td>
-            <td class="action-btns"><button class="btn btn-sm btn-secondary" onclick="checkHealth(${t.id})">健康检查</button></td></tr>`).join('');
+            <td class="action-btns">
+                <button class="btn btn-sm btn-secondary" onclick="checkHealth(${t.id})">健康检查</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteTask(${t.id})">删除</button>
+            </td></tr>`).join('');
     } catch (e) { toast(e.message, 'error'); }
 }
-async function deployTask(e) { e.preventDefault(); try { const cf = {}; document.querySelectorAll('#deploy-config-fields input').forEach(f => { if (f.value) cf[f.dataset.key] = f.value; }); const res = await api('/tasks/deploy', { method: 'POST', body: JSON.stringify({ instance_id: parseInt(document.getElementById('deploy-instance').value), project_id: parseInt(document.getElementById('deploy-project').value), config: Object.keys(cf).length ? cf : null }) }); hideModal('deploy-modal'); toast(`部署: ${res.status}`); loadTasks(); } catch (e) { toast(e.message, 'error'); } }
+async function deployTask(e) {
+    e.preventDefault();
+    try {
+        const cf = {};
+        document.querySelectorAll('#deploy-config-fields input').forEach(f => { if (f.value) cf[f.dataset.key] = f.value; });
+        const projectId = parseInt(document.getElementById('deploy-project').value);
+        const config = Object.keys(cf).length ? cf : null;
+        const selected = Array.from(document.getElementById('deploy-instance').selectedOptions).map(o => parseInt(o.value));
+        if (selected.length > 1) {
+            const res = await api('/tasks/batch-deploy', { method: 'POST', body: JSON.stringify({ instance_ids: selected, project_id: projectId, config }) });
+            hideModal('deploy-modal');
+            toast(`批量部署: ${res.deployed?.length || 0} 成功, ${res.errors?.length || 0} 失败`);
+        } else {
+            const res = await api('/tasks/deploy', { method: 'POST', body: JSON.stringify({ instance_id: selected[0], project_id: projectId, config }) });
+            hideModal('deploy-modal');
+            toast(`部署: ${res.status}`);
+        }
+        loadTasks();
+    } catch (e) { toast(e.message, 'error'); }
+}
+async function deleteTask(id) {
+    if (!confirm('确定删除此部署任务？')) return;
+    try { await api(`/tasks/${id}`, { method: 'DELETE' }); toast('任务已删除'); loadTasks(); } catch (e) { toast(e.message, 'error'); }
+}
 async function checkHealth(id) { try { const res = await api(`/tasks/${id}/health`, { method: 'POST' }); toast(`健康检查: ${res.status} ${res.message || ''}`, 'info'); } catch (e) { toast(e.message, 'error'); } }
 
 // ==================== Helpers ====================
