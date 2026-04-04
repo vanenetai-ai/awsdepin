@@ -9,10 +9,44 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+TOKEN_FILE = os.path.join(os.getenv("DATA_DIR", "data"), "bot_token.txt")
 
 _running = False
 _task = None
-_bot_token = BOT_TOKEN
+_bot_token = ""
+
+
+def _load_token():
+    """从文件加载持久化的 bot token"""
+    global _bot_token
+    # 优先用环境变量
+    if BOT_TOKEN:
+        _bot_token = BOT_TOKEN
+        return
+    # 从文件读取
+    try:
+        if os.path.exists(TOKEN_FILE):
+            with open(TOKEN_FILE, "r") as f:
+                t = f.read().strip()
+                if t:
+                    _bot_token = t
+                    logger.info("Bot token loaded from file")
+    except Exception as e:
+        logger.error(f"Failed to load bot token: {e}")
+
+
+def _save_token(token: str):
+    """持久化 bot token 到文件"""
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        with open(TOKEN_FILE, "w") as f:
+            f.write(token)
+    except Exception as e:
+        logger.error(f"Failed to save bot token: {e}")
+
+
+# 启动时加载
+_load_token()
 
 
 def get_tg_api():
@@ -22,6 +56,7 @@ def get_tg_api():
 def set_bot_token(token: str):
     global _bot_token
     _bot_token = token
+    _save_token(token)
 
 
 def get_bot_token():
