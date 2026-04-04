@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 - AWS DePIN 管理平台</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .login-page {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: var(--bg);
+        }
+        .login-card {
+            background: var(--bg2);
+            border-radius: 16px;
+            padding: 48px 40px;
+            text-align: center;
+            max-width: 420px;
+            width: 90%;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        }
+        .login-card .logo-icon { font-size: 48px; display: block; margin-bottom: 16px; }
+        .login-card h1 { color: var(--text); margin-bottom: 8px; font-size: 24px; }
+        .login-card p { color: var(--text2); margin-bottom: 24px; }
+        .login-status { margin-top: 20px; padding: 16px; border-radius: 8px; }
+        .login-status.loading { background: rgba(99,102,241,0.1); color: var(--primary); }
+        .login-status.success { background: rgba(34,197,94,0.1); color: #22c55e; }
+        .login-status.error { background: rgba(239,68,68,0.1); color: #ef4444; }
+        .tg-link {
+            display: inline-flex; align-items: center; gap: 8px;
+            background: #2AABEE; color: white; padding: 12px 24px;
+            border-radius: 8px; text-decoration: none; font-weight: 600;
+            margin-top: 16px; transition: opacity 0.2s;
+        }
+        .tg-link:hover { opacity: 0.9; }
+    </style>
+</head>
+<body class="login-page">
+    <div class="login-card">
+        <span class="logo-icon">⛓</span>
+        <h1>AWS DePIN 管理平台</h1>
+        <p>通过 Telegram 机器人获取登录链接</p>
+
+        <div id="login-status" class="login-status loading">正在验证登录信息...</div>
+
+        <a class="tg-link" href="https://t.me/aws_depin_bot" target="_blank" id="tg-btn" style="display:none">
+            🤖 打开 Telegram 获取登录链接
+        </a>
+    </div>
+
+    <script>
+        (function() {
+            const params = new URLSearchParams(window.location.search);
+            const token = params.get('token');
+            const statusEl = document.getElementById('login-status');
+            const tgBtn = document.getElementById('tg-btn');
+
+            if (!token) {
+                statusEl.className = 'login-status error';
+                statusEl.textContent = '未提供登录凭证，请通过 Telegram 机器人获取登录链接';
+                tgBtn.style.display = 'inline-flex';
+                return;
+            }
+
+            fetch('/api/auth/login?token=' + encodeURIComponent(token), { method: 'POST' })
+                .then(r => {
+                    if (!r.ok) return r.json().then(e => { throw new Error(e.detail || '登录失败'); });
+                    return r.json();
+                })
+                .then(data => {
+                    localStorage.setItem('auth_token', data.token);
+                    localStorage.setItem('user_name', data.display_name);
+                    statusEl.className = 'login-status success';
+                    statusEl.textContent = '登录成功！欢迎 ' + data.display_name + '，正在跳转...';
+                    setTimeout(() => { window.location.href = '/'; }, 1000);
+                })
+                .catch(err => {
+                    statusEl.className = 'login-status error';
+                    statusEl.textContent = err.message;
+                    tgBtn.style.display = 'inline-flex';
+                });
+        })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AWS DePIN 管理平台</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="logo">
+            <span class="logo-icon">⛓</span>
+            <span>DePIN Manager</span>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item active" data-tab="dashboard"><span>📊</span> 仪表盘</li>
+            <li class="nav-item" data-tab="accounts"><span>🔑</span> AWS 账号</li>
+            <li class="nav-item" data-tab="instances"><span>🖥</span> 实例管理</li>
+            <li class="nav-item" data-tab="proxies"><span>🔄</span> 代理管理</li>
+            <li class="nav-item" data-tab="projects"><span>📦</span> DePIN 项目</li>
+            <li class="nav-item" data-tab="tasks"><span>🚀</span> 部署任务</li>
+        </ul>
+        <div class="nav-footer">
+            <div class="user-bar">
+                <span>👤</span>
+                <span id="user-info">用户</span>
+            </div>
+            <button class="btn btn-sm btn-secondary" onclick="logout()" style="width:100%;margin-top:8px;">退出登录</button>
+        </div>
+    </nav>
+
+    <main class="content">
+        <!-- Dashboard -->
+        <section id="tab-dashboard" class="tab-content active">
+            <h2>仪表盘</h2>
+            <div class="stats-grid" id="stats-grid"></div>
+        </section>
+
+        <!-- Accounts -->
+        <section id="tab-accounts" class="tab-content">
+            <div class="tab-header">
+                <h2>AWS 账号管理</h2>
+                <button class="btn btn-primary" onclick="showModal('account-modal')">+ 添加账号</button>
+            </div>
+            <div class="table-wrap">
+                <table id="accounts-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th><th>名称</th><th>Access Key</th><th>区域</th>
+                            <th>实例数</th><th>状态</th><th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Instances -->
+        <section id="tab-instances" class="tab-content">
+            <div class="tab-header">
+                <h2>实例管理</h2>
+                <div>
+                    <button class="btn btn-secondary" onclick="syncAllInstances()">🔄 同步全部</button>
+                    <button class="btn btn-primary" onclick="showModal('launch-modal')">+ 启动实例</button>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table id="instances-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th><th>账号</th><th>实例ID</th><th>区域</th>
+                            <th>类型</th><th>状态</th><th>公网IP</th><th>任务</th><th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Proxies -->
+        <section id="tab-proxies" class="tab-content">
+            <div class="tab-header">
+                <h2>旋转代理管理</h2>
+                <button class="btn btn-primary" onclick="showModal('proxy-modal')">+ 添加代理</button>
+            </div>
+            <div class="table-wrap">
+                <table id="proxies-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th><th>协议</th><th>地址</th><th>端口</th>
+                            <th>用户名</th><th>状态</th><th>最后使用</th><th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Projects -->
+        <section id="tab-projects" class="tab-content">
+            <div class="tab-header">
+                <h2>DePIN 项目</h2>
+                <button class="btn btn-primary" onclick="showModal('project-modal')">+ 添加项目</button>
+            </div>
+            <div class="cards-grid" id="projects-grid"></div>
+        </section>
+
+        <!-- Tasks -->
+        <section id="tab-tasks" class="tab-content">
+            <div class="tab-header">
+                <h2>部署任务</h2>
+                <button class="btn btn-primary" onclick="showModal('deploy-modal')">+ 新建部署</button>
+            </div>
+            <div class="table-wrap">
+                <table id="tasks-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th><th>项目</th><th>实例IP</th>
+                            <th>状态</th><th>日志</th><th>创建时间</th><th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- Modals -->
+    <div class="modal-overlay" id="account-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>添加 AWS 账号</h3>
+                <button class="modal-close" onclick="hideModal('account-modal')">&times;</button>
+            </div>
+            <form onsubmit="createAccount(event)">
+                <div class="form-group">
+                    <label>账号名称</label>
+                    <input type="text" id="acc-name" required placeholder="例: my-aws-account">
+                </div>
+                <div class="form-group">
+                    <label>Access Key ID</label>
+                    <input type="text" id="acc-key" required placeholder="AKIA...">
+                </div>
+                <div class="form-group">
+                    <label>Secret Access Key</label>
+                    <input type="password" id="acc-secret" required>
+                </div>
+                <div class="form-group">
+                    <label>默认区域</label>
+                    <select id="acc-region">
+                        <option value="us-east-1">us-east-1 (弗吉尼亚)</option>
+                        <option value="us-east-2">us-east-2 (俄亥俄)</option>
+                        <option value="us-west-1">us-west-1 (加利福尼亚)</option>
+                        <option value="us-west-2">us-west-2 (俄勒冈)</option>
+                        <option value="eu-west-1">eu-west-1 (爱尔兰)</option>
+                        <option value="eu-central-1">eu-central-1 (法兰克福)</option>
+                        <option value="ap-southeast-1">ap-southeast-1 (新加坡)</option>
+                        <option value="ap-northeast-1">ap-northeast-1 (东京)</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">添加并验证</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="launch-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>启动 EC2 实例</h3>
+                <button class="modal-close" onclick="hideModal('launch-modal')">&times;</button>
+            </div>
+            <form onsubmit="launchInstance(event)">
+                <div class="form-group">
+                    <label>选择账号</label>
+                    <select id="launch-account"></select>
+                </div>
+                <div class="form-group">
+                    <label>区域</label>
+                    <select id="launch-region">
+                        <option value="">使用默认区域</option>
+                        <option value="us-east-1">us-east-1</option>
+                        <option value="us-east-2">us-east-2</option>
+                        <option value="us-west-1">us-west-1</option>
+                        <option value="us-west-2">us-west-2</option>
+                        <option value="eu-west-1">eu-west-1</option>
+                        <option value="eu-central-1">eu-central-1</option>
+                        <option value="ap-southeast-1">ap-southeast-1</option>
+                        <option value="ap-northeast-1">ap-northeast-1</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>实例类型</label>
+                    <select id="launch-type">
+                        <option value="t3.micro">t3.micro (1C/1G)</option>
+                        <option value="t3.small">t3.small (1C/2G)</option>
+                        <option value="t3.medium">t3.medium (2C/4G)</option>
+                        <option value="t3.large">t3.large (2C/8G)</option>
+                        <option value="t3.xlarge">t3.xlarge (4C/16G)</option>
+                        <option value="c5.large">c5.large (2C/4G)</option>
+                        <option value="m5.large">m5.large (2C/8G)</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">启动实例</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="proxy-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>添加代理</h3>
+                <button class="modal-close" onclick="hideModal('proxy-modal')">&times;</button>
+            </div>
+            <form onsubmit="createProxy(event)">
+                <div class="form-group">
+                    <label>协议</label>
+                    <select id="proxy-protocol">
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                        <option value="socks5">SOCKS5</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>地址</label>
+                    <input type="text" id="proxy-host" required placeholder="1.2.3.4">
+                </div>
+                <div class="form-group">
+                    <label>端口</label>
+                    <input type="number" id="proxy-port" required placeholder="8080">
+                </div>
+                <div class="form-group">
+                    <label>用户名 (可选)</label>
+                    <input type="text" id="proxy-user">
+                </div>
+                <div class="form-group">
+                    <label>密码 (可选)</label>
+                    <input type="password" id="proxy-pass">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">添加代理</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="project-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>添加 DePIN 项目</h3>
+                <button class="modal-close" onclick="hideModal('project-modal')">&times;</button>
+            </div>
+            <form onsubmit="createProject(event)">
+                <div class="form-group">
+                    <label>项目名称</label>
+                    <input type="text" id="proj-name" required>
+                </div>
+                <div class="form-group">
+                    <label>描述</label>
+                    <input type="text" id="proj-desc">
+                </div>
+                <div class="form-group">
+                    <label>安装脚本</label>
+                    <textarea id="proj-script" rows="8" required placeholder="#!/bin/bash"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>健康检查命令</label>
+                    <input type="text" id="proj-health" placeholder="docker ps --filter name=xxx">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">添加项目</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="deploy-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>部署 DePIN 项目</h3>
+                <button class="modal-close" onclick="hideModal('deploy-modal')">&times;</button>
+            </div>
+            <form onsubmit="deployTask(event)">
+                <div class="form-group">
+                    <label>选择实例</label>
+                    <select id="deploy-instance"></select>
+                </div>
+                <div class="form-group">
+                    <label>选择项目</label>
+                    <select id="deploy-project" onchange="loadProjectConfig()"></select>
+                </div>
+                <div id="deploy-config-fields"></div>
+                <button type="submit" class="btn btn-primary btn-block">开始部署</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

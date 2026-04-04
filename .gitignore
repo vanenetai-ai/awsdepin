@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite3
+.env
+data/app.db
+backend/data/
+backend/__pycache__/
+.vscode/
+.idea/
+*.log
+node_modules/
