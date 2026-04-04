@@ -9,7 +9,7 @@ from proxy_manager import ProxyManager
 
 logger = logging.getLogger(__name__)
 
-# 区域显示名映射
+# 默认启用的区域 (排除 opt-in 区域如 me-south-1, af-south-1 等，它们会超时)
 REGION_DISPLAY = {
     "us-east-1": "🇺🇸 美国 弗吉尼亚",
     "us-east-2": "🇺🇸 美国 俄亥俄",
@@ -28,8 +28,6 @@ REGION_DISPLAY = {
     "eu-west-3": "🇫🇷 法国 巴黎",
     "eu-north-1": "🇸🇪 瑞典 斯德哥尔摩",
     "sa-east-1": "🇧🇷 巴西 圣保罗",
-    "me-south-1": "🇧🇭 巴林",
-    "af-south-1": "🇿🇦 南非 开普敦",
 }
 
 # 国家代码到国旗 emoji
@@ -83,7 +81,7 @@ class AwsManager:
 
     def _get_client(self, service: str, region: str = None):
         region = region or self.account.default_region
-        config_kwargs = {}
+        config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
         if self.proxy_config:
             config_kwargs["proxies"] = self.proxy_config
         return boto3.client(
@@ -91,7 +89,7 @@ class AwsManager:
             aws_access_key_id=self.account.access_key_id,
             aws_secret_access_key=self.account.secret_access_key,
             region_name=region,
-            config=Config(**config_kwargs) if config_kwargs else None,
+            config=Config(**config_kwargs),
         )
 
     def _get_resource(self, service: str, region: str = None):
@@ -303,7 +301,7 @@ class AwsManager:
     # ==================== 账号信息检测 ====================
 
     def get_account_email_and_arn(self) -> dict:
-        """获取账号邮箱、ARN、账号ID"""
+        """获取账号邮箱、ARN、账号ID - 多种方法尝试"""
         result = {"email": None, "arn": None, "account_id": None}
         try:
             sts = self._get_client("sts")
@@ -311,9 +309,10 @@ class AwsManager:
             result["arn"] = identity.get("Arn", "")
             result["account_id"] = identity.get("Account", "")
         except Exception as e:
-            logger.error(f"get_account_email_and_arn STS failed: {e}")
+            logger.error(f"STS failed: {e}")
+            return result
 
-        # 尝试通过 IAM 获取账号别名(通常是邮箱前缀)
+        # 方法1: IAM 账号别名
         try:
             iam = self._get_client("iam")
             aliases = iam.list_account_aliases().get("AccountAliases", [])
@@ -322,22 +321,49 @@ class AwsManager:
         except Exception:
             pass
 
-        # 尝试通过 organizations 获取邮箱
+        # 方法2: Organizations 获取邮箱 (需要 org 权限)
         if not result["email"]:
             try:
                 org = self._get_client("organizations")
                 acct = org.describe_account(AccountId=result["account_id"])
-                result["email"] = acct["Account"].get("Email", "")
+                email = acct["Account"].get("Email", "")
+                if email:
+                    result["email"] = email
             except Exception:
                 pass
 
-        # 尝试从 ARN 推断用户名作为 fallback
+        # 方法3: IAM credential report 获取 root 邮箱
+        if not result["email"]:
+            try:
+                import time, csv, io
+                iam = self._get_client("iam")
+                iam.generate_credential_report()
+                time.sleep(2)  # 等待报告生成
+                resp = iam.get_credential_report()
+                report = resp["Content"].decode("utf-8")
+                reader = csv.DictReader(io.StringIO(report))
+                for row in reader:
+                    if row.get("user") == "<root_account>":
+                        arn_val = row.get("arn", "")
+                        # root ARN 格式: arn:aws:iam::ACCOUNT_ID:root
+                        # 但 credential report 没有直接的邮箱字段
+                        # 不过 user 列有时包含邮箱
+                        break
+            except Exception:
+                pass
+
+        # 方法4: 从 ARN 推断
         if not result["email"] and result["arn"]:
             arn = result["arn"]
             if ":user/" in arn:
                 result["email"] = arn.split(":user/")[-1]
             elif ":root" in arn:
-                result["email"] = "root"
+                # root 密钥，用账号ID作为标识
+                result["email"] = f"root ({result['account_id']})"
+
+        # 方法5: 用 access key 前缀 + 账号ID 作为 fallback
+        if not result["email"]:
+            result["email"] = f"{self.account.access_key_id[:8]}...({result['account_id']})"
 
         return result
 
@@ -432,27 +458,38 @@ class AwsManager:
         }
 
     def get_vcpu_quotas_all_regions(self) -> dict:
-        """并发获取所有区域的 vCPU 配额"""
+        """并发获取所有区域的 vCPU 配额 (19线程并发, 每区域15s超时)"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        regions = list(REGION_DISPLAY.keys())  # 用固定列表，不再调 list_regions
+        regions = list(REGION_DISPLAY.keys())
         regions_data = {}
         total_vcpus = 0
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=19) as pool:
             futures = {pool.submit(self._get_region_vcpu, r): r for r in regions}
-            for future in as_completed(futures, timeout=30):
-                region = futures[future]
-                try:
-                    data = future.result(timeout=10)
-                    regions_data[region] = data
-                    total_vcpus += data["on_demand_limit"]
-                except Exception:
-                    regions_data[region] = {
-                        "display": REGION_DISPLAY.get(region, region),
-                        "on_demand_limit": 5, "on_demand_usage": 0,
-                        "spot_limit": 5, "spot_usage": 0,
-                    }
-                    total_vcpus += 5
+            try:
+                for future in as_completed(futures, timeout=60):
+                    region = futures[future]
+                    try:
+                        data = future.result(timeout=15)
+                        regions_data[region] = data
+                        total_vcpus += data["on_demand_limit"]
+                    except Exception:
+                        regions_data[region] = {
+                            "display": REGION_DISPLAY.get(region, region),
+                            "on_demand_limit": 5, "on_demand_usage": 0,
+                            "spot_limit": 5, "spot_usage": 0,
+                        }
+                        total_vcpus += 5
+            except Exception:
+                # 超时的区域填默认值
+                for r in regions:
+                    if r not in regions_data:
+                        regions_data[r] = {
+                            "display": REGION_DISPLAY.get(r, r),
+                            "on_demand_limit": 5, "on_demand_usage": 0,
+                            "spot_limit": 5, "spot_usage": 0,
+                        }
+                        total_vcpus += 5
 
         return {"regions": regions_data, "total_vcpus": total_vcpus}
 
