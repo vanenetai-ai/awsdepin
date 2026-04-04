@@ -9,32 +9,63 @@ logger = logging.getLogger(__name__)
 BUILTIN_PROJECTS = [
     {
         "name": "titan-network",
-        "description": "Titan Network - 去中心化CDN与存储网络 (https://test1.titannet.io/)",
+        "description": "Titan Network - 去中心化CDN与存储网络 (https://test4.titannet.io/) 需要 Identity Code",
         "install_script": """#!/bin/bash
 set -e
-cd /home/ubuntu
 
-# 安装 Docker (如果尚未安装)
-if ! command -v docker &> /dev/null; then
-    curl -fsSL https://get.docker.com | sh
-    systemctl enable docker && systemctl start docker
-    usermod -aG docker ubuntu
+IDENTITY_CODE="${identity_code}"
+if [ -z "$IDENTITY_CODE" ]; then
+    echo "ERROR: Identity Code is required! Get it from https://test4.titannet.io/"
+    exit 1
 fi
 
-# 拉取并运行 Titan Network 节点
-docker pull nezha123/titan-edge:latest
-mkdir -p /home/ubuntu/.titanedge
+cd /opt
 
-# 启动 Titan Edge 节点
-docker run -d --name titan-edge --restart=always \\
-    -v /home/ubuntu/.titanedge:/root/.titanedge \\
-    -p 1234:1234 \\
-    nezha123/titan-edge:latest
+# 安装依赖
+apt-get update && apt-get install -y wget unzip
 
-echo "Titan Network node started successfully"
+# 下载 Titan Agent
+if [ ! -f /opt/titanagent/agent ]; then
+    wget -q https://pcdn.titannet.io/test4/bin/agent-linux.zip -O /tmp/agent-linux.zip
+    mkdir -p /opt/titanagent
+    unzip -o /tmp/agent-linux.zip -d /opt/titanagent
+    chmod +x /opt/titanagent/agent
+    rm -f /tmp/agent-linux.zip
+fi
+
+# 创建工作目录
+mkdir -p /opt/titanagent/data
+
+# 创建 systemd 服务
+cat > /etc/systemd/system/titan-agent.service << EOF
+[Unit]
+Description=Titan Network Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/titanagent/agent --working-dir=/opt/titanagent/data --server-url=https://test4-api.titannet.io --key=${identity_code}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 停止旧进程(如果存在)
+systemctl stop titan-agent 2>/dev/null || true
+pkill -f '/opt/titanagent/agent' 2>/dev/null || true
+sleep 2
+
+# 启动服务
+systemctl daemon-reload
+systemctl enable titan-agent
+systemctl start titan-agent
+
+echo "Titan Network agent started with Identity Code: ${identity_code:0:8}..."
 """,
-        "health_check_cmd": "docker ps --filter name=titan-edge --format '{{.Status}}'",
-        "config_template": {"bind_code": "", "storage_size": "50GB"},
+        "health_check_cmd": "systemctl is-active titan-agent && journalctl -u titan-agent --no-pager -n 5",
+        "config_template": {"identity_code": ""},
     },
     {
         "name": "grass-node",
@@ -97,10 +128,16 @@ class DepinManager:
         self.db = db
 
     def init_builtin_projects(self):
-        """初始化内置 DePIN 项目"""
+        """初始化/更新内置 DePIN 项目"""
         for proj in BUILTIN_PROJECTS:
             existing = self.db.query(DepinProject).filter(DepinProject.name == proj["name"]).first()
-            if not existing:
+            if existing:
+                # 更新已有项目的脚本和配置
+                existing.description = proj["description"]
+                existing.install_script = proj["install_script"]
+                existing.health_check_cmd = proj.get("health_check_cmd", "")
+                existing.config_template = proj.get("config_template")
+            else:
                 p = DepinProject(
                     name=proj["name"],
                     description=proj["description"],
