@@ -388,98 +388,71 @@ class AwsManager:
         }
         return region_country.get(region, "US")
 
+    def _get_region_vcpu(self, region: str) -> dict:
+        """获取单个区域的 vCPU 配额"""
+        on_demand_limit, on_demand_usage, spot_limit, spot_usage = 5, 0, 5, 0
+        try:
+            sq = self._get_client("service-quotas", region)
+            try:
+                resp = sq.get_service_quota(ServiceCode="ec2", QuotaCode="L-1216C47A")
+                on_demand_limit = int(resp["Quota"]["Value"])
+            except Exception:
+                try:
+                    resp = sq.get_aws_default_service_quota(ServiceCode="ec2", QuotaCode="L-1216C47A")
+                    on_demand_limit = int(resp["Quota"]["Value"])
+                except Exception:
+                    pass
+            try:
+                resp = sq.get_service_quota(ServiceCode="ec2", QuotaCode="L-34B43A08")
+                spot_limit = int(resp["Quota"]["Value"])
+            except Exception:
+                try:
+                    resp = sq.get_aws_default_service_quota(ServiceCode="ec2", QuotaCode="L-34B43A08")
+                    spot_limit = int(resp["Quota"]["Value"])
+                except Exception:
+                    pass
+            try:
+                ec2 = self._get_client("ec2", region)
+                resp = ec2.describe_instances(Filters=[{"Name": "instance-state-name", "Values": ["running", "pending"]}])
+                for res in resp.get("Reservations", []):
+                    for inst in res.get("Instances", []):
+                        vc = inst.get("CpuOptions", {}).get("CoreCount", 1) * inst.get("CpuOptions", {}).get("ThreadsPerCore", 1)
+                        if inst.get("InstanceLifecycle") == "spot":
+                            spot_usage += vc
+                        else:
+                            on_demand_usage += vc
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return {
+            "display": REGION_DISPLAY.get(region, region),
+            "on_demand_limit": on_demand_limit, "on_demand_usage": on_demand_usage,
+            "spot_limit": spot_limit, "spot_usage": spot_usage,
+        }
+
     def get_vcpu_quotas_all_regions(self) -> dict:
-        """获取所有区域的 vCPU 配额 (On-Demand + Spot)"""
+        """并发获取所有区域的 vCPU 配额"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        regions = list(REGION_DISPLAY.keys())  # 用固定列表，不再调 list_regions
         regions_data = {}
         total_vcpus = 0
 
-        try:
-            regions = self.list_regions()
-        except Exception:
-            regions = list(REGION_DISPLAY.keys())
-
-        for region in regions:
-            try:
-                sq = self._get_client("service-quotas", region)
-                on_demand_limit = 5
-                on_demand_usage = 0
-                spot_limit = 5
-                spot_usage = 0
-
-                # On-Demand Standard vCPU 配额
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(self._get_region_vcpu, r): r for r in regions}
+            for future in as_completed(futures, timeout=30):
+                region = futures[future]
                 try:
-                    resp = sq.get_service_quota(
-                        ServiceCode="ec2",
-                        QuotaCode="L-1216C47A"  # Running On-Demand Standard instances
-                    )
-                    on_demand_limit = int(resp["Quota"]["Value"])
+                    data = future.result(timeout=10)
+                    regions_data[region] = data
+                    total_vcpus += data["on_demand_limit"]
                 except Exception:
-                    try:
-                        resp = sq.get_aws_default_service_quota(
-                            ServiceCode="ec2",
-                            QuotaCode="L-1216C47A"
-                        )
-                        on_demand_limit = int(resp["Quota"]["Value"])
-                    except Exception:
-                        pass
-
-                # Spot Standard vCPU 配额
-                try:
-                    resp = sq.get_service_quota(
-                        ServiceCode="ec2",
-                        QuotaCode="L-34B43A08"  # All Standard Spot Instance Requests
-                    )
-                    spot_limit = int(resp["Quota"]["Value"])
-                except Exception:
-                    try:
-                        resp = sq.get_aws_default_service_quota(
-                            ServiceCode="ec2",
-                            QuotaCode="L-34B43A08"
-                        )
-                        spot_limit = int(resp["Quota"]["Value"])
-                    except Exception:
-                        pass
-
-                # 获取当前使用量
-                try:
-                    ec2 = self._get_client("ec2", region)
-                    resp = ec2.describe_instances(
-                        Filters=[
-                            {"Name": "instance-state-name", "Values": ["running", "pending"]},
-                        ]
-                    )
-                    for res in resp.get("Reservations", []):
-                        for inst in res.get("Instances", []):
-                            # 简单估算 vCPU (实际应查 instance type 的 vCPU 数)
-                            vcpu_count = inst.get("CpuOptions", {}).get("CoreCount", 1) * \
-                                         inst.get("CpuOptions", {}).get("ThreadsPerCore", 1)
-                            if inst.get("InstanceLifecycle") == "spot":
-                                spot_usage += vcpu_count
-                            else:
-                                on_demand_usage += vcpu_count
-                except Exception:
-                    pass
-
-                display = REGION_DISPLAY.get(region, region)
-                regions_data[region] = {
-                    "display": display,
-                    "on_demand_limit": on_demand_limit,
-                    "on_demand_usage": on_demand_usage,
-                    "spot_limit": spot_limit,
-                    "spot_usage": spot_usage,
-                }
-                total_vcpus += on_demand_limit
-
-            except Exception as e:
-                logger.debug(f"vCPU quota for {region}: {e}")
-                regions_data[region] = {
-                    "display": REGION_DISPLAY.get(region, region),
-                    "on_demand_limit": 5,
-                    "on_demand_usage": 0,
-                    "spot_limit": 5,
-                    "spot_usage": 0,
-                }
-                total_vcpus += 5
+                    regions_data[region] = {
+                        "display": REGION_DISPLAY.get(region, region),
+                        "on_demand_limit": 5, "on_demand_usage": 0,
+                        "spot_limit": 5, "spot_usage": 0,
+                    }
+                    total_vcpus += 5
 
         return {"regions": regions_data, "total_vcpus": total_vcpus}
 

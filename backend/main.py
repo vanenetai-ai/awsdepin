@@ -322,6 +322,31 @@ def batch_delete_accounts(data: BatchDeleteRequest, user: User = Depends(get_cur
     db.commit()
     return {"deleted": deleted}
 
+@app.post("/api/accounts/detect-all")
+async def detect_all_accounts(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """并发检测所有账号信息"""
+    accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).all()
+    loop = asyncio.get_event_loop()
+    results, errors = [], []
+
+    async def _detect_one(acc):
+        try:
+            def do():
+                s = SessionLocal()
+                try:
+                    a = s.query(AwsAccount).get(acc.id)
+                    mgr = AwsManager(a, s)
+                    return mgr.detect_account_info()
+                finally:
+                    s.close()
+            info = await loop.run_in_executor(executor, do)
+            results.append({"id": acc.id, "info": info})
+        except Exception as e:
+            errors.append({"id": acc.id, "error": str(e)[:100]})
+
+    await asyncio.gather(*[_detect_one(a) for a in accounts])
+    return {"detected": len(results), "errors": len(errors), "results": results}
+
 @app.get("/api/accounts/groups")
 def list_account_groups(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """获取所有分组名称"""

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405">
+    <link rel="stylesheet" href="style.css?v=20260405b">
 </head>
 <body>
     <nav class="sidebar">
@@ -41,6 +41,7 @@
             <div class="tab-header">
                 <h2>AWS 账号管理</h2>
                 <div>
+                    <button class="btn btn-secondary" onclick="detectAllAccounts()">🔍 检测全部</button>
                     <button class="btn btn-secondary" onclick="toggleSelectAll()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>
                     <button class="btn btn-primary" onclick="showModal('account-modal')">+ 添加账号</button>
@@ -390,6 +391,6 @@
 
     <div class="toast-container" id="toast-container"></div>
 
-    <script src="app.js?v=20260405"></script>
+    <script src="app.js?v=20260405b"></script>
 </body>
 </html>

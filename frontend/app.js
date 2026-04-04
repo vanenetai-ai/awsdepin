@@ -188,6 +188,15 @@ async function detectAccount(id) {
     } catch (e) { toast(e.message, 'error'); }
 }
 
+async function detectAllAccounts() {
+    toast('正在并发检测所有账号...', 'info');
+    try {
+        const res = await api('/accounts/detect-all', { method: 'POST' });
+        toast(`检测完成: ${res.detected} 成功, ${res.errors} 失败`);
+        loadAccounts();
+    } catch (e) { toast(e.message, 'error'); }
+}
+
 async function showVcpuDetail(id) {
     const a = accountsCache.find(x => x.id === id);
     const modal = document.getElementById('vcpu-modal');
