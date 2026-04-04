@@ -100,7 +100,7 @@ function renderAccountCards(list) {
         const displayName = a.email || a.name || a.access_key_id;
         const age = timeAgo(a.register_time || a.added_at);
         const flag = a.country_flag || '';
-        const vcpuText = a.total_vcpus ? `${a.total_vcpus} vCPUs` : '';
+        const vcpuText = a.max_on_demand ? `${a.max_on_demand} vCPUs` : '';
         const checked = selectedAccounts.has(a.id) ? 'checked' : '';
         return `
         <div class="acc-card" data-id="${a.id}">
@@ -215,7 +215,7 @@ async function showVcpuDetail(id) {
         const res = await api(`/accounts/${id}/vcpus`, { method: 'POST' });
         renderVcpuTable(res.regions);
         // 更新缓存
-        if (a) { a.vcpu_data = res.regions; a.total_vcpus = res.total_vcpus; }
+        if (a) { a.vcpu_data = res.regions; a.total_vcpus = res.total_vcpus; a.max_on_demand = res.max_on_demand || 0; }
         loadAccounts(); // 刷新卡片上的 vCPU 数字
     } catch (e) {
         body.innerHTML = `<div style="color:var(--red);padding:20px">获取失败: ${e.message}</div>`;
@@ -224,11 +224,14 @@ async function showVcpuDetail(id) {
 
 function renderVcpuTable(regions) {
     const body = document.getElementById('vcpu-body');
+    // 按 on_demand_limit 从高到低排序
+    const sorted = Object.entries(regions).sort((a, b) => b[1].on_demand_limit - a[1].on_demand_limit);
     let html = `<table class="vcpu-table"><thead><tr><th>地区</th><th>On-Demand (已用/全部)</th><th>Spot (已用/全部)</th></tr></thead><tbody>`;
-    for (const [region, data] of Object.entries(regions)) {
+    for (const [region, data] of sorted) {
+        const highlight = data.on_demand_limit > 5 ? ' style="color:var(--green);font-weight:bold"' : '';
         html += `<tr>
             <td>${data.display || region} (${region})</td>
-            <td>${data.on_demand_usage}/${data.on_demand_limit}</td>
+            <td${highlight}>${data.on_demand_usage}/${data.on_demand_limit}</td>
             <td>${data.spot_usage}/${data.spot_limit}</td>
         </tr>`;
     }

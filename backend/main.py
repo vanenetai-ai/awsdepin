@@ -186,6 +186,7 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
                 "note": getattr(a, 'note', '') or "",
                 "group_name": getattr(a, 'group_name', '') or "",
                 "total_vcpus": getattr(a, 'total_vcpus', 0) or 0,
+                "max_on_demand": getattr(a, 'max_on_demand', 0) or 0,
                 "vcpu_data": getattr(a, 'vcpu_data', None),
             })
         except Exception as e:
@@ -306,6 +307,7 @@ async def get_account_vcpus(account_id: int, user: User = Depends(get_current_us
     result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).get_vcpu_quotas_all_regions())
     # 保存到数据库
     account.total_vcpus = result["total_vcpus"]
+    account.max_on_demand = result.get("max_on_demand", 0)
     account.vcpu_data = result["regions"]
     db.commit()
     return result

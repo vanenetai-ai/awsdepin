@@ -491,7 +491,9 @@ class AwsManager:
                         }
                         total_vcpus += 5
 
-        return {"regions": regions_data, "total_vcpus": total_vcpus}
+        # max_on_demand = 单区域最高 on_demand_limit
+        max_on_demand = max((d["on_demand_limit"] for d in regions_data.values()), default=5)
+        return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand}
 
     def detect_account_info(self) -> dict:
         """一次性检测账号所有信息并更新数据库"""
