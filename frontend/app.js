@@ -447,6 +447,42 @@ async function checkHealth(taskId) {
     }
 }
 
+// ==================== Batch Operations ====================
+
+async function batchCreateAccounts(e) {
+    e.preventDefault();
+    try {
+        const data = {
+            text: document.getElementById('batch-acc-text').value,
+            default_region: document.getElementById('batch-acc-region').value,
+        };
+        const res = await api('/accounts/batch', { method: 'POST', body: JSON.stringify(data) });
+        hideModal('batch-account-modal');
+        const ok = res.created?.length || 0;
+        const fail = res.errors?.length || 0;
+        toast(`批量添加完成: ${ok} 成功, ${fail} 失败`, fail ? 'error' : 'success');
+        document.getElementById('batch-acc-text').value = '';
+        loadAccounts();
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
+async function batchCreateProxies(e) {
+    e.preventDefault();
+    try {
+        const data = { text: document.getElementById('batch-proxy-text').value };
+        const res = await api('/proxies/batch-text', { method: 'POST', body: JSON.stringify(data) });
+        hideModal('batch-proxy-modal');
+        const fail = res.errors?.length || 0;
+        toast(`批量添加完成: ${res.created} 成功, ${fail} 失败`, fail ? 'error' : 'success');
+        document.getElementById('batch-proxy-text').value = '';
+        loadProxies();
+    } catch (e) {
+        toast(e.message, 'error');
+    }
+}
+
 // ==================== Helpers ====================
 
 async function loadAccountOptions(selectId) {

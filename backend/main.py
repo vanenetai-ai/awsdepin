@@ -92,6 +92,13 @@ class BatchDeployRequest(BaseModel):
     project_id: int
     config: Optional[dict] = None
 
+class BatchAccountCreate(BaseModel):
+    text: str  # 多行文本，每行一个账号
+    default_region: str = "us-east-1"
+
+class BatchProxyCreate(BaseModel):
+    text: str  # 多行文本，每行一个代理
+
 
 # ==================== Auth ====================
 
@@ -190,6 +197,48 @@ def delete_account(account_id: int, user: User = Depends(get_current_user), db: 
     db.delete(account)
     db.commit()
     return {"ok": True}
+
+@app.post("/api/accounts/batch")
+async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """批量添加账号 - 支持多种格式，每行一个"""
+    lines = [l.strip() for l in data.text.strip().split('\n') if l.strip()]
+    created, errors = [], []
+    loop = asyncio.get_event_loop()
+
+    for idx, line in enumerate(lines):
+        try:
+            parts = line.split()
+            if len(parts) == 2:
+                # AccessKeyId SecretAccessKey
+                name = f"account-{idx+1}"
+                ak, sk = parts[0], parts[1]
+            elif len(parts) >= 3:
+                # 名称 AccessKeyId SecretAccessKey [...]
+                name, ak, sk = parts[0], parts[1], parts[2]
+            else:
+                errors.append({"line": idx+1, "error": "格式错误，至少需要 AccessKeyId 和 SecretAccessKey"})
+                continue
+
+            account = AwsAccount(
+                user_id=user.id, name=name,
+                access_key_id=ak, secret_access_key=sk,
+                default_region=data.default_region,
+            )
+            db.add(account)
+            db.commit()
+            db.refresh(account)
+
+            # 并发验证
+            result = await loop.run_in_executor(
+                executor,
+                lambda a=account: AwsManager(a, db, use_proxy=True).verify_credentials()
+            )
+            created.append({"id": account.id, "name": name, "verify": result})
+        except Exception as e:
+            errors.append({"line": idx+1, "error": str(e)})
+
+    return {"created": created, "errors": errors}
+
 
 @app.post("/api/accounts/{account_id}/verify")
 async def verify_account(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -417,6 +466,55 @@ def batch_create_proxies(proxies: list[ProxyCreate], user: User = Depends(get_cu
         created.append(proxy)
     db.commit()
     return {"created": len(created)}
+
+@app.post("/api/proxies/batch-text")
+def batch_create_proxies_text(data: BatchProxyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """批量添加代理 - 每行一个，支持多种格式:
+    host:port
+    protocol://host:port
+    protocol://user:pass@host:port
+    host:port:user:pass
+    """
+    lines = [l.strip() for l in data.text.strip().split('\n') if l.strip()]
+    created, errors = [], []
+
+    for idx, line in enumerate(lines):
+        try:
+            protocol, host, port, username, password = "http", "", 0, None, None
+
+            if "://" in line:
+                # protocol://[user:pass@]host:port
+                proto, rest = line.split("://", 1)
+                protocol = proto.lower()
+                if "@" in rest:
+                    auth, hostport = rest.rsplit("@", 1)
+                    if ":" in auth:
+                        username, password = auth.split(":", 1)
+                else:
+                    hostport = rest
+                hp = hostport.split(":")
+                host, port = hp[0], int(hp[1])
+            else:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    host, port = parts[0], int(parts[1])
+                elif len(parts) == 4:
+                    host, port = parts[0], int(parts[1])
+                    username, password = parts[2], parts[3]
+                else:
+                    errors.append({"line": idx+1, "error": "格式错误"})
+                    continue
+
+            proxy = Proxy(user_id=user.id, protocol=protocol, host=host, port=port, username=username, password=password)
+            db.add(proxy)
+            created.append({"host": host, "port": port})
+        except Exception as e:
+            errors.append({"line": idx+1, "error": str(e)})
+
+    if created:
+        db.commit()
+    return {"created": len(created), "errors": errors}
+
 
 @app.delete("/api/proxies/{proxy_id}")
 def delete_proxy(proxy_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):

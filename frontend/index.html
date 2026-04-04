@@ -40,7 +40,10 @@
         <section id="tab-accounts" class="tab-content">
             <div class="tab-header">
                 <h2>AWS 账号管理</h2>
-                <button class="btn btn-primary" onclick="showModal('account-modal')">+ 添加账号</button>
+                <div>
+                    <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>
+                    <button class="btn btn-primary" onclick="showModal('account-modal')">+ 添加账号</button>
+                </div>
             </div>
             <div class="table-wrap">
                 <table id="accounts-table">
@@ -81,7 +84,10 @@
         <section id="tab-proxies" class="tab-content">
             <div class="tab-header">
                 <h2>旋转代理管理</h2>
-                <button class="btn btn-primary" onclick="showModal('proxy-modal')">+ 添加代理</button>
+                <div>
+                    <button class="btn btn-secondary" onclick="showModal('batch-proxy-modal')">📋 批量添加</button>
+                    <button class="btn btn-primary" onclick="showModal('proxy-modal')">+ 添加代理</button>
+                </div>
             </div>
             <div class="table-wrap">
                 <table id="proxies-table">
@@ -286,6 +292,69 @@
                 </div>
                 <div id="deploy-config-fields"></div>
                 <button type="submit" class="btn btn-primary btn-block">开始部署</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Batch Account Modal -->
+    <div class="modal-overlay" id="batch-account-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>批量添加 AWS 账号</h3>
+                <button class="modal-close" onclick="hideModal('batch-account-modal')">&times;</button>
+            </div>
+            <div style="background:var(--bg3);padding:12px;border-radius:8px;margin-bottom:16px;font-size:13px;color:var(--text2)">
+                <b style="color:var(--text)">格式</b> (每行一个，空格分隔)
+                <ul style="margin:6px 0 0 16px;line-height:1.8">
+                    <li>AccessKeyId SecretAccessKey</li>
+                    <li>名称 AccessKeyId SecretAccessKey</li>
+                </ul>
+            </div>
+            <form onsubmit="batchCreateAccounts(event)">
+                <div class="form-group">
+                    <label>账号列表</label>
+                    <textarea id="batch-acc-text" rows="8" required placeholder="AKIA... secret...&#10;my-acc AKIA... secret..."></textarea>
+                </div>
+                <div class="form-group">
+                    <label>默认区域</label>
+                    <select id="batch-acc-region">
+                        <option value="us-east-1">us-east-1</option>
+                        <option value="us-east-2">us-east-2</option>
+                        <option value="us-west-1">us-west-1</option>
+                        <option value="us-west-2">us-west-2</option>
+                        <option value="eu-west-1">eu-west-1</option>
+                        <option value="eu-central-1">eu-central-1</option>
+                        <option value="ap-southeast-1">ap-southeast-1</option>
+                        <option value="ap-northeast-1">ap-northeast-1</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">批量添加并验证</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Batch Proxy Modal -->
+    <div class="modal-overlay" id="batch-proxy-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>批量添加代理</h3>
+                <button class="modal-close" onclick="hideModal('batch-proxy-modal')">&times;</button>
+            </div>
+            <div style="background:var(--bg3);padding:12px;border-radius:8px;margin-bottom:16px;font-size:13px;color:var(--text2)">
+                <b style="color:var(--text)">格式</b> (每行一个)
+                <ul style="margin:6px 0 0 16px;line-height:1.8">
+                    <li>host:port</li>
+                    <li>host:port:user:pass</li>
+                    <li>http://host:port</li>
+                    <li>socks5://user:pass@host:port</li>
+                </ul>
+            </div>
+            <form onsubmit="batchCreateProxies(event)">
+                <div class="form-group">
+                    <label>代理列表</label>
+                    <textarea id="batch-proxy-text" rows="8" required placeholder="1.2.3.4:8080&#10;socks5://user:pass@5.6.7.8:1080"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">批量添加</button>
             </form>
         </div>
     </div>
