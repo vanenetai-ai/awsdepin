@@ -322,8 +322,36 @@ async function loadProxies() {
         document.querySelector('#proxies-table tbody').innerHTML = list.map(p => `<tr>
             <td>${p.id}</td><td>${p.protocol.toUpperCase()}</td><td>${p.host}</td><td>${p.port}</td><td>${p.username || '-'}</td>
             <td><span class="badge ${p.is_active ? 'badge-green' : 'badge-red'}" style="cursor:pointer" onclick="toggleProxy(${p.id})">${p.is_active ? '活跃' : '禁用'}</span></td>
-            <td>${p.last_used_at || '-'}</td>
-            <td class="action-btns"><button class="btn btn-sm btn-danger" onclick="deleteProxy(${p.id})">删除</button></td></tr>`).join('');
+            <td id="proxy-ip-${p.id}">${p.last_used_at || '-'}</td>
+            <td class="action-btns">
+                <button class="btn btn-sm btn-secondary" onclick="testProxy(${p.id})">🔍 测试</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteProxy(${p.id})">删除</button>
+            </td></tr>`).join('');
+    } catch (e) { toast(e.message, 'error'); }
+}
+async function testProxy(id) {
+    const el = document.getElementById('proxy-ip-' + id);
+    if (el) el.innerHTML = '<span style="color:var(--yellow)">测试中...</span>';
+    try {
+        const res = await api(`/proxies/${id}/test`, { method: 'POST' });
+        if (res.ok) {
+            toast(`✅ ${res.proxy} → ${res.ip}`);
+            if (el) el.innerHTML = `<span class="badge badge-green">${res.ip}</span>`;
+        } else {
+            toast(`❌ ${res.proxy}: ${res.error}`, 'error');
+            if (el) el.innerHTML = `<span class="badge badge-red">失败</span>`;
+        }
+    } catch (e) { toast(e.message, 'error'); if (el) el.innerHTML = '<span class="badge badge-red">错误</span>'; }
+}
+async function testAllProxies() {
+    toast('正在测试所有代理...', 'info');
+    try {
+        const res = await api('/proxies/test-all', { method: 'POST' });
+        toast(`测试完成: ${res.ok}/${res.total} 可用`);
+        for (const r of res.results) {
+            const el = document.getElementById('proxy-ip-' + r.id);
+            if (el) el.innerHTML = r.ok ? `<span class="badge badge-green">${r.ip}</span>` : `<span class="badge badge-red">失败</span>`;
+        }
     } catch (e) { toast(e.message, 'error'); }
 }
 async function createProxy(e) { e.preventDefault(); try { const data = { protocol: document.getElementById('proxy-protocol').value, host: document.getElementById('proxy-host').value, port: parseInt(document.getElementById('proxy-port').value), username: document.getElementById('proxy-user').value || null, password: document.getElementById('proxy-pass').value || null }; await api('/proxies', { method: 'POST', body: JSON.stringify(data) }); hideModal('proxy-modal'); toast('代理已添加'); loadProxies(); } catch (e) { toast(e.message, 'error'); } }

@@ -543,53 +543,155 @@ def batch_create_proxies(proxies: list[ProxyCreate], user: User = Depends(get_cu
     db.commit()
     return {"created": len(created)}
 
-@app.post("/api/proxies/batch-text")
-def batch_create_proxies_text(data: BatchProxyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """批量添加代理 - 每行一个，支持多种格式:
+def _smart_parse_proxy(line: str) -> dict:
+    """智能解析代理字符串，支持各种格式:
     host:port
+    host:port:user:pass
+    user:pass@host:port
     protocol://host:port
     protocol://user:pass@host:port
-    host:port:user:pass
+    protocol://host:port:user:pass
+    host port (空格分隔)
+    protocol host port user pass (空格分隔)
     """
+    line = line.strip()
+    if not line:
+        raise ValueError("空行")
+
+    protocol, host, port, username, password = "http", "", 0, None, None
+
+    # 检测协议前缀
+    if "://" in line:
+        proto, rest = line.split("://", 1)
+        protocol = proto.lower().replace("socks5h", "socks5")
+        if protocol not in ("http", "https", "socks5", "socks4"):
+            protocol = "http"
+    else:
+        rest = line
+        # 根据常见端口猜测协议
+        # 先解析完再判断
+
+    # 处理 user:pass@host:port 格式
+    if "@" in rest:
+        auth_part, hostport_part = rest.rsplit("@", 1)
+        if ":" in auth_part:
+            username, password = auth_part.split(":", 1)
+        else:
+            username = auth_part
+        rest = hostport_part
+
+    # 尝试用空格分隔
+    if " " in rest and ":" not in rest:
+        parts = rest.split()
+        if len(parts) >= 2:
+            host = parts[0]
+            port = int(parts[1])
+            if len(parts) >= 4 and not username:
+                username, password = parts[2], parts[3]
+            return {"protocol": protocol, "host": host, "port": port, "username": username, "password": password}
+
+    # 用冒号分隔
+    parts = rest.split(":")
+    if len(parts) == 2:
+        host, port = parts[0], int(parts[1])
+    elif len(parts) == 3:
+        # 可能是 host:port:user 或 ip:port:something
+        host, port = parts[0], int(parts[1])
+        username = parts[2]
+    elif len(parts) == 4:
+        host, port = parts[0], int(parts[1])
+        username, password = parts[2], parts[3]
+    elif len(parts) >= 5:
+        # host:port:user:pass:protocol 或其他
+        host, port = parts[0], int(parts[1])
+        username, password = parts[2], parts[3]
+        if parts[4].lower() in ("http", "https", "socks5", "socks4"):
+            protocol = parts[4].lower()
+    else:
+        raise ValueError(f"无法解析: {line}")
+
+    if not host or port <= 0:
+        raise ValueError(f"无效的地址或端口: {line}")
+
+    # 根据端口猜测协议 (如果没有显式指定)
+    if "://" not in line:
+        if port in (1080, 1081, 7890, 7891):
+            protocol = "socks5"
+        elif port in (443, 8443):
+            protocol = "https"
+
+    return {"protocol": protocol, "host": host, "port": port, "username": username, "password": password}
+
+
+@app.post("/api/proxies/batch-text")
+def batch_create_proxies_text(data: BatchProxyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """批量添加代理 - 智能识别各种格式"""
     lines = [l.strip() for l in data.text.strip().split('\n') if l.strip()]
     created, errors = [], []
 
     for idx, line in enumerate(lines):
         try:
-            protocol, host, port, username, password = "http", "", 0, None, None
-
-            if "://" in line:
-                # protocol://[user:pass@]host:port
-                proto, rest = line.split("://", 1)
-                protocol = proto.lower()
-                if "@" in rest:
-                    auth, hostport = rest.rsplit("@", 1)
-                    if ":" in auth:
-                        username, password = auth.split(":", 1)
-                else:
-                    hostport = rest
-                hp = hostport.split(":")
-                host, port = hp[0], int(hp[1])
-            else:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    host, port = parts[0], int(parts[1])
-                elif len(parts) == 4:
-                    host, port = parts[0], int(parts[1])
-                    username, password = parts[2], parts[3]
-                else:
-                    errors.append({"line": idx+1, "error": "格式错误"})
-                    continue
-
-            proxy = Proxy(user_id=user.id, protocol=protocol, host=host, port=port, username=username, password=password)
+            parsed = _smart_parse_proxy(line)
+            proxy = Proxy(user_id=user.id, **parsed)
             db.add(proxy)
-            created.append({"host": host, "port": port})
+            created.append({"host": parsed["host"], "port": parsed["port"], "protocol": parsed["protocol"]})
         except Exception as e:
-            errors.append({"line": idx+1, "error": str(e)})
+            errors.append({"line": idx+1, "error": str(e), "text": line[:50]})
 
     if created:
         db.commit()
     return {"created": len(created), "errors": errors}
+
+
+@app.post("/api/proxies/{proxy_id}/test")
+async def test_proxy(proxy_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """测试代理是否可用，返回出口IP"""
+    proxy = _get_user_proxy(db, user, proxy_id)
+    loop = asyncio.get_event_loop()
+
+    def _test():
+        import httpx as hx
+        auth = ""
+        if proxy.username and proxy.password:
+            auth = f"{proxy.username}:{proxy.password}@"
+        proxy_url = f"{proxy.protocol}://{auth}{proxy.host}:{proxy.port}"
+        try:
+            with hx.Client(proxy=proxy_url, timeout=15) as client:
+                resp = client.get("https://api.ipify.org?format=json")
+                ip = resp.json().get("ip", "unknown")
+                return {"ok": True, "ip": ip, "proxy": f"{proxy.host}:{proxy.port}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "proxy": f"{proxy.host}:{proxy.port}"}
+
+    return await loop.run_in_executor(executor, _test)
+
+
+@app.post("/api/proxies/test-all")
+async def test_all_proxies(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """批量测试所有代理"""
+    proxies = db.query(Proxy).filter(Proxy.user_id == user.id, Proxy.is_active == True).all()
+    loop = asyncio.get_event_loop()
+    results = []
+
+    async def _test_one(p):
+        def do():
+            import httpx as hx
+            auth = ""
+            if p.username and p.password:
+                auth = f"{p.username}:{p.password}@"
+            proxy_url = f"{p.protocol}://{auth}{p.host}:{p.port}"
+            try:
+                with hx.Client(proxy=proxy_url, timeout=10) as client:
+                    resp = client.get("https://api.ipify.org?format=json")
+                    ip = resp.json().get("ip", "unknown")
+                    return {"id": p.id, "ok": True, "ip": ip}
+            except Exception as e:
+                return {"id": p.id, "ok": False, "error": str(e)[:80]}
+        r = await loop.run_in_executor(executor, do)
+        results.append(r)
+
+    await asyncio.gather(*[_test_one(p) for p in proxies])
+    return {"results": results, "total": len(proxies), "ok": sum(1 for r in results if r["ok"])}
 
 
 @app.delete("/api/proxies/{proxy_id}")
