@@ -56,6 +56,11 @@ class AccountUpdate(BaseModel):
     secret_access_key: Optional[str] = None
     default_region: Optional[str] = None
     is_active: Optional[bool] = None
+    note: Optional[str] = None
+    group_name: Optional[str] = None
+
+class BatchDeleteRequest(BaseModel):
+    ids: list[int]
 
 class ProxyCreate(BaseModel):
     protocol: str = "http"
@@ -161,13 +166,25 @@ def _get_user_proxy(db: Session, user: User, proxy_id: int) -> Proxy:
 
 @app.get("/api/accounts")
 def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).all()
+    from aws_manager import COUNTRY_FLAGS
+    accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).order_by(AwsAccount.id).all()
     return [
         {
             "id": a.id, "name": a.name, "default_region": a.default_region,
             "is_active": a.is_active, "created_at": str(a.created_at),
-            "access_key_id": a.access_key_id[:8] + "****",
+            "access_key_id": a.access_key_id[:16] + "..." if len(a.access_key_id) > 16 else a.access_key_id,
             "instance_count": len(a.instances),
+            "email": a.email or "",
+            "aws_account_id": a.aws_account_id or "",
+            "arn": a.arn or "",
+            "register_country": a.register_country or "",
+            "country_flag": COUNTRY_FLAGS.get(a.register_country or "", ""),
+            "register_time": str(a.register_time) if a.register_time else None,
+            "added_at": str(a.added_at) if a.added_at else str(a.created_at),
+            "note": a.note or "",
+            "group_name": a.group_name or "",
+            "total_vcpus": a.total_vcpus or 0,
+            "vcpu_data": a.vcpu_data,
         }
         for a in accounts
     ]
@@ -252,6 +269,52 @@ async def list_regions(account_id: int, user: User = Depends(get_current_user), 
     account = _get_user_account(db, user, account_id)
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, lambda: AwsManager(account, db).list_regions())
+
+@app.post("/api/accounts/{account_id}/detect")
+async def detect_account(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """检测账号信息: 邮箱、注册时间、国家、ARN"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    info = await loop.run_in_executor(executor, lambda: AwsManager(account, db).detect_account_info())
+    db.refresh(account)
+    return {
+        "email": account.email, "arn": account.arn,
+        "aws_account_id": account.aws_account_id,
+        "register_time": str(account.register_time) if account.register_time else None,
+        "register_country": account.register_country,
+        "name": account.name,
+    }
+
+@app.post("/api/accounts/{account_id}/vcpus")
+async def get_account_vcpus(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """获取账号各区域 vCPU 配额详情"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).get_vcpu_quotas_all_regions())
+    # 保存到数据库
+    account.total_vcpus = result["total_vcpus"]
+    account.vcpu_data = result["regions"]
+    db.commit()
+    return result
+
+@app.post("/api/accounts/batch-delete")
+def batch_delete_accounts(data: BatchDeleteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """批量删除账号"""
+    deleted = 0
+    for aid in data.ids:
+        account = db.query(AwsAccount).filter(AwsAccount.id == aid, AwsAccount.user_id == user.id).first()
+        if account:
+            db.delete(account)
+            deleted += 1
+    db.commit()
+    return {"deleted": deleted}
+
+@app.get("/api/accounts/groups")
+def list_account_groups(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """获取所有分组名称"""
+    accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).all()
+    groups = sorted(set(a.group_name for a in accounts if a.group_name))
+    return groups
 
 
 # ==================== Instances ====================

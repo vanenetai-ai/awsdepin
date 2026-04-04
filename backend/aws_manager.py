@@ -1,12 +1,51 @@
 import boto3
 import base64
 import logging
+from datetime import datetime
 from botocore.config import Config
 from sqlalchemy.orm import Session
 from models import AwsAccount, Instance
 from proxy_manager import ProxyManager
 
 logger = logging.getLogger(__name__)
+
+# 区域显示名映射
+REGION_DISPLAY = {
+    "us-east-1": "🇺🇸 美国 弗吉尼亚",
+    "us-east-2": "🇺🇸 美国 俄亥俄",
+    "us-west-1": "🇺🇸 美国 加利福尼亚",
+    "us-west-2": "🇺🇸 美国 俄勒冈",
+    "ap-south-1": "🇮🇳 印度 孟买",
+    "ap-northeast-1": "🇯🇵 日本 东京",
+    "ap-northeast-2": "🇰🇷 韩国 首尔",
+    "ap-northeast-3": "🇯🇵 日本 大阪",
+    "ap-southeast-1": "🇸🇬 新加坡",
+    "ap-southeast-2": "🇦🇺 澳大利亚 悉尼",
+    "ca-central-1": "🇨🇦 加拿大",
+    "eu-central-1": "🇩🇪 德国 法兰克福",
+    "eu-west-1": "🇮🇪 爱尔兰",
+    "eu-west-2": "🇬🇧 英国 伦敦",
+    "eu-west-3": "🇫🇷 法国 巴黎",
+    "eu-north-1": "🇸🇪 瑞典 斯德哥尔摩",
+    "sa-east-1": "🇧🇷 巴西 圣保罗",
+    "me-south-1": "🇧🇭 巴林",
+    "af-south-1": "🇿🇦 南非 开普敦",
+}
+
+# 国家代码到国旗 emoji
+COUNTRY_FLAGS = {
+    "US": "🇺🇸", "CN": "🇨🇳", "JP": "🇯🇵", "KR": "🇰🇷", "DE": "🇩🇪",
+    "GB": "🇬🇧", "FR": "🇫🇷", "CA": "🇨🇦", "AU": "🇦🇺", "IN": "🇮🇳",
+    "BR": "🇧🇷", "SG": "🇸🇬", "IE": "🇮🇪", "SE": "🇸🇪", "TH": "🇹🇭",
+    "VN": "🇻🇳", "PH": "🇵🇭", "MY": "🇲🇾", "ID": "🇮🇩", "TW": "🇹🇼",
+    "HK": "🇭🇰", "RU": "🇷🇺", "TR": "🇹🇷", "MX": "🇲🇽", "AR": "🇦🇷",
+    "CL": "🇨🇱", "CO": "🇨🇴", "PE": "🇵🇪", "ZA": "🇿🇦", "NG": "🇳🇬",
+    "EG": "🇪🇬", "SA": "🇸🇦", "AE": "🇦🇪", "IL": "🇮🇱", "PK": "🇵🇰",
+    "BD": "🇧🇩", "NZ": "🇳🇿", "IT": "🇮🇹", "ES": "🇪🇸", "NL": "🇳🇱",
+    "PL": "🇵🇱", "CH": "🇨🇭", "AT": "🇦🇹", "BE": "🇧🇪", "PT": "🇵🇹",
+    "CZ": "🇨🇿", "RO": "🇷🇴", "HU": "🇭🇺", "FI": "🇫🇮", "NO": "🇳🇴",
+    "DK": "🇩🇰", "GR": "🇬🇷", "UA": "🇺🇦", "BH": "🇧🇭",
+}
 
 # 默认安全组配置 - 开放 SSH
 DEFAULT_SG_NAME = "depin-sg"
@@ -260,3 +299,220 @@ class AwsManager:
                     "launch_time": str(inst.get("LaunchTime")),
                 })
         return instances
+
+    # ==================== 账号信息检测 ====================
+
+    def get_account_email_and_arn(self) -> dict:
+        """获取账号邮箱、ARN、账号ID"""
+        result = {"email": None, "arn": None, "account_id": None}
+        try:
+            sts = self._get_client("sts")
+            identity = sts.get_caller_identity()
+            result["arn"] = identity.get("Arn", "")
+            result["account_id"] = identity.get("Account", "")
+        except Exception as e:
+            logger.error(f"get_account_email_and_arn STS failed: {e}")
+
+        # 尝试通过 IAM 获取账号别名(通常是邮箱前缀)
+        try:
+            iam = self._get_client("iam")
+            aliases = iam.list_account_aliases().get("AccountAliases", [])
+            if aliases:
+                result["email"] = aliases[0]
+        except Exception:
+            pass
+
+        # 尝试通过 organizations 获取邮箱
+        if not result["email"]:
+            try:
+                org = self._get_client("organizations")
+                acct = org.describe_account(AccountId=result["account_id"])
+                result["email"] = acct["Account"].get("Email", "")
+            except Exception:
+                pass
+
+        # 尝试从 ARN 推断用户名作为 fallback
+        if not result["email"] and result["arn"]:
+            arn = result["arn"]
+            if ":user/" in arn:
+                result["email"] = arn.split(":user/")[-1]
+            elif ":root" in arn:
+                result["email"] = "root"
+
+        return result
+
+    def get_account_creation_time(self) -> datetime | None:
+        """获取 AWS 账号创建时间 (通过最早的 IAM 用户或 trail)"""
+        try:
+            # 方法1: 通过 IAM credential report 获取 root 账号创建时间
+            iam = self._get_client("iam")
+            # 获取用户列表，root 的 CreateDate 就是账号创建时间
+            users = iam.list_users(MaxItems=1)
+            if users.get("Users"):
+                return users["Users"][0].get("CreateDate")
+        except Exception:
+            pass
+
+        try:
+            # 方法2: 获取当前用户的创建时间
+            iam = self._get_client("iam")
+            user = iam.get_user()
+            return user["User"].get("CreateDate")
+        except Exception:
+            pass
+
+        return None
+
+    def get_account_country(self) -> str:
+        """尝试检测账号注册国家"""
+        try:
+            # 通过 organizations
+            sts = self._get_client("sts")
+            identity = sts.get_caller_identity()
+            account_id = identity["Account"]
+            org = self._get_client("organizations")
+            acct = org.describe_account(AccountId=account_id)
+            # organizations 没有直接的 country 字段，但可以从 billing 推断
+        except Exception:
+            pass
+
+        # 通过默认区域推断国家
+        region = self.account.default_region
+        region_country = {
+            "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
+            "eu-west-1": "IE", "eu-west-2": "GB", "eu-west-3": "FR", "eu-central-1": "DE",
+            "eu-north-1": "SE", "ap-northeast-1": "JP", "ap-northeast-2": "KR",
+            "ap-northeast-3": "JP", "ap-southeast-1": "SG", "ap-southeast-2": "AU",
+            "ap-south-1": "IN", "sa-east-1": "BR", "ca-central-1": "CA",
+            "me-south-1": "BH", "af-south-1": "ZA",
+        }
+        return region_country.get(region, "US")
+
+    def get_vcpu_quotas_all_regions(self) -> dict:
+        """获取所有区域的 vCPU 配额 (On-Demand + Spot)"""
+        regions_data = {}
+        total_vcpus = 0
+
+        try:
+            regions = self.list_regions()
+        except Exception:
+            regions = list(REGION_DISPLAY.keys())
+
+        for region in regions:
+            try:
+                sq = self._get_client("service-quotas", region)
+                on_demand_limit = 5
+                on_demand_usage = 0
+                spot_limit = 5
+                spot_usage = 0
+
+                # On-Demand Standard vCPU 配额
+                try:
+                    resp = sq.get_service_quota(
+                        ServiceCode="ec2",
+                        QuotaCode="L-1216C47A"  # Running On-Demand Standard instances
+                    )
+                    on_demand_limit = int(resp["Quota"]["Value"])
+                except Exception:
+                    try:
+                        resp = sq.get_aws_default_service_quota(
+                            ServiceCode="ec2",
+                            QuotaCode="L-1216C47A"
+                        )
+                        on_demand_limit = int(resp["Quota"]["Value"])
+                    except Exception:
+                        pass
+
+                # Spot Standard vCPU 配额
+                try:
+                    resp = sq.get_service_quota(
+                        ServiceCode="ec2",
+                        QuotaCode="L-34B43A08"  # All Standard Spot Instance Requests
+                    )
+                    spot_limit = int(resp["Quota"]["Value"])
+                except Exception:
+                    try:
+                        resp = sq.get_aws_default_service_quota(
+                            ServiceCode="ec2",
+                            QuotaCode="L-34B43A08"
+                        )
+                        spot_limit = int(resp["Quota"]["Value"])
+                    except Exception:
+                        pass
+
+                # 获取当前使用量
+                try:
+                    ec2 = self._get_client("ec2", region)
+                    resp = ec2.describe_instances(
+                        Filters=[
+                            {"Name": "instance-state-name", "Values": ["running", "pending"]},
+                        ]
+                    )
+                    for res in resp.get("Reservations", []):
+                        for inst in res.get("Instances", []):
+                            # 简单估算 vCPU (实际应查 instance type 的 vCPU 数)
+                            vcpu_count = inst.get("CpuOptions", {}).get("CoreCount", 1) * \
+                                         inst.get("CpuOptions", {}).get("ThreadsPerCore", 1)
+                            if inst.get("InstanceLifecycle") == "spot":
+                                spot_usage += vcpu_count
+                            else:
+                                on_demand_usage += vcpu_count
+                except Exception:
+                    pass
+
+                display = REGION_DISPLAY.get(region, region)
+                regions_data[region] = {
+                    "display": display,
+                    "on_demand_limit": on_demand_limit,
+                    "on_demand_usage": on_demand_usage,
+                    "spot_limit": spot_limit,
+                    "spot_usage": spot_usage,
+                }
+                total_vcpus += on_demand_limit
+
+            except Exception as e:
+                logger.debug(f"vCPU quota for {region}: {e}")
+                regions_data[region] = {
+                    "display": REGION_DISPLAY.get(region, region),
+                    "on_demand_limit": 5,
+                    "on_demand_usage": 0,
+                    "spot_limit": 5,
+                    "spot_usage": 0,
+                }
+                total_vcpus += 5
+
+        return {"regions": regions_data, "total_vcpus": total_vcpus}
+
+    def detect_account_info(self) -> dict:
+        """一次性检测账号所有信息并更新数据库"""
+        info = {}
+
+        # 1. 邮箱/ARN/账号ID
+        email_info = self.get_account_email_and_arn()
+        info.update(email_info)
+
+        # 2. 注册时间
+        reg_time = self.get_account_creation_time()
+        info["register_time"] = reg_time
+
+        # 3. 国家
+        info["country"] = self.get_account_country()
+
+        # 4. 更新数据库
+        if email_info.get("email"):
+            self.account.email = email_info["email"]
+            self.account.name = email_info["email"]  # 用邮箱作为名称
+        if email_info.get("account_id"):
+            self.account.aws_account_id = email_info["account_id"]
+        if email_info.get("arn"):
+            self.account.arn = email_info["arn"]
+        if reg_time:
+            self.account.register_time = reg_time
+        self.account.register_country = info["country"]
+
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+
+        return info

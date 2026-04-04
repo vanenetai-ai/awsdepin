@@ -38,11 +38,24 @@ class AwsAccount(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    name = Column(String(100), nullable=False)
+    name = Column(String(200), nullable=False)
     access_key_id = Column(String(200), nullable=False)
     secret_access_key = Column(String(200), nullable=False)
     default_region = Column(String(50), default="us-east-1")
     is_active = Column(Boolean, default=True)
+
+    # 新增: 账号详情字段
+    email = Column(String(200))           # AWS 账号邮箱 (用作显示名)
+    aws_account_id = Column(String(20))   # AWS 12位账号ID
+    arn = Column(String(300))             # IAM ARN
+    register_country = Column(String(10)) # 注册国家代码 (如 US, CN)
+    register_time = Column(DateTime)      # AWS 账号注册/创建时间
+    added_at = Column(DateTime, default=datetime.utcnow)  # 加入本平台时间
+    note = Column(Text, default="")       # 备注
+    group_name = Column(String(100), default="")  # 分组名称
+    total_vcpus = Column(Integer, default=0)      # 总 vCPU 配额
+    vcpu_data = Column(JSON)              # 各区域 vCPU 详情 JSON
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

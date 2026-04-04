@@ -41,21 +41,16 @@
             <div class="tab-header">
                 <h2>AWS 账号管理</h2>
                 <div>
+                    <button class="btn btn-secondary" onclick="toggleSelectAll()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>
                     <button class="btn btn-primary" onclick="showModal('account-modal')">+ 添加账号</button>
                 </div>
             </div>
-            <div class="table-wrap">
-                <table id="accounts-table">
-                    <thead>
-                        <tr>
-                            <th>ID</th><th>名称</th><th>Access Key</th><th>区域</th>
-                            <th>实例数</th><th>状态</th><th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody></tbody>
-                </table>
+            <div class="batch-bar" id="batch-bar" style="display:none">
+                <span>已选 <b id="batch-count">0</b> 个账号</span>
+                <button class="btn btn-sm btn-danger" onclick="batchDeleteSelected()">🗑 批量删除</button>
             </div>
+            <div class="accounts-grid" id="accounts-grid"></div>
         </section>
 
         <!-- Instances -->
@@ -355,6 +350,39 @@
                     <textarea id="batch-proxy-text" rows="8" required placeholder="1.2.3.4:8080&#10;socks5://user:pass@5.6.7.8:1080"></textarea>
                 </div>
                 <button type="submit" class="btn btn-primary btn-block">批量添加</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- vCPU Detail Modal -->
+    <div class="modal-overlay" id="vcpu-modal">
+        <div class="modal" style="width:560px">
+            <div class="modal-header">
+                <h3>vCPUs 详情</h3>
+                <button class="modal-close" onclick="hideModal('vcpu-modal')">&times;</button>
+            </div>
+            <div id="vcpu-body"></div>
+        </div>
+    </div>
+
+    <!-- Edit Account Modal -->
+    <div class="modal-overlay" id="edit-account-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>编辑账号</h3>
+                <button class="modal-close" onclick="hideModal('edit-account-modal')">&times;</button>
+            </div>
+            <form onsubmit="saveAccountEdit(event)">
+                <input type="hidden" id="edit-acc-id">
+                <div class="form-group">
+                    <label>分组</label>
+                    <input type="text" id="edit-acc-group" placeholder="输入分组名称">
+                </div>
+                <div class="form-group">
+                    <label>备注</label>
+                    <textarea id="edit-acc-note" rows="3" placeholder="输入备注"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">保存</button>
             </form>
         </div>
     </div>
