@@ -87,7 +87,7 @@ class AwsManager:
         if cache_key in self._client_cache:
             return self._client_cache[cache_key]
         # 某些 API 需要更长超时
-        slow_services = {"service-quotas", "iam", "account", "organizations", "support"}
+        slow_services = {"service-quotas", "iam", "account", "organizations", "support", "budgets", "bedrock", "sso-admin", "license-manager"}
         if service in slow_services:
             config_kwargs = {"connect_timeout": 10, "read_timeout": 30, "retries": {"max_attempts": 2}}
         else:
@@ -369,6 +369,35 @@ class AwsManager:
             logger.debug(f"Organizations API failed: {e}")
         return None
 
+    def _detect_email_from_budgets(self) -> str | None:
+        """从 Budgets 通知订阅者获取邮箱"""
+        try:
+            sts = self._get_client("sts")
+            account_id = sts.get_caller_identity()["Account"]
+            budgets = self._get_client("budgets", "us-east-1")
+            resp = budgets.describe_budgets(AccountId=account_id, MaxResults=10)
+            for budget in resp.get("Budgets", []):
+                try:
+                    notifs = budgets.describe_notifications_for_budget(
+                        AccountId=account_id, BudgetName=budget["BudgetName"]
+                    )
+                    for n in notifs.get("Notifications", []):
+                        subs = budgets.describe_subscribers_for_notification(
+                            AccountId=account_id,
+                            BudgetName=budget["BudgetName"],
+                            Notification=n
+                        )
+                        for s in subs.get("Subscribers", []):
+                            if s.get("SubscriptionType") == "EMAIL":
+                                addr = s.get("Address", "")
+                                if "@" in addr:
+                                    return addr
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"Budgets API failed: {e}")
+        return None
+
     def _detect_email_from_credential_report(self) -> str | None:
         """从 credential report 的 root 行获取邮箱（部分账号 root user 就是邮箱）"""
         try:
@@ -540,9 +569,10 @@ class AwsManager:
 
         # 并行执行所有检测任务
         results = {}
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {
                 pool.submit(self._detect_email_from_organizations): "email_org",
+                pool.submit(self._detect_email_from_budgets): "email_budgets",
                 pool.submit(self._detect_email_from_credential_report): "email_cred",
                 pool.submit(self._detect_creation_time): "creation_time",
                 pool.submit(self._detect_country): "country",
@@ -556,8 +586,8 @@ class AwsManager:
                     logger.debug(f"Detection {key} failed: {e}")
                     results[key] = None
 
-        # 邮箱: 优先 organizations，其次 credential report
-        email = results.get("email_org") or results.get("email_cred")
+        # 邮箱: 优先 organizations，其次 budgets，最后 credential report
+        email = results.get("email_org") or results.get("email_budgets") or results.get("email_cred")
         if not email:
             email = f"root ({info['account_id']})"
         info["email"] = email
@@ -592,3 +622,104 @@ class AwsManager:
             self.db.rollback()
 
         return info
+
+    # ==================== AI 配额检测 ====================
+
+    def detect_ai_info(self) -> dict:
+        """检测 Bedrock AI 配额、Anthropic 模型、Kiro/SSO 订阅"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        result = {"bedrock_models": [], "bedrock_quotas": [], "sso_instances": 0, "licenses": []}
+
+        def _detect_bedrock_models():
+            """获取 us-east-1 的 Anthropic 模型列表"""
+            models = []
+            try:
+                bedrock = self._get_client("bedrock", "us-east-1")
+                resp = bedrock.list_foundation_models()
+                for m in resp.get("modelSummaries", []):
+                    if "anthropic" in m.get("providerName", "").lower():
+                        models.append({
+                            "id": m.get("modelId", ""),
+                            "name": m.get("modelName", ""),
+                            "provider": m.get("providerName", ""),
+                            "input": m.get("inputModalities", []),
+                            "output": m.get("outputModalities", []),
+                        })
+            except Exception as e:
+                logger.debug(f"Bedrock models error: {e}")
+            return models
+
+        def _detect_bedrock_quotas():
+            """获取 Bedrock 关键配额 (global cross-region Anthropic)"""
+            quotas = []
+            try:
+                sq = self._get_client("service-quotas", "us-east-1")
+                paginator = sq.get_paginator("list_service_quotas")
+                for page in paginator.paginate(ServiceCode="bedrock"):
+                    for q in page.get("Quotas", []):
+                        name = q.get("QuotaName", "").lower()
+                        # 只取关键的 Anthropic/Claude 配额
+                        if ("anthropic" in name or "claude" in name) and (
+                            "on-demand" in name or "global cross-region" in name
+                        ) and ("tokens per minute" in name or "requests per minute" in name):
+                            quotas.append({
+                                "name": q.get("QuotaName", ""),
+                                "value": q.get("Value", 0),
+                                "code": q.get("QuotaCode", ""),
+                            })
+            except Exception as e:
+                logger.debug(f"Bedrock quotas error: {e}")
+            return quotas
+
+        def _detect_sso():
+            """检测 IAM Identity Center (Kiro 订阅)"""
+            try:
+                sso = self._get_client("sso-admin", "us-east-1")
+                resp = sso.list_instances()
+                return len(resp.get("Instances", []))
+            except Exception:
+                return 0
+
+        def _detect_licenses():
+            """检测 License Manager 许可证"""
+            licenses = []
+            try:
+                lm = self._get_client("license-manager", "us-east-1")
+                resp = lm.list_received_licenses(MaxResults=10)
+                for lic in resp.get("Licenses", []):
+                    licenses.append({
+                        "name": lic.get("LicenseName", ""),
+                        "product": lic.get("ProductName", ""),
+                        "status": lic.get("Status", ""),
+                    })
+            except Exception:
+                pass
+            return licenses
+
+        # 并行执行
+        tasks = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            tasks = {
+                pool.submit(_detect_bedrock_models): "models",
+                pool.submit(_detect_bedrock_quotas): "quotas",
+                pool.submit(_detect_sso): "sso",
+                pool.submit(_detect_licenses): "licenses",
+            }
+            for future in as_completed(tasks, timeout=60):
+                key = tasks[future]
+                try:
+                    val = future.result(timeout=55)
+                    if key == "models":
+                        result["bedrock_models"] = val
+                    elif key == "quotas":
+                        result["bedrock_quotas"] = val
+                    elif key == "sso":
+                        result["sso_instances"] = val
+                    elif key == "licenses":
+                        result["licenses"] = val
+                except Exception as e:
+                    logger.debug(f"AI detection {key} failed: {e}")
+
+        return result
+
+
