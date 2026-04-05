@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405e">
+    <link rel="stylesheet" href="style.css?v=20260405f">
 </head>
 <body>
     <nav class="sidebar">
@@ -174,8 +174,8 @@
             </div>
             <form onsubmit="launchInstance(event)">
                 <div class="form-group">
-                    <label>选择账号</label>
-                    <select id="launch-account"></select>
+                    <label>选择账号 (可多选，按住 Ctrl 批量开机)</label>
+                    <select id="launch-account" multiple size="5" style="min-height:100px"></select>
                 </div>
                 <div class="form-group">
                     <label>区域</label>
@@ -395,6 +395,6 @@
 
     <div class="toast-container" id="toast-container"></div>
 
-    <script src="app.js?v=20260405e"></script>
+    <script src="app.js?v=20260405f"></script>
 </body>
 </html>

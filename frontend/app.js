@@ -333,18 +333,27 @@ async function launchInstance(e) {
     e.preventDefault();
     try {
         const count = parseInt(document.getElementById('launch-count').value) || 1;
-        const accountId = parseInt(document.getElementById('launch-account').value);
+        const selectedAccounts = Array.from(document.getElementById('launch-account').selectedOptions).map(o => parseInt(o.value));
         const region = document.getElementById('launch-region').value || null;
         const instanceType = document.getElementById('launch-type').value;
-        if (count > 1) {
-            const res = await api('/instances/batch-launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType, count }) });
-            hideModal('launch-modal');
-            toast(`批量启动: ${res.launched?.length || 0} 成功, ${res.errors?.length || 0} 失败`);
-        } else {
-            const res = await api('/instances/launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType }) });
-            hideModal('launch-modal');
-            toast(`实例已启动: ${res.instance_id}`);
-        }
+        if (!selectedAccounts.length) { toast('请选择至少一个账号', 'error'); return; }
+        hideModal('launch-modal');
+        toast(`正在为 ${selectedAccounts.length} 个账号各启动 ${count} 个实例...`, 'info');
+        let totalOk = 0, totalErr = 0;
+        const promises = selectedAccounts.map(async (accountId) => {
+            try {
+                if (count > 1) {
+                    const res = await api('/instances/batch-launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType, count }) });
+                    totalOk += res.launched?.length || 0;
+                    totalErr += res.errors?.length || 0;
+                } else {
+                    await api('/instances/launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType }) });
+                    totalOk++;
+                }
+            } catch (err) { totalErr++; }
+        });
+        await Promise.all(promises);
+        toast(`批量启动完成: ${totalOk} 成功, ${totalErr} 失败`);
         loadInstances();
     } catch (e) { toast(e.message, 'error'); }
 }
@@ -449,7 +458,13 @@ async function checkHealth(id) { try { const res = await api(`/tasks/${id}/healt
 
 // ==================== Helpers ====================
 async function loadAccountOptions(sid) { try { const l = await api('/accounts'); document.getElementById(sid).innerHTML = l.map(a => `<option value="${a.id}">${a.name} (${a.default_region})</option>`).join(''); } catch(e){} }
-async function loadInstanceOptions(sid) { try { const l = await api('/instances'); document.getElementById(sid).innerHTML = l.filter(i => i.state==='running').map(i => `<option value="${i.id}">${i.public_ip||i.instance_id} (${i.account_name})</option>`).join(''); } catch(e){} }
+async function loadInstanceOptions(sid) {
+    try {
+        const l = await api('/instances');
+        const sel = document.getElementById(sid);
+        sel.innerHTML = l.filter(i => i.state==='running').map(i => `<option value="${i.id}" selected>${i.public_ip||i.instance_id} (${i.account_name})</option>`).join('');
+    } catch(e){}
+}
 async function loadProjectOptions(sid) { try { if (!projectsCache.length) projectsCache = await api('/projects'); document.getElementById(sid).innerHTML = projectsCache.map(p => `<option value="${p.id}">${p.name}</option>`).join(''); } catch(e){} }
 async function loadProjectConfig() { const pid = document.getElementById('deploy-project').value; const c = document.getElementById('deploy-config-fields'); c.innerHTML = ''; try { const p = await api(`/projects/${pid}`); if (p.config_template) for (const [k,v] of Object.entries(p.config_template)) c.innerHTML += `<div class="form-group"><label>${k}</label><input type="text" data-key="${k}" value="${v}" placeholder="${k}"></div>`; } catch(e){} }
 
