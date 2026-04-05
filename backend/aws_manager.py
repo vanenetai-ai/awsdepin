@@ -358,15 +358,21 @@ class AwsManager:
         return rows
 
     def _detect_email_from_account_contact(self) -> str | None:
-        """从 Account contact information 获取邮箱"""
+        """从 Account contact information 获取邮箱或名字"""
         try:
             acct = self._get_client("account", "us-east-1")
             contact = acct.get_contact_information()
-            email = contact.get("ContactInformation", {}).get("EmailAddress", "")
+            ci = contact.get("ContactInformation", {})
+            # 优先邮箱
+            email = ci.get("EmailAddress", "")
             if email and "@" in email:
                 return email
+            # 没有邮箱就用 FullName 作为显示名
+            name = ci.get("FullName", "")
+            if name:
+                return name
         except Exception as e:
-            logger.debug(f"Account contact email failed: {e}")
+            logger.debug(f"Account contact failed: {e}")
         return None
 
     def _detect_email_from_budgets(self) -> str | None:
