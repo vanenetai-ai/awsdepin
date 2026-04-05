@@ -27,7 +27,7 @@ function toast(msg, type = 'success') {
 
 function showModal(id) {
     document.getElementById(id).classList.add('show');
-    if (id === 'launch-modal') loadAccountOptions('launch-account');
+    if (id === 'launch-modal') { loadAccountOptions('launch-account'); loadInstanceTypes(); loadAmiOptions(); }
     if (id === 'deploy-modal') { loadInstanceOptions('deploy-instance'); loadProjectOptions('deploy-project'); }
 }
 function hideModal(id) { document.getElementById(id).classList.remove('show'); }
@@ -314,10 +314,15 @@ async function batchCreateAccounts(e) {
 }
 
 // ==================== Instances ====================
+let selectedInstances = new Set();
+
 async function loadInstances() {
     try {
         const list = await api('/instances');
+        selectedInstances.clear();
+        updateInstanceBatchBar();
         document.querySelector('#instances-table tbody').innerHTML = list.map(i => `<tr>
+            <td><input type="checkbox" class="inst-check" data-id="${i.id}" onchange="toggleInstanceSelect(${i.id}, this.checked)"></td>
             <td>${i.id}</td><td>${i.account_name}</td><td><code>${i.instance_id || '-'}</code></td><td>${i.region}</td>
             <td>${i.instance_type}</td><td>${stateBadge(i.state)}</td><td>${i.public_ip || '-'}</td>
             <td>${i.projects || '-'}</td><td>${i.task_count}</td>
@@ -326,8 +331,41 @@ async function loadInstances() {
                 ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="startInstance(${i.id})">启动</button>` : ''}
                 ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="stopInstance(${i.id})">停止</button>` : ''}
                 <button class="btn btn-sm btn-danger" onclick="terminateInstance(${i.id})">终止</button>
+                <button class="btn btn-sm btn-danger" onclick="deleteInstanceRecord(${i.id})">🗑</button>
             </td></tr>`).join('');
     } catch (e) { toast(e.message, 'error'); }
+}
+
+function toggleInstanceSelect(id, checked) {
+    if (checked) selectedInstances.add(id); else selectedInstances.delete(id);
+    updateInstanceBatchBar();
+}
+function toggleSelectAllInstances() {
+    const cbs = document.querySelectorAll('.inst-check');
+    const allChecked = selectedInstances.size === cbs.length && cbs.length > 0;
+    selectedInstances.clear();
+    cbs.forEach(cb => { cb.checked = !allChecked; if (!allChecked) selectedInstances.add(parseInt(cb.dataset.id)); });
+    updateInstanceBatchBar();
+}
+function updateInstanceBatchBar() {
+    const bar = document.getElementById('instance-batch-bar');
+    if (bar) bar.style.display = selectedInstances.size > 0 ? 'flex' : 'none';
+    const cnt = document.getElementById('instance-batch-count');
+    if (cnt) cnt.textContent = selectedInstances.size;
+}
+async function batchDeleteInstances() {
+    if (!selectedInstances.size) return;
+    if (!confirm(`确定删除选中的 ${selectedInstances.size} 个实例记录？`)) return;
+    try {
+        await api('/instances/batch-delete', { method: 'POST', body: JSON.stringify({ ids: [...selectedInstances] }) });
+        toast(`已删除 ${selectedInstances.size} 个实例`);
+        selectedInstances.clear();
+        loadInstances();
+    } catch (e) { toast(e.message, 'error'); }
+}
+async function deleteInstanceRecord(id) {
+    if (!confirm('确定删除此实例记录？')) return;
+    try { await api(`/instances/${id}`, { method: 'DELETE' }); toast('已删除'); loadInstances(); } catch (e) { toast(e.message, 'error'); }
 }
 async function launchInstance(e) {
     e.preventDefault();
@@ -467,6 +505,21 @@ async function loadInstanceOptions(sid) {
 }
 async function loadProjectOptions(sid) { try { if (!projectsCache.length) projectsCache = await api('/projects'); document.getElementById(sid).innerHTML = projectsCache.map(p => `<option value="${p.id}">${p.name}</option>`).join(''); } catch(e){} }
 async function loadProjectConfig() { const pid = document.getElementById('deploy-project').value; const c = document.getElementById('deploy-config-fields'); c.innerHTML = ''; try { const p = await api(`/projects/${pid}`); if (p.config_template) for (const [k,v] of Object.entries(p.config_template)) c.innerHTML += `<div class="form-group"><label>${k}</label><input type="text" data-key="${k}" value="${v}" placeholder="${k}"></div>`; } catch(e){} }
+
+async function loadInstanceTypes() {
+    try {
+        const types = await api('/instances/types');
+        const sel = document.getElementById('launch-type');
+        sel.innerHTML = types.map(t => `<option value="${t.type}">${t.type} (${t.vcpu}C/${t.mem}) [${t.category}]</option>`).join('');
+    } catch(e){}
+}
+async function loadAmiOptions() {
+    try {
+        const amis = await api('/instances/amis');
+        const sel = document.getElementById('launch-ami');
+        if (sel) sel.innerHTML = amis.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
+    } catch(e){}
+}
 
 // ==================== Init ====================
 if (checkAuth()) { showUserInfo(); loadDashboard(); }

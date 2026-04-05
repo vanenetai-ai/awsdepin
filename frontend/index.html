@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405f">
+    <link rel="stylesheet" href="style.css?v=20260405g">
 </head>
 <body>
     <nav class="sidebar">
@@ -59,15 +59,20 @@
             <div class="tab-header">
                 <h2>实例管理</h2>
                 <div>
+                    <button class="btn btn-secondary" onclick="toggleSelectAllInstances()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="syncAllInstances()">🔄 同步全部</button>
                     <button class="btn btn-primary" onclick="showModal('launch-modal')">+ 启动实例</button>
                 </div>
+            </div>
+            <div class="batch-bar" id="instance-batch-bar" style="display:none">
+                <span>已选 <b id="instance-batch-count">0</b> 个实例</span>
+                <button class="btn btn-sm btn-danger" onclick="batchDeleteInstances()">🗑 批量删除</button>
             </div>
             <div class="table-wrap">
                 <table id="instances-table">
                     <thead>
                         <tr>
-                            <th>ID</th><th>账号</th><th>实例ID</th><th>区域</th>
+                            <th style="width:30px"></th><th>ID</th><th>账号</th><th>实例ID</th><th>区域</th>
                             <th>类型</th><th>状态</th><th>公网IP</th><th>项目</th><th>任务</th><th>操作</th>
                         </tr>
                     </thead>
@@ -192,19 +197,19 @@
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>实例类型</label>
-                    <select id="launch-type">
-                        <option value="t3.micro">t3.micro (1C/1G)</option>
-                        <option value="t3.small">t3.small (1C/2G)</option>
-                        <option value="t3.medium">t3.medium (2C/4G)</option>
-                        <option value="t3.large">t3.large (2C/8G)</option>
-                        <option value="t3.xlarge">t3.xlarge (4C/16G)</option>
-                        <option value="c5.large">c5.large (2C/4G)</option>
-                        <option value="m5.large">m5.large (2C/8G)</option>
+                    <label>镜像 (AMI)</label>
+                    <select id="launch-ami">
+                        <option value="">Ubuntu 22.04 LTS (默认)</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>数量 (批量启动)</label>
+                    <label>实例类型</label>
+                    <select id="launch-type">
+                        <option value="t3.micro">加载中...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>数量 (每个账号启动几个)</label>
                     <input type="number" id="launch-count" value="1" min="1" max="20" placeholder="1">
                 </div>
                 <button type="submit" class="btn btn-primary btn-block">启动实例</button>
@@ -395,6 +400,6 @@
 
     <div class="toast-container" id="toast-container"></div>
 
-    <script src="app.js?v=20260405f"></script>
+    <script src="app.js?v=20260405g"></script>
 </body>
 </html>

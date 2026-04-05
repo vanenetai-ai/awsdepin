@@ -73,6 +73,7 @@ class LaunchRequest(BaseModel):
     account_id: int
     region: Optional[str] = None
     instance_type: str = "t3.micro"
+    ami_id: Optional[str] = None
 
 class DeployRequest(BaseModel):
     instance_id: int
@@ -567,6 +568,73 @@ async def batch_stop(instance_ids: list[int], user: User = Depends(get_current_u
 
     await asyncio.gather(*[_stop_one(i) for i in instance_ids])
     return {"stopped": results, "errors": errors}
+
+@app.delete("/api/instances/{instance_id}")
+def delete_instance_record(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """删除实例记录 (仅从数据库删除，不终止 AWS 实例)"""
+    instance = _get_user_instance(db, user, instance_id)
+    db.delete(instance)
+    db.commit()
+    return {"ok": True}
+
+@app.post("/api/instances/batch-delete")
+def batch_delete_instances(data: BatchDeleteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """批量删除实例记录"""
+    deleted = 0
+    for iid in data.ids:
+        inst = db.query(Instance).join(AwsAccount).filter(Instance.id == iid, AwsAccount.user_id == user.id).first()
+        if inst:
+            db.delete(inst)
+            deleted += 1
+    db.commit()
+    return {"deleted": deleted}
+
+@app.get("/api/instances/types")
+def list_instance_types(user: User = Depends(get_current_user)):
+    """返回常用 EC2 实例类型列表"""
+    return [
+        {"type": "t2.micro", "vcpu": 1, "mem": "1 GiB", "category": "通用"},
+        {"type": "t2.small", "vcpu": 1, "mem": "2 GiB", "category": "通用"},
+        {"type": "t2.medium", "vcpu": 2, "mem": "4 GiB", "category": "通用"},
+        {"type": "t2.large", "vcpu": 2, "mem": "8 GiB", "category": "通用"},
+        {"type": "t2.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "通用"},
+        {"type": "t3.micro", "vcpu": 2, "mem": "1 GiB", "category": "通用"},
+        {"type": "t3.small", "vcpu": 2, "mem": "2 GiB", "category": "通用"},
+        {"type": "t3.medium", "vcpu": 2, "mem": "4 GiB", "category": "通用"},
+        {"type": "t3.large", "vcpu": 2, "mem": "8 GiB", "category": "通用"},
+        {"type": "t3.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "通用"},
+        {"type": "t3.2xlarge", "vcpu": 8, "mem": "32 GiB", "category": "通用"},
+        {"type": "t3a.micro", "vcpu": 2, "mem": "1 GiB", "category": "通用AMD"},
+        {"type": "t3a.small", "vcpu": 2, "mem": "2 GiB", "category": "通用AMD"},
+        {"type": "t3a.medium", "vcpu": 2, "mem": "4 GiB", "category": "通用AMD"},
+        {"type": "t3a.large", "vcpu": 2, "mem": "8 GiB", "category": "通用AMD"},
+        {"type": "t3a.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "通用AMD"},
+        {"type": "t3a.2xlarge", "vcpu": 8, "mem": "32 GiB", "category": "通用AMD"},
+        {"type": "m5.large", "vcpu": 2, "mem": "8 GiB", "category": "内存优化"},
+        {"type": "m5.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "内存优化"},
+        {"type": "m5.2xlarge", "vcpu": 8, "mem": "32 GiB", "category": "内存优化"},
+        {"type": "m5a.large", "vcpu": 2, "mem": "8 GiB", "category": "内存AMD"},
+        {"type": "m5a.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "内存AMD"},
+        {"type": "c5.large", "vcpu": 2, "mem": "4 GiB", "category": "计算优化"},
+        {"type": "c5.xlarge", "vcpu": 4, "mem": "8 GiB", "category": "计算优化"},
+        {"type": "c5.2xlarge", "vcpu": 8, "mem": "16 GiB", "category": "计算优化"},
+        {"type": "c5a.large", "vcpu": 2, "mem": "4 GiB", "category": "计算AMD"},
+        {"type": "c5a.xlarge", "vcpu": 4, "mem": "8 GiB", "category": "计算AMD"},
+        {"type": "r5.large", "vcpu": 2, "mem": "16 GiB", "category": "大内存"},
+        {"type": "r5.xlarge", "vcpu": 4, "mem": "32 GiB", "category": "大内存"},
+    ]
+
+@app.get("/api/instances/amis")
+def list_amis(user: User = Depends(get_current_user)):
+    """返回常用 AMI 镜像列表 (预定义)"""
+    return [
+        {"id": "", "name": "Ubuntu 22.04 LTS (默认)", "os": "Ubuntu", "desc": "自动选择区域对应的 Ubuntu 22.04 AMI"},
+        {"id": "amazon-linux-2", "name": "Amazon Linux 2", "os": "Amazon Linux", "desc": "AWS 官方 Amazon Linux 2"},
+        {"id": "amazon-linux-2023", "name": "Amazon Linux 2023", "os": "Amazon Linux", "desc": "AWS 官方 Amazon Linux 2023"},
+        {"id": "debian-12", "name": "Debian 12", "os": "Debian", "desc": "Debian 12 Bookworm"},
+        {"id": "ubuntu-20.04", "name": "Ubuntu 20.04 LTS", "os": "Ubuntu", "desc": "Ubuntu 20.04 Focal Fossa"},
+        {"id": "ubuntu-24.04", "name": "Ubuntu 24.04 LTS", "os": "Ubuntu", "desc": "Ubuntu 24.04 Noble Numbat"},
+    ]
 
 
 # ==================== Proxies ====================
