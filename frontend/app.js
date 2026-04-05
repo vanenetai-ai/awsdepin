@@ -102,8 +102,30 @@ async function loadAccounts() {
     if (grid) grid.innerHTML = '<div class="loading-spinner"><div class="spinner"></div><span>加载账号中...</span></div>';
     try {
         accountsCache = await api('/accounts');
-        renderAccountCards(accountsCache);
+        updateGroupFilter();
+        filterAccounts();
     } catch (e) { toast(e.message, 'error'); if (grid) grid.innerHTML = ''; }
+}
+
+function updateGroupFilter() {
+    const sel = document.getElementById('account-group-filter');
+    if (!sel) return;
+    const groups = [...new Set(accountsCache.map(a => a.group_name).filter(Boolean))].sort();
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">全部分组</option>' + groups.map(g => `<option value="${g}"${g === cur ? ' selected' : ''}>${g}</option>`).join('');
+}
+
+function filterAccounts() {
+    const q = (document.getElementById('account-search')?.value || '').toLowerCase();
+    const group = document.getElementById('account-group-filter')?.value || '';
+    const filtered = accountsCache.filter(a => {
+        if (group && a.group_name !== group) return false;
+        if (!q) return true;
+        return (a.email || '').toLowerCase().includes(q) || (a.name || '').toLowerCase().includes(q) ||
+            (a.group_name || '').toLowerCase().includes(q) || (a.note || '').toLowerCase().includes(q) ||
+            (a.aws_account_id || '').includes(q) || String(a.id).includes(q);
+    });
+    renderAccountCards(filtered);
 }
 
 function renderAccountCards(list) {
@@ -450,13 +472,30 @@ async function batchCreateAccounts(e) {
 
 // ==================== Instances ====================
 let selectedInstances = new Set();
+let instancesCache = [];
 
 async function loadInstances() {
     try {
-        const list = await api('/instances');
+        instancesCache = await api('/instances');
         selectedInstances.clear();
         updateInstanceBatchBar();
-        document.querySelector('#instances-table tbody').innerHTML = list.map(i => `<tr>
+        renderInstances(instancesCache);
+    } catch (e) { toast(e.message, 'error'); }
+}
+
+function filterInstances() {
+    const q = (document.getElementById('instance-search')?.value || '').toLowerCase();
+    if (!q) { renderInstances(instancesCache); return; }
+    const filtered = instancesCache.filter(i =>
+        (i.account_name || '').toLowerCase().includes(q) || (i.instance_id || '').toLowerCase().includes(q) ||
+        (i.public_ip || '').includes(q) || (i.region || '').includes(q) || (i.instance_type || '').includes(q) ||
+        (i.state || '').includes(q) || (i.projects || '').toLowerCase().includes(q) || String(i.id).includes(q)
+    );
+    renderInstances(filtered);
+}
+
+function renderInstances(list) {
+    document.querySelector('#instances-table tbody').innerHTML = list.map(i => `<tr>
             <td><input type="checkbox" class="inst-check" data-id="${i.id}" onchange="toggleInstanceSelect(${i.id}, this.checked)"></td>
             <td>${i.id}</td><td>${i.account_name}</td><td><code>${i.instance_id || '-'}</code></td><td>${i.region}</td>
             <td>${i.instance_type}</td><td>${stateBadge(i.state)}</td><td>${i.public_ip || '-'}</td>
@@ -468,7 +507,6 @@ async function loadInstances() {
                 <button class="btn btn-sm btn-danger" onclick="terminateInstance(${i.id})">终止</button>
                 <button class="btn btn-sm btn-danger" onclick="deleteInstanceRecord(${i.id})">🗑</button>
             </td></tr>`).join('');
-    } catch (e) { toast(e.message, 'error'); }
 }
 
 function toggleInstanceSelect(id, checked) {
@@ -600,17 +638,33 @@ async function loadProjects() {
 async function createProject(e) { e.preventDefault(); try { await api('/projects', { method: 'POST', body: JSON.stringify({ name: document.getElementById('proj-name').value, description: document.getElementById('proj-desc').value || null, install_script: document.getElementById('proj-script').value, health_check_cmd: document.getElementById('proj-health').value || null }) }); hideModal('project-modal'); toast('项目已添加'); loadProjects(); } catch (e) { toast(e.message, 'error'); } }
 
 // ==================== Tasks ====================
+let tasksCache = [];
+
 async function loadTasks() {
     try {
-        const list = await api('/tasks');
-        document.querySelector('#tasks-table tbody').innerHTML = list.map(t => `<tr>
-            <td>${t.id}</td><td>${t.project_name}</td><td>${t.instance_ip || '-'}</td><td>${stateBadge(t.status)}</td>
-            <td title="${t.log || ''}">${(t.log || '-').substring(0, 40)}</td><td>${t.created_at}</td>
-            <td class="action-btns">
-                <button class="btn btn-sm btn-secondary" onclick="checkHealth(${t.id})">健康检查</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteTask(${t.id})">删除</button>
-            </td></tr>`).join('');
+        tasksCache = await api('/tasks');
+        renderTasks(tasksCache);
     } catch (e) { toast(e.message, 'error'); }
+}
+
+function filterTasks() {
+    const q = (document.getElementById('task-search')?.value || '').toLowerCase();
+    if (!q) { renderTasks(tasksCache); return; }
+    const filtered = tasksCache.filter(t =>
+        (t.project_name || '').toLowerCase().includes(q) || (t.instance_ip || '').includes(q) ||
+        (t.status || '').includes(q) || (t.log || '').toLowerCase().includes(q) || String(t.id).includes(q)
+    );
+    renderTasks(filtered);
+}
+
+function renderTasks(list) {
+    document.querySelector('#tasks-table tbody').innerHTML = list.map(t => `<tr>
+        <td>${t.id}</td><td>${t.project_name}</td><td>${t.instance_ip || '-'}</td><td>${stateBadge(t.status)}</td>
+        <td title="${t.log || ''}">${(t.log || '-').substring(0, 40)}</td><td>${t.created_at}</td>
+        <td class="action-btns">
+            <button class="btn btn-sm btn-secondary" onclick="checkHealth(${t.id})">健康检查</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteTask(${t.id})">删除</button>
+        </td></tr>`).join('');
 }
 async function deployTask(e) {
     e.preventDefault();

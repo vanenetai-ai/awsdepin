@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405q">
+    <link rel="stylesheet" href="style.css?v=20260405r">
 </head>
 <body>
     <nav class="sidebar">
@@ -40,7 +40,9 @@
         <section id="tab-accounts" class="tab-content">
             <div class="tab-header">
                 <h2>AWS 账号管理</h2>
-                <div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <input type="text" id="account-search" class="search-input" placeholder="🔍 搜索账号/邮箱/分组..." oninput="filterAccounts()">
+                    <select id="account-group-filter" class="search-input" onchange="filterAccounts()" style="width:auto;min-width:100px"><option value="">全部分组</option></select>
                     <button class="btn btn-secondary" onclick="detectAllAccounts()">🔍 检测全部</button>
                     <button class="btn btn-secondary" onclick="toggleSelectAll()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>
@@ -58,7 +60,8 @@
         <section id="tab-instances" class="tab-content">
             <div class="tab-header">
                 <h2>实例管理</h2>
-                <div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <input type="text" id="instance-search" class="search-input" placeholder="🔍 搜索账号/实例ID/IP..." oninput="filterInstances()">
                     <button class="btn btn-secondary" onclick="toggleSelectAllInstances()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="syncAllInstances()">🔄 同步全部</button>
                     <button class="btn btn-primary" onclick="showModal('launch-modal')">+ 启动实例</button>
@@ -117,7 +120,10 @@
         <section id="tab-tasks" class="tab-content">
             <div class="tab-header">
                 <h2>部署任务</h2>
-                <button class="btn btn-primary" onclick="showModal('deploy-modal')">+ 新建部署</button>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <input type="text" id="task-search" class="search-input" placeholder="🔍 搜索项目/IP/状态..." oninput="filterTasks()">
+                    <button class="btn btn-primary" onclick="showModal('deploy-modal')">+ 新建部署</button>
+                </div>
             </div>
             <div class="table-wrap">
                 <table id="tasks-table">
@@ -436,6 +442,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260405q"></script>
+    <script src="app.js?v=20260405r"></script>
 </body>
 </html>
