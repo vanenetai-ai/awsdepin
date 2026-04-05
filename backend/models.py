@@ -68,11 +68,11 @@ class Instance(Base):
     __tablename__ = "instances"
 
     id = Column(Integer, primary_key=True, index=True)
-    account_id = Column(Integer, ForeignKey("aws_accounts.id"), nullable=False)
-    instance_id = Column(String(50))
+    account_id = Column(Integer, ForeignKey("aws_accounts.id"), nullable=False, index=True)
+    instance_id = Column(String(50), index=True)
     region = Column(String(50))
     instance_type = Column(String(50), default="t3.micro")
-    state = Column(String(30), default="unknown")
+    state = Column(String(30), default="unknown", index=True)
     public_ip = Column(String(50))
     private_ip = Column(String(50))
     key_name = Column(String(100))
@@ -118,9 +118,9 @@ class DepinTask(Base):
     __tablename__ = "depin_tasks"
 
     id = Column(Integer, primary_key=True, index=True)
-    instance_id = Column(Integer, ForeignKey("instances.id"), nullable=False)
-    project_id = Column(Integer, ForeignKey("depin_projects.id"), nullable=False)
-    status = Column(String(30), default="pending")  # pending/installing/running/failed/stopped
+    instance_id = Column(Integer, ForeignKey("instances.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("depin_projects.id"), nullable=False, index=True)
+    status = Column(String(30), default="pending", index=True)  # pending/installing/running/failed/stopped
     config = Column(JSON)
     log = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)

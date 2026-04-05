@@ -75,35 +75,47 @@ class AwsManager:
         self.account = account
         self.db = db
         self.proxy_config = None
+        self._client_cache = {}
+        self._resource_cache = {}
         if use_proxy:
             pm = ProxyManager(db)
             self.proxy_config = pm.get_proxy_for_boto3()
 
     def _get_client(self, service: str, region: str = None):
         region = region or self.account.default_region
+        cache_key = f"{service}:{region}"
+        if cache_key in self._client_cache:
+            return self._client_cache[cache_key]
         config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
         if self.proxy_config:
             config_kwargs["proxies"] = self.proxy_config
-        return boto3.client(
+        client = boto3.client(
             service,
             aws_access_key_id=self.account.access_key_id,
             aws_secret_access_key=self.account.secret_access_key,
             region_name=region,
             config=Config(**config_kwargs),
         )
+        self._client_cache[cache_key] = client
+        return client
 
     def _get_resource(self, service: str, region: str = None):
         region = region or self.account.default_region
+        cache_key = f"{service}:{region}"
+        if cache_key in self._resource_cache:
+            return self._resource_cache[cache_key]
         config_kwargs = {}
         if self.proxy_config:
             config_kwargs["proxies"] = self.proxy_config
-        return boto3.resource(
+        resource = boto3.resource(
             service,
             aws_access_key_id=self.account.access_key_id,
             aws_secret_access_key=self.account.secret_access_key,
             region_name=region,
             config=Config(**config_kwargs) if config_kwargs else None,
         )
+        self._resource_cache[cache_key] = resource
+        return resource
 
     def verify_credentials(self) -> dict:
         """验证 AWS 凭证是否有效"""

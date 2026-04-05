@@ -38,8 +38,8 @@ function toast(msg, type = 'success') {
 
 function showModal(id) {
     document.getElementById(id).classList.add('show');
-    if (id === 'launch-modal') { loadAccountOptions('launch-account'); loadInstanceTypes(); loadAmiOptions(); }
-    if (id === 'deploy-modal') { loadInstanceOptions('deploy-instance'); loadProjectOptions('deploy-project'); }
+    if (id === 'launch-modal') { Promise.all([loadAccountOptions('launch-account'), loadInstanceTypes(), loadAmiOptions()]); }
+    if (id === 'deploy-modal') { Promise.all([loadInstanceOptions('deploy-instance'), loadProjectOptions('deploy-project')]); }
 }
 function hideModal(id) { document.getElementById(id).classList.remove('show'); }
 
@@ -525,7 +525,7 @@ async function deleteTask(id) {
 async function checkHealth(id) { showLoading('正在健康检查...'); try { const res = await api(`/tasks/${id}/health`, { method: 'POST' }); toast(`健康检查: ${res.status} ${res.message || ''}`, 'info'); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
 // ==================== Helpers ====================
-async function loadAccountOptions(sid) { try { const l = await api('/accounts'); document.getElementById(sid).innerHTML = l.map(a => `<option value="${a.id}">${a.name} (${a.default_region})</option>`).join(''); } catch(e){} }
+async function loadAccountOptions(sid) { try { const l = accountsCache.length ? accountsCache : await api('/accounts'); document.getElementById(sid).innerHTML = l.map(a => `<option value="${a.id}">${a.email || a.name} (${a.default_region})</option>`).join(''); } catch(e){} }
 async function loadInstanceOptions(sid) {
     try {
         const l = await api('/instances');

@@ -59,3 +59,20 @@ def _migrate_db():
                     print(f"  [migrate] Added column {table}.{column}")
                 except Exception as e:
                     print(f"  [migrate] Skip {table}.{column}: {e}")
+
+    # 创建缺失的索引 (加速查询)
+    indexes = [
+        ("instances", "ix_instances_account_id", "account_id"),
+        ("instances", "ix_instances_instance_id", "instance_id"),
+        ("instances", "ix_instances_state", "state"),
+        ("depin_tasks", "ix_depin_tasks_instance_id", "instance_id"),
+        ("depin_tasks", "ix_depin_tasks_project_id", "project_id"),
+        ("depin_tasks", "ix_depin_tasks_status", "status"),
+    ]
+    for table, idx_name, column in indexes:
+        if table in insp.get_table_names():
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({column})'))
+            except Exception:
+                pass  # 索引已存在或不支持 IF NOT EXISTS
