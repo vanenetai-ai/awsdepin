@@ -357,8 +357,20 @@ class AwsManager:
         self._cred_report_cache = rows
         return rows
 
+    def _detect_email_from_organizations(self) -> str | None:
+        """从 Organizations describe_organization 获取 MasterAccountEmail"""
+        try:
+            org = self._get_client("organizations")
+            resp = org.describe_organization()
+            email = resp.get("Organization", {}).get("MasterAccountEmail", "")
+            if email and "@" in email:
+                return email
+        except Exception as e:
+            logger.debug(f"Organizations API failed: {e}")
+        return None
+
     def _detect_email_from_credential_report(self) -> str | None:
-        """从 credential report 的 root 行获取邮箱"""
+        """从 credential report 的 root 行获取邮箱（部分账号 root user 就是邮箱）"""
         try:
             rows = self._get_credential_report()
             for row in rows:
@@ -370,30 +382,6 @@ class AwsManager:
                     break
         except Exception:
             pass
-        return None
-
-    def _detect_email_from_support(self) -> str | None:
-        """从 AWS Support 工单系统获取邮箱"""
-        try:
-            support = self._get_client("support", "us-east-1")
-            resp = support.describe_cases(
-                includeResolvedCases=True,
-                includeCommunications=True,
-                maxResults=10,
-            )
-            for case in resp.get("cases", []):
-                submitted_by = case.get("submittedBy", "")
-                if submitted_by and "@" in submitted_by:
-                    return submitted_by
-                for cc in case.get("ccEmailAddresses", []):
-                    if "@" in cc:
-                        return cc
-                for comm in case.get("recentCommunications", {}).get("communications", []):
-                    s = comm.get("submittedBy", "")
-                    if s and "@" in s:
-                        return s
-        except Exception as e:
-            logger.debug(f"Support API failed: {e}")
         return None
 
     def _detect_creation_time(self) -> datetime | None:
@@ -554,7 +542,7 @@ class AwsManager:
         results = {}
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
-                pool.submit(self._detect_email_from_support): "email_support",
+                pool.submit(self._detect_email_from_organizations): "email_org",
                 pool.submit(self._detect_email_from_credential_report): "email_cred",
                 pool.submit(self._detect_creation_time): "creation_time",
                 pool.submit(self._detect_country): "country",
@@ -568,8 +556,8 @@ class AwsManager:
                     logger.debug(f"Detection {key} failed: {e}")
                     results[key] = None
 
-        # 邮箱: 优先 support 工单，其次 credential report
-        email = results.get("email_support") or results.get("email_cred")
+        # 邮箱: 优先 organizations，其次 credential report
+        email = results.get("email_org") or results.get("email_cred")
         if not email:
             email = f"root ({info['account_id']})"
         info["email"] = email
