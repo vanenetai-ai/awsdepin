@@ -347,6 +347,7 @@ async def detect_account(account_id: int, user: User = Depends(get_current_user)
         "name": account.name,
         "max_on_demand": getattr(account, 'max_on_demand', 0) or 0,
         "total_usage": getattr(account, 'total_usage', 0) or 0,
+        "_errors": info.get("_errors", []),
     }
 
 @app.post("/api/accounts/{account_id}/detect-ai")

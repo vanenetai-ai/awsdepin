@@ -588,9 +588,8 @@ class AwsManager:
         return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
     def detect_account_info(self) -> dict:
-        """一次性检测账号所有信息并更新数据库 - 全部并行，无超时，必须等真实数据"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        info = {"email": None, "arn": None, "account_id": None}
+        """一次性检测账号所有信息并更新数据库 - 全部串行执行，确保稳定"""
+        info = {"email": None, "arn": None, "account_id": None, "_errors": []}
 
         # 先获取 STS 身份
         try:
@@ -600,27 +599,36 @@ class AwsManager:
             info["account_id"] = identity.get("Account", "")
         except Exception as e:
             logger.error(f"STS failed: {e}")
+            info["_errors"].append(f"STS: {e}")
             return info
 
-        # 并行执行所有检测任务 - 不设超时，等每个任务完成
+        # 串行执行所有检测任务 - 避免线程安全问题
         results = {}
-        with ThreadPoolExecutor(max_workers=7) as pool:
-            futures = {
-                pool.submit(self._detect_primary_email): "email_primary",
-                pool.submit(self._detect_email_from_organizations): "email_org",
-                pool.submit(self._detect_email_from_account_contact): "email_contact",
-                pool.submit(self._detect_email_from_budgets): "email_budgets",
-                pool.submit(self._detect_creation_time): "creation_time",
-                pool.submit(self._detect_country): "country",
-                pool.submit(self.get_vcpu_quotas_all_regions): "vcpus",
-            }
-            for future in as_completed(futures):
-                key = futures[future]
-                try:
-                    results[key] = future.result()
-                except Exception as e:
-                    logger.warning(f"Detection {key} failed: {e}")
-                    results[key] = None
+        tasks = [
+            ("email_primary", self._detect_primary_email),
+            ("email_org", self._detect_email_from_organizations),
+            ("email_contact", self._detect_email_from_account_contact),
+            ("email_budgets", self._detect_email_from_budgets),
+            ("creation_time", self._detect_creation_time),
+            ("country", self._detect_country),
+        ]
+        for key, func in tasks:
+            try:
+                results[key] = func()
+                logger.info(f"Detection {key}: {results[key]}")
+            except Exception as e:
+                logger.warning(f"Detection {key} failed: {e}")
+                info["_errors"].append(f"{key}: {str(e)[:100]}")
+                results[key] = None
+
+        # vCPU 单独调用（内部有自己的线程池）
+        try:
+            results["vcpus"] = self.get_vcpu_quotas_all_regions()
+            logger.info(f"Detection vcpus: total={results['vcpus'].get('total_vcpus')}, max={results['vcpus'].get('max_on_demand')}")
+        except Exception as e:
+            logger.warning(f"Detection vcpus failed: {e}")
+            info["_errors"].append(f"vcpus: {str(e)[:100]}")
+            results["vcpus"] = None
 
         # 邮箱优先级: primary_email > organizations > account_contact(邮箱) > budgets > account_contact(名字)
         email = results.get("email_primary") or results.get("email_org") or results.get("email_budgets")
