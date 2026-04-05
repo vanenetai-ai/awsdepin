@@ -86,7 +86,12 @@ class AwsManager:
         cache_key = f"{service}:{region}"
         if cache_key in self._client_cache:
             return self._client_cache[cache_key]
-        config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
+        # 某些 API 需要更长超时
+        slow_services = {"service-quotas", "iam", "account", "organizations"}
+        if service in slow_services:
+            config_kwargs = {"connect_timeout": 10, "read_timeout": 30, "retries": {"max_attempts": 2}}
+        else:
+            config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
         if self.proxy_config:
             config_kwargs["proxies"] = self.proxy_config
         client = boto3.client(
@@ -354,7 +359,7 @@ class AwsManager:
         except Exception:
             pass
 
-        # 方法2: Organizations 获取邮箱 (需要 org 权限)
+        # 方法2: Organizations describe_account 获取邮箱
         if not result["email"]:
             try:
                 org = self._get_client("organizations")
@@ -362,6 +367,20 @@ class AwsManager:
                 email = acct["Account"].get("Email", "")
                 if email:
                     result["email"] = email
+            except Exception:
+                pass
+
+        # 方法2b: Organizations list_accounts 获取邮箱 (管理账号)
+        if not result["email"]:
+            try:
+                org = self._get_client("organizations")
+                resp = org.list_accounts(MaxResults=5)
+                for acct in resp.get("Accounts", []):
+                    if acct.get("Id") == result["account_id"]:
+                        email = acct.get("Email", "")
+                        if email:
+                            result["email"] = email
+                            break
             except Exception:
                 pass
 
@@ -425,19 +444,36 @@ class AwsManager:
         return result
 
     def get_account_creation_time(self) -> datetime | None:
-        """获取 AWS 账号创建时间 (通过最早的 IAM 用户或 trail)"""
+        """获取 AWS 账号创建时间 (通过 credential report 的 root 行)"""
+        # 方法1: credential report 的 root 行 user_creation_time 是账号创建时间
         try:
-            # 方法1: 通过 IAM credential report 获取 root 账号创建时间
+            import time, csv, io
             iam = self._get_client("iam")
-            # 获取用户列表，root 的 CreateDate 就是账号创建时间
-            users = iam.list_users(MaxItems=1)
-            if users.get("Users"):
-                return users["Users"][0].get("CreateDate")
-        except Exception:
-            pass
+            for _ in range(3):
+                try:
+                    resp = iam.generate_credential_report()
+                    if resp.get("State") == "COMPLETE":
+                        break
+                except Exception:
+                    pass
+                time.sleep(2)
+            resp = iam.get_credential_report()
+            report = resp["Content"].decode("utf-8")
+            reader = csv.DictReader(io.StringIO(report))
+            for row in reader:
+                arn_val = row.get("arn", "")
+                if ":root" in arn_val:
+                    creation_str = row.get("user_creation_time", "")
+                    if creation_str and creation_str != "N/A":
+                        # 格式: 2024-01-15T08:30:00+00:00
+                        from dateutil import parser as dateparser
+                        return dateparser.parse(creation_str)
+                    break
+        except Exception as e:
+            logger.debug(f"Credential report creation time failed: {e}")
 
+        # 方法2: fallback - 获取当前 IAM 用户的创建时间
         try:
-            # 方法2: 获取当前用户的创建时间
             iam = self._get_client("iam")
             user = iam.get_user()
             return user["User"].get("CreateDate")
@@ -523,10 +559,10 @@ class AwsManager:
         with ThreadPoolExecutor(max_workers=19) as pool:
             futures = {pool.submit(self._get_region_vcpu, r): r for r in regions}
             try:
-                for future in as_completed(futures, timeout=60):
+                for future in as_completed(futures, timeout=120):
                     region = futures[future]
                     try:
-                        data = future.result(timeout=15)
+                        data = future.result(timeout=45)
                         regions_data[region] = data
                         total_vcpus += data["on_demand_limit"]
                     except Exception:
