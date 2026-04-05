@@ -576,12 +576,12 @@ class AwsManager:
                 pool.submit(self._detect_email_from_credential_report): "email_cred",
                 pool.submit(self._detect_creation_time): "creation_time",
                 pool.submit(self._detect_country): "country",
-                pool.submit(self._detect_default_region_vcpu): "vcpus",
+                pool.submit(self.get_vcpu_quotas_all_regions): "vcpus",
             }
-            for future in as_completed(futures, timeout=40):
+            for future in as_completed(futures, timeout=150):
                 key = futures[future]
                 try:
-                    results[key] = future.result(timeout=35)
+                    results[key] = future.result(timeout=140)
                 except Exception as e:
                     logger.debug(f"Detection {key} failed: {e}")
                     results[key] = None
@@ -598,11 +598,18 @@ class AwsManager:
         # 国家
         info["country"] = results.get("country") or "US"
 
-        # vCPU (单区域 us-east-1 的配额，和竞品一致)
-        vcpus = results.get("vcpus") or 5
-        info["total_vcpus"] = vcpus
-        info["max_on_demand"] = vcpus
-        info["total_usage"] = 0
+        # vCPU (全区域扫描)
+        vcpu_result = results.get("vcpus")
+        if isinstance(vcpu_result, dict):
+            info["total_vcpus"] = vcpu_result.get("total_vcpus", 0)
+            info["max_on_demand"] = vcpu_result.get("max_on_demand", 5)
+            info["total_usage"] = vcpu_result.get("total_usage", 0)
+            info["vcpu_data"] = vcpu_result.get("regions")
+        else:
+            info["total_vcpus"] = 5
+            info["max_on_demand"] = 5
+            info["total_usage"] = 0
+            info["vcpu_data"] = None
 
         # 更新数据库
         self.account.email = info["email"]
@@ -612,9 +619,11 @@ class AwsManager:
         if info["register_time"]:
             self.account.register_time = info["register_time"]
         self.account.register_country = info["country"]
-        self.account.total_vcpus = vcpus
-        self.account.max_on_demand = vcpus
-        self.account.total_usage = 0
+        self.account.total_vcpus = info["total_vcpus"]
+        self.account.max_on_demand = info["max_on_demand"]
+        self.account.total_usage = info["total_usage"]
+        if info["vcpu_data"]:
+            self.account.vcpu_data = info["vcpu_data"]
 
         try:
             self.db.commit()
