@@ -514,50 +514,39 @@ class AwsManager:
         }
 
     def get_vcpu_quotas_all_regions(self) -> dict:
-        """并发获取所有区域的 vCPU 配额 (19线程并发, 每区域15s超时)"""
+        """并发获取所有区域的 vCPU 配额 - 无超时，等每个区域返回真实数据"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         regions = list(REGION_DISPLAY.keys())
         regions_data = {}
         total_vcpus = 0
 
-        with ThreadPoolExecutor(max_workers=19) as pool:
+        with ThreadPoolExecutor(max_workers=20) as pool:
             futures = {pool.submit(self._get_region_vcpu, r): r for r in regions}
-            try:
-                for future in as_completed(futures, timeout=120):
-                    region = futures[future]
-                    try:
-                        data = future.result(timeout=45)
-                        regions_data[region] = data
-                        total_vcpus += data["on_demand_limit"]
-                    except Exception:
-                        regions_data[region] = {
-                            "display": REGION_DISPLAY.get(region, region),
-                            "on_demand_limit": 5, "on_demand_usage": 0,
-                            "spot_limit": 5, "spot_usage": 0,
-                        }
-                        total_vcpus += 5
-            except Exception:
-                # 超时的区域填默认值
-                for r in regions:
-                    if r not in regions_data:
-                        regions_data[r] = {
-                            "display": REGION_DISPLAY.get(r, r),
-                            "on_demand_limit": 5, "on_demand_usage": 0,
-                            "spot_limit": 5, "spot_usage": 0,
-                        }
-                        total_vcpus += 5
+            for future in as_completed(futures):
+                region = futures[future]
+                try:
+                    data = future.result()
+                    regions_data[region] = data
+                    total_vcpus += data["on_demand_limit"]
+                except Exception as e:
+                    logger.warning(f"vCPU {region} failed: {e}")
+                    regions_data[region] = {
+                        "display": REGION_DISPLAY.get(region, region),
+                        "on_demand_limit": 5, "on_demand_usage": 0,
+                        "spot_limit": 5, "spot_usage": 0,
+                    }
+                    total_vcpus += 5
 
-        # max_on_demand = 单区域最高 on_demand_limit
         max_on_demand = max((d["on_demand_limit"] for d in regions_data.values()), default=5)
         total_usage = sum(d["on_demand_usage"] for d in regions_data.values())
         return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
     def detect_account_info(self) -> dict:
-        """一次性检测账号所有信息并更新数据库 - 全部并行执行"""
+        """一次性检测账号所有信息并更新数据库 - 全部并行，无超时，必须等真实数据"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         info = {"email": None, "arn": None, "account_id": None}
 
-        # 先获取 STS 身份（后续都需要）
+        # 先获取 STS 身份
         try:
             sts = self._get_client("sts")
             identity = sts.get_caller_identity()
@@ -567,7 +556,7 @@ class AwsManager:
             logger.error(f"STS failed: {e}")
             return info
 
-        # 并行执行所有检测任务
+        # 并行执行所有检测任务 - 不设超时，等每个任务完成
         results = {}
         with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {
@@ -578,21 +567,17 @@ class AwsManager:
                 pool.submit(self._detect_country): "country",
                 pool.submit(self.get_vcpu_quotas_all_regions): "vcpus",
             }
-            try:
-                for future in as_completed(futures, timeout=150):
-                    key = futures[future]
-                    try:
-                        results[key] = future.result(timeout=140)
-                    except Exception as e:
-                        logger.debug(f"Detection {key} failed: {e}")
-                        results[key] = None
-            except Exception as e:
-                logger.warning(f"as_completed timeout, got {len(results)}/{len(futures)} results: {e}")
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result()
+                except Exception as e:
+                    logger.warning(f"Detection {key} failed: {e}")
+                    results[key] = None
 
         # 邮箱: 优先 organizations，其次 budgets，最后 credential report
         email = results.get("email_org") or results.get("email_budgets") or results.get("email_cred")
         if not email:
-            # 只有数据库里也没有邮箱时才用 fallback
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
 
@@ -602,15 +587,14 @@ class AwsManager:
         # 国家
         info["country"] = results.get("country") or "US"
 
-        # vCPU (全区域扫描)
+        # vCPU (全区域扫描) - 必须是真实数据
         vcpu_result = results.get("vcpus")
-        if isinstance(vcpu_result, dict):
+        if isinstance(vcpu_result, dict) and vcpu_result.get("regions"):
             info["total_vcpus"] = vcpu_result.get("total_vcpus", 0)
             info["max_on_demand"] = vcpu_result.get("max_on_demand", 5)
             info["total_usage"] = vcpu_result.get("total_usage", 0)
             info["vcpu_data"] = vcpu_result.get("regions")
         else:
-            # vCPU 检测失败，保留数据库已有值，不覆盖
             info["total_vcpus"] = self.account.total_vcpus or 0
             info["max_on_demand"] = self.account.max_on_demand or 0
             info["total_usage"] = self.account.total_usage or 0
@@ -640,18 +624,21 @@ class AwsManager:
     # ==================== AI 配额检测 ====================
 
     def detect_ai_info(self) -> dict:
-        """检测 Bedrock AI 配额、Anthropic 模型、Kiro/SSO 订阅"""
+        """检测 Bedrock AI 配额、Anthropic 模型、Kiro/SSO 订阅 - 无超时，等真实数据"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         result = {"bedrock_models": [], "bedrock_quotas": [], "sso_instances": 0, "licenses": []}
 
         def _detect_bedrock_models():
-            """获取 us-east-1 的 Anthropic 模型列表"""
+            """只获取 global Claude 模型 (us-east-1)"""
             models = []
             try:
                 bedrock = self._get_client("bedrock", "us-east-1")
                 resp = bedrock.list_foundation_models()
                 for m in resp.get("modelSummaries", []):
-                    if "anthropic" in m.get("providerName", "").lower():
+                    mid = m.get("modelId", "").lower()
+                    provider = m.get("providerName", "").lower()
+                    # 只取 anthropic claude 模型
+                    if "anthropic" in provider and "claude" in mid:
                         models.append({
                             "id": m.get("modelId", ""),
                             "name": m.get("modelName", ""),
@@ -660,11 +647,11 @@ class AwsManager:
                             "output": m.get("outputModalities", []),
                         })
             except Exception as e:
-                logger.debug(f"Bedrock models error: {e}")
+                logger.warning(f"Bedrock models error: {e}")
             return models
 
         def _detect_bedrock_quotas():
-            """获取 Bedrock 关键配额 (global cross-region Anthropic)"""
+            """获取 Bedrock 配额 - 只取 Anthropic/Claude 相关"""
             quotas = []
             try:
                 sq = self._get_client("service-quotas", "us-east-1")
@@ -672,17 +659,29 @@ class AwsManager:
                 for page in paginator.paginate(ServiceCode="bedrock"):
                     for q in page.get("Quotas", []):
                         name = q.get("QuotaName", "").lower()
-                        # 只取关键的 Anthropic/Claude 配额
-                        if ("anthropic" in name or "claude" in name) and (
-                            "on-demand" in name or "global cross-region" in name
-                        ) and ("tokens per minute" in name or "requests per minute" in name):
+                        if ("anthropic" in name or "claude" in name) and ("token" in name or "request" in name):
                             quotas.append({
                                 "name": q.get("QuotaName", ""),
                                 "value": q.get("Value", 0),
                                 "code": q.get("QuotaCode", ""),
                             })
             except Exception as e:
-                logger.debug(f"Bedrock quotas error: {e}")
+                logger.warning(f"Bedrock quotas error: {e}")
+                # fallback: 尝试默认配额
+                try:
+                    sq = self._get_client("service-quotas", "us-east-1")
+                    paginator = sq.get_paginator("list_aws_default_service_quotas")
+                    for page in paginator.paginate(ServiceCode="bedrock"):
+                        for q in page.get("Quotas", []):
+                            name = q.get("QuotaName", "").lower()
+                            if ("anthropic" in name or "claude" in name) and ("token" in name or "request" in name):
+                                quotas.append({
+                                    "name": q.get("QuotaName", ""),
+                                    "value": q.get("Value", 0),
+                                    "code": q.get("QuotaCode", ""),
+                                })
+                except Exception:
+                    pass
             return quotas
 
         def _detect_sso():
@@ -710,8 +709,7 @@ class AwsManager:
                 pass
             return licenses
 
-        # 并行执行
-        tasks = {}
+        # 并行执行 - 无超时，等每个任务完成
         with ThreadPoolExecutor(max_workers=4) as pool:
             tasks = {
                 pool.submit(_detect_bedrock_models): "models",
@@ -719,23 +717,20 @@ class AwsManager:
                 pool.submit(_detect_sso): "sso",
                 pool.submit(_detect_licenses): "licenses",
             }
-            try:
-                for future in as_completed(tasks, timeout=60):
-                    key = tasks[future]
-                    try:
-                        val = future.result(timeout=55)
-                        if key == "models":
-                            result["bedrock_models"] = val
-                        elif key == "quotas":
-                            result["bedrock_quotas"] = val
-                        elif key == "sso":
-                            result["sso_instances"] = val
-                        elif key == "licenses":
-                            result["licenses"] = val
-                    except Exception as e:
-                        logger.debug(f"AI detection {key} failed: {e}")
-            except Exception as e:
-                logger.warning(f"AI as_completed timeout: {e}")
+            for future in as_completed(tasks):
+                key = tasks[future]
+                try:
+                    val = future.result()
+                    if key == "models":
+                        result["bedrock_models"] = val
+                    elif key == "quotas":
+                        result["bedrock_quotas"] = val
+                    elif key == "sso":
+                        result["sso_instances"] = val
+                    elif key == "licenses":
+                        result["licenses"] = val
+                except Exception as e:
+                    logger.warning(f"AI detection {key} failed: {e}")
 
         return result
 
