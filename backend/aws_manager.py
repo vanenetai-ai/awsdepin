@@ -337,21 +337,43 @@ class AwsManager:
 
     # ==================== 账号信息检测 ====================
 
-    def get_account_email_and_arn(self) -> dict:
-        """获取账号邮箱、ARN、账号ID - 通过 AWS Support 工单系统"""
-        result = {"email": None, "arn": None, "account_id": None}
-        try:
-            sts = self._get_client("sts")
-            identity = sts.get_caller_identity()
-            result["arn"] = identity.get("Arn", "")
-            result["account_id"] = identity.get("Account", "")
-        except Exception as e:
-            logger.error(f"STS failed: {e}")
-            return result
+    def _get_credential_report(self) -> list:
+        """获取 credential report 并解析为行列表，带缓存"""
+        if hasattr(self, '_cred_report_cache'):
+            return self._cred_report_cache
+        import time, csv, io
+        iam = self._get_client("iam")
+        for _ in range(3):
+            try:
+                resp = iam.generate_credential_report()
+                if resp.get("State") == "COMPLETE":
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        resp = iam.get_credential_report()
+        report = resp["Content"].decode("utf-8")
+        rows = list(csv.DictReader(io.StringIO(report)))
+        self._cred_report_cache = rows
+        return rows
 
-        # 通过 AWS Support 工单系统获取邮箱
-        # describe_cases 返回的 submittedBy 字段包含账号邮箱
-        # ccEmailAddresses 也可能包含邮箱
+    def _detect_email_from_credential_report(self) -> str | None:
+        """从 credential report 的 root 行获取邮箱"""
+        try:
+            rows = self._get_credential_report()
+            for row in rows:
+                arn_val = row.get("arn", "")
+                if ":root" in arn_val:
+                    user = row.get("user", "")
+                    if "@" in user:
+                        return user
+                    break
+        except Exception:
+            pass
+        return None
+
+    def _detect_email_from_support(self) -> str | None:
+        """从 AWS Support 工单系统获取邮箱"""
         try:
             support = self._get_client("support", "us-east-1")
             resp = support.describe_cases(
@@ -359,93 +381,45 @@ class AwsManager:
                 includeCommunications=True,
                 maxResults=10,
             )
-            cases = resp.get("cases", [])
-            for case in cases:
-                # submittedBy 是提交工单的邮箱
+            for case in resp.get("cases", []):
                 submitted_by = case.get("submittedBy", "")
                 if submitted_by and "@" in submitted_by:
-                    result["email"] = submitted_by
-                    break
-                # 检查 ccEmailAddresses
-                cc_emails = case.get("ccEmailAddresses", [])
-                for cc in cc_emails:
+                    return submitted_by
+                for cc in case.get("ccEmailAddresses", []):
                     if "@" in cc:
-                        result["email"] = cc
-                        break
-                if result["email"]:
-                    break
-                # 检查通信记录中的邮箱
-                comms = case.get("recentCommunications", {}).get("communications", [])
-                for comm in comms:
-                    submitted = comm.get("submittedBy", "")
-                    if submitted and "@" in submitted:
-                        result["email"] = submitted
-                        break
-                if result["email"]:
-                    break
+                        return cc
+                for comm in case.get("recentCommunications", {}).get("communications", []):
+                    s = comm.get("submittedBy", "")
+                    if s and "@" in s:
+                        return s
         except Exception as e:
-            logger.debug(f"Support describe_cases failed: {e}")
+            logger.debug(f"Support API failed: {e}")
+        return None
 
-        # 如果没有工单，尝试创建一个测试工单来触发邮箱显示
-        if not result["email"]:
-            try:
-                support = self._get_client("support", "us-east-1")
-                # describe_services 本身不返回邮箱，但可以验证 support API 可用
-                # 尝试 describe_trusted_advisor_checks 获取账号信息
-                resp = support.describe_trusted_advisor_checks(language="en")
-                # Trusted Advisor 不直接返回邮箱，但如果 support API 可用
-                # 说明账号有 support 权限，邮箱可能在其他地方
-            except Exception:
-                pass
-
-        # fallback: 用账号ID标识
-        if not result["email"]:
-            result["email"] = f"root ({result['account_id']})"
-
-        return result
-
-    def get_account_creation_time(self) -> datetime | None:
-        """获取 AWS 账号创建时间 (通过 credential report 的 root 行)"""
-        # 方法1: credential report 的 root 行 user_creation_time 是账号创建时间
+    def _detect_creation_time(self) -> datetime | None:
+        """从 credential report root 行获取账号创建时间"""
         try:
-            import time, csv, io
-            iam = self._get_client("iam")
-            for _ in range(3):
-                try:
-                    resp = iam.generate_credential_report()
-                    if resp.get("State") == "COMPLETE":
-                        break
-                except Exception:
-                    pass
-                time.sleep(2)
-            resp = iam.get_credential_report()
-            report = resp["Content"].decode("utf-8")
-            reader = csv.DictReader(io.StringIO(report))
-            for row in reader:
-                arn_val = row.get("arn", "")
-                if ":root" in arn_val:
+            rows = self._get_credential_report()
+            for row in rows:
+                if ":root" in row.get("arn", ""):
                     creation_str = row.get("user_creation_time", "")
                     if creation_str and creation_str != "N/A":
-                        # 格式: 2024-01-15T08:30:00+00:00
                         from dateutil import parser as dateparser
                         return dateparser.parse(creation_str)
                     break
-        except Exception as e:
-            logger.debug(f"Credential report creation time failed: {e}")
-
-        # 方法2: fallback - 获取当前 IAM 用户的创建时间
+        except Exception:
+            pass
+        # fallback: 当前 IAM 用户创建时间
         try:
             iam = self._get_client("iam")
             user = iam.get_user()
             return user["User"].get("CreateDate")
         except Exception:
             pass
-
         return None
 
-    def get_account_country(self) -> str:
-        """尝试检测账号注册国家"""
-        # 方法1: 通过 account contact information 获取国家代码
+    def _detect_country(self) -> str:
+        """检测账号注册国家"""
         try:
             account_client = self._get_client("account", "us-east-1")
             contact = account_client.get_contact_information()
@@ -454,8 +428,6 @@ class AwsManager:
                 return country
         except Exception:
             pass
-
-        # 方法2: 通过默认区域推断国家
         region = self.account.default_region
         region_country = {
             "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
@@ -466,6 +438,20 @@ class AwsManager:
             "me-south-1": "BH", "af-south-1": "ZA",
         }
         return region_country.get(region, "US")
+
+    def _detect_default_region_vcpu(self) -> int:
+        """快速获取默认区域(us-east-1)的 on-demand vCPU 配额"""
+        region = "us-east-1"
+        try:
+            sq = self._get_client("service-quotas", region)
+            try:
+                resp = sq.get_service_quota(ServiceCode="ec2", QuotaCode="L-1216C47A")
+                return int(resp["Quota"]["Value"])
+            except Exception:
+                resp = sq.get_aws_default_service_quota(ServiceCode="ec2", QuotaCode="L-1216C47A")
+                return int(resp["Quota"]["Value"])
+        except Exception:
+            return 5
 
     def _get_region_vcpu(self, region: str) -> dict:
         """获取单个区域的 vCPU 配额"""
@@ -550,45 +536,67 @@ class AwsManager:
         return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
     def detect_account_info(self) -> dict:
-        """一次性检测账号所有信息并更新数据库（含 vCPU 配额）"""
-        info = {}
+        """一次性检测账号所有信息并更新数据库 - 全部并行执行"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        info = {"email": None, "arn": None, "account_id": None}
 
-        # 1. 邮箱/ARN/账号ID
-        email_info = self.get_account_email_and_arn()
-        info.update(email_info)
-
-        # 2. 注册时间
-        reg_time = self.get_account_creation_time()
-        info["register_time"] = reg_time
-
-        # 3. 国家
-        info["country"] = self.get_account_country()
-
-        # 4. vCPU 配额
+        # 先获取 STS 身份（后续都需要）
         try:
-            vcpu_result = self.get_vcpu_quotas_all_regions()
-            info["total_vcpus"] = vcpu_result["total_vcpus"]
-            info["max_on_demand"] = vcpu_result["max_on_demand"]
-            info["total_usage"] = vcpu_result["total_usage"]
-            info["vcpu_data"] = vcpu_result["regions"]
-            self.account.total_vcpus = vcpu_result["total_vcpus"]
-            self.account.max_on_demand = vcpu_result["max_on_demand"]
-            self.account.total_usage = vcpu_result["total_usage"]
-            self.account.vcpu_data = vcpu_result["regions"]
+            sts = self._get_client("sts")
+            identity = sts.get_caller_identity()
+            info["arn"] = identity.get("Arn", "")
+            info["account_id"] = identity.get("Account", "")
         except Exception as e:
-            logger.warning(f"vU detection failed for account {self.account.id}: {e}")
+            logger.error(f"STS failed: {e}")
+            return info
 
-        # 5. 更新数据库
-        if email_info.get("email"):
-            self.account.email = email_info["email"]
-            self.account.name = email_info["email"]  # 用邮箱作为名称
-        if email_info.get("account_id"):
-            self.account.aws_account_id = email_info["account_id"]
-        if email_info.get("arn"):
-            self.account.arn = email_info["arn"]
-        if reg_time:
-            self.account.register_time = reg_time
+        # 并行执行所有检测任务
+        results = {}
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {
+                pool.submit(self._detect_email_from_support): "email_support",
+                pool.submit(self._detect_email_from_credential_report): "email_cred",
+                pool.submit(self._detect_creation_time): "creation_time",
+                pool.submit(self._detect_country): "country",
+                pool.submit(self._detect_default_region_vcpu): "vcpus",
+            }
+            for future in as_completed(futures, timeout=40):
+                key = futures[future]
+                try:
+                    results[key] = future.result(timeout=35)
+                except Exception as e:
+                    logger.debug(f"Detection {key} failed: {e}")
+                    results[key] = None
+
+        # 邮箱: 优先 support 工单，其次 credential report
+        email = results.get("email_support") or results.get("email_cred")
+        if not email:
+            email = f"root ({info['account_id']})"
+        info["email"] = email
+
+        # 注册时间
+        info["register_time"] = results.get("creation_time")
+
+        # 国家
+        info["country"] = results.get("country") or "US"
+
+        # vCPU (单区域 us-east-1 的配额，和竞品一致)
+        vcpus = results.get("vcpus") or 5
+        info["total_vcpus"] = vcpus
+        info["max_on_demand"] = vcpus
+        info["total_usage"] = 0
+
+        # 更新数据库
+        self.account.email = info["email"]
+        self.account.name = info["email"]
+        self.account.aws_account_id = info["account_id"]
+        self.account.arn = info["arn"]
+        if info["register_time"]:
+            self.account.register_time = info["register_time"]
         self.account.register_country = info["country"]
+        self.account.total_vcpus = vcpus
+        self.account.max_on_demand = vcpus
+        self.account.total_usage = 0
 
         try:
             self.db.commit()
