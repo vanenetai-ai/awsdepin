@@ -11,3 +11,4 @@ backend/__pycache__/
 .idea/
 *.log
 node_modules/
+test*.py
