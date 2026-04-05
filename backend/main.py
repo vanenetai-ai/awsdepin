@@ -349,6 +349,15 @@ async def detect_account(account_id: int, user: User = Depends(get_current_user)
         "total_usage": getattr(account, 'total_usage', 0) or 0,
     }
 
+@app.post("/api/accounts/{account_id}/detect-ai")
+async def detect_ai(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """检测账号 AI 能力: Bedrock 模型、配额、Kiro/SSO、License"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).detect_ai_info())
+    return result
+
+
 @app.post("/api/accounts/{account_id}/vcpus")
 async def get_account_vcpus(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """获取账号各区域 vCPU 配额详情"""

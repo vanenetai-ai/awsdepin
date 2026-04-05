@@ -587,6 +587,37 @@ tbody tr:hover { background: rgba(99,102,241,0.04); }
     font-size: 13px;
 }
 
+/* AI Detection */
+.ai-section { margin-bottom: 16px; }
+.ai-section-title {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 8px 0 6px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+}
+.ai-section-body { padding: 4px 0; font-size: 13px; }
+.ai-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+.ai-table th {
+    text-align: left;
+    padding: 6px 8px;
+    background: var(--bg3);
+    color: var(--text2);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+}
+.ai-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+}
+.ai-table tr:hover td { background: rgba(99,102,241,0.05); }
+.ai-table code { background: var(--bg3); padding: 1px 4px; border-radius: 3px; }
+
 /* Responsive */
 @media (max-width: 768px) {
     .sidebar { width: 60px; }

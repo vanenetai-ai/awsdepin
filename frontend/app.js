@@ -145,6 +145,7 @@ function renderAccountCards(list) {
                 <button class="btn btn-sm btn-secondary" onclick="editAccountInline(${a.id})">✏️</button>
                 <button class="btn btn-sm btn-danger" onclick="deleteAccount(${a.id})">🗑</button>
                 <button class="btn btn-sm btn-secondary" onclick="detectAccount(${a.id})">🔍 检测</button>
+                <button class="btn btn-sm btn-secondary" onclick="detectAI(${a.id})">🤖 AI</button>
                 <button class="btn btn-sm btn-secondary" onclick="showVcpuDetail(${a.id})">⚡ vCPU</button>
                 <span class="acc-footer-spacer"></span>
                 <button class="btn btn-sm btn-secondary" onclick="window.location.hash='instances';loadInstances()">EC2 实例</button>
@@ -217,6 +218,101 @@ async function detectAllAccounts() {
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
     finally { hideLoading(); if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
+}
+
+// ==================== AI Detection ====================
+async function detectAI(id) {
+    const a = accountsCache.find(x => x.id === id);
+    const body = document.getElementById('ai-body');
+    const modal = document.getElementById('ai-modal');
+    modal.classList.add('show');
+    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在检测 AI 能力，可能需要 30-60 秒...</div></div>`;
+
+    try {
+        const res = await api(`/accounts/${id}/detect-ai`, { method: 'POST' });
+        renderAiResults(res, a);
+        toast('AI 检测完成');
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">检测失败: ${e.message}</div>`;
+        toast(e.message, 'error');
+    }
+}
+
+function renderAiResults(data, account) {
+    const body = document.getElementById('ai-body');
+    const accName = account ? (account.email || account.name) : '';
+    let html = '';
+
+    // Header
+    if (accName) html += `<div style="padding:8px 0;margin-bottom:8px;border-bottom:1px solid var(--border);color:var(--text2);font-size:13px">账号: ${accName}</div>`;
+
+    // SSO / Kiro
+    const ssoCount = data.sso_instances || 0;
+    html += `<div class="ai-section">
+        <div class="ai-section-title">🔐 Kiro / IAM Identity Center (SSO)</div>
+        <div class="ai-section-body">
+            ${ssoCount > 0
+                ? `<span class="badge badge-green">已启用</span> ${ssoCount} 个 SSO 实例 (可能有 Kiro 订阅)`
+                : `<span class="badge badge-gray">未检测到</span> 无 SSO 实例`}
+        </div>
+    </div>`;
+
+    // Licenses
+    const licenses = data.licenses || [];
+    html += `<div class="ai-section">
+        <div class="ai-section-title">📜 License Manager 许可证</div>
+        <div class="ai-section-body">`;
+    if (licenses.length) {
+        html += `<table class="ai-table"><thead><tr><th>名称</th><th>产品</th><th>状态</th></tr></thead><tbody>`;
+        for (const l of licenses) {
+            html += `<tr><td>${l.name}</td><td>${l.product}</td><td>${l.status}</td></tr>`;
+        }
+        html += '</tbody></table>';
+    } else {
+        html += '<span style="color:var(--text2)">无许可证</span>';
+    }
+    html += '</div></div>';
+
+    // Bedrock Models
+    const models = data.bedrock_models || [];
+    html += `<div class="ai-section">
+        <div class="ai-section-title">🧠 Bedrock Anthropic 模型 (us-east-1)</div>
+        <div class="ai-section-body">`;
+    if (models.length) {
+        html += `<div style="margin-bottom:6px;color:var(--text2);font-size:12px">共 ${models.length} 个模型</div>`;
+        html += `<table class="ai-table"><thead><tr><th>模型 ID</th><th>名称</th><th>输入</th><th>输出</th></tr></thead><tbody>`;
+        for (const m of models) {
+            html += `<tr>
+                <td><code style="font-size:11px">${m.id}</code></td>
+                <td>${m.name}</td>
+                <td>${(m.input || []).join(', ')}</td>
+                <td>${(m.output || []).join(', ')}</td>
+            </tr>`;
+        }
+        html += '</tbody></table>';
+    } else {
+        html += '<span style="color:var(--text2)">未检测到 Anthropic 模型</span>';
+    }
+    html += '</div></div>';
+
+    // Bedrock Quotas
+    const quotas = data.bedrock_quotas || [];
+    html += `<div class="ai-section">
+        <div class="ai-section-title">📊 Bedrock 关键配额 (Anthropic/Claude)</div>
+        <div class="ai-section-body">`;
+    if (quotas.length) {
+        html += `<table class="ai-table"><thead><tr><th>配额名称</th><th>值</th></tr></thead><tbody>`;
+        for (const q of quotas) {
+            const val = q.value >= 1000000 ? (q.value / 1000000).toFixed(1) + 'M' : q.value >= 1000 ? (q.value / 1000).toFixed(1) + 'K' : q.value;
+            html += `<tr><td style="font-size:12px">${q.name}</td><td style="font-weight:bold;color:var(--blue)">${val}</td></tr>`;
+        }
+        html += '</tbody></table>';
+    } else {
+        html += '<span style="color:var(--text2)">未检测到 Bedrock 配额 (可能未开通)</span>';
+    }
+    html += '</div></div>';
+
+    body.innerHTML = html;
 }
 
 async function showVcpuDetail(id) {
