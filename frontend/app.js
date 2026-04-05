@@ -113,7 +113,8 @@ function renderAccountCards(list) {
         const displayName = a.email || a.name || a.access_key_id;
         const age = timeAgo(a.register_time || a.added_at);
         const flag = a.country_flag || '';
-        const vcpuText = a.max_on_demand ? `${a.max_on_demand} vCPUs` : '';
+        const vcpuUsage = a.total_usage || 0;
+        const vcpuText = a.max_on_demand ? `${vcpuUsage}/${a.max_on_demand} vCPUs` : '';
         const checked = selectedAccounts.has(a.id) ? 'checked' : '';
         return `
         <div class="acc-card" data-id="${a.id}">
@@ -236,8 +237,26 @@ async function showVcpuDetail(id) {
         const res = await api(`/accounts/${id}/vcpus`, { method: 'POST' });
         renderVcpuTable(res.regions);
         // 更新缓存
-        if (a) { a.vcpu_data = res.regions; a.total_vcpus = res.total_vcpus; a.max_on_demand = res.max_on_demand || 0; }
-        loadAccounts(); // 刷新卡片上的 vCPU 数字
+        if (a) {
+            a.vcpu_data = res.regions;
+            a.total_vcpus = res.total_vcpus;
+            a.max_on_demand = res.max_on_demand || 0;
+            a.total_usage = res.total_usage || 0;
+        }
+        // 实时更新卡片上的 vCPU 标签（不重新加载整个列表）
+        const card = document.querySelector(`.acc-card[data-id="${id}"]`);
+        if (card) {
+            const vcpuEl = card.querySelector('.acc-vcpu');
+            const usage = a ? a.total_usage : 0;
+            const max = a ? a.max_on_demand : 0;
+            if (vcpuEl && max) {
+                vcpuEl.textContent = `⚡ ${usage}/${max} vCPUs`;
+            } else if (!vcpuEl && max) {
+                // 之前没有 vcpu 标签，需要插入
+                const left = card.querySelector('.acc-card-left');
+                if (left) left.insertAdjacentHTML('beforeend', `<span class="acc-vcpu" onclick="showVcpuDetail(${id})" title="点击查看详情">⚡ ${usage}/${max} vCPUs</span>`);
+            }
+        }
     } catch (e) {
         body.innerHTML = `<div style="color:var(--red);padding:20px">获取失败: ${e.message}</div>`;
     }

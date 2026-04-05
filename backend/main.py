@@ -192,6 +192,7 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
                 "group_name": getattr(a, 'group_name', '') or "",
                 "total_vcpus": getattr(a, 'total_vcpus', 0) or 0,
                 "max_on_demand": getattr(a, 'max_on_demand', 0) or 0,
+                "total_usage": getattr(a, 'total_usage', 0) or 0,
                 "vcpu_data": getattr(a, 'vcpu_data', None),
             })
         except Exception as e:
@@ -355,6 +356,7 @@ async def get_account_vcpus(account_id: int, user: User = Depends(get_current_us
     # 保存到数据库
     account.total_vcpus = result["total_vcpus"]
     account.max_on_demand = result.get("max_on_demand", 0)
+    account.total_usage = result.get("total_usage", 0)
     account.vcpu_data = result["regions"]
     db.commit()
     return result

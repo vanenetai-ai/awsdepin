@@ -55,6 +55,7 @@ class AwsAccount(Base):
     group_name = Column(String(100), default="")  # 分组名称
     total_vcpus = Column(Integer, default=0)      # 总 vCPU 配额
     max_on_demand = Column(Integer, default=0)    # 单区域最高 On-Demand vCPU 限制
+    total_usage = Column(Integer, default=0)      # 总 vCPU 使用量
     vcpu_data = Column(JSON)              # 各区域 vCPU 详情 JSON
 
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -380,29 +380,34 @@ class AwsManager:
             try:
                 import time, csv, io
                 iam = self._get_client("iam")
-                try:
-                    iam.generate_credential_report()
-                except Exception:
-                    pass
-                time.sleep(3)  # 等待报告生成
+                # 尝试多次生成报告
+                for _ in range(3):
+                    try:
+                        resp = iam.generate_credential_report()
+                        if resp.get("State") == "COMPLETE":
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(2)
                 resp = iam.get_credential_report()
                 report = resp["Content"].decode("utf-8")
                 reader = csv.DictReader(io.StringIO(report))
                 for row in reader:
                     user = row.get("user", "")
                     arn_val = row.get("arn", "")
-                    # root 账号的 user 列就是邮箱地址
-                    if ":root" in arn_val or user == "<root_account>":
-                        # 某些报告中 user 列直接是邮箱
+                    # root 账号: arn 包含 :root, user 列是 <root_account> 或邮箱
+                    if ":root" in arn_val:
                         if "@" in user:
                             result["email"] = user
                             break
-                    # 也检查其他用户行中是否有邮箱格式的 user
-                    elif "@" in user:
+                        # 有些报告 user 是 <root_account>，无法获取邮箱
+                        continue
+                    # 非 root 行: 如果 user 包含 @ 可能是邮箱格式的用户名
+                    if "@" in user:
                         result["email"] = user
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Credential report failed: {e}")
 
         # 方法4: 从 ARN 推断
         if not result["email"] and result["arn"]:
@@ -544,7 +549,8 @@ class AwsManager:
 
         # max_on_demand = 单区域最高 on_demand_limit
         max_on_demand = max((d["on_demand_limit"] for d in regions_data.values()), default=5)
-        return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand}
+        total_usage = sum(d["on_demand_usage"] for d in regions_data.values())
+        return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
     def detect_account_info(self) -> dict:
         """一次性检测账号所有信息并更新数据库"""
