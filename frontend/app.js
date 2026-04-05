@@ -321,17 +321,13 @@ async function showVcpuDetail(id) {
     const body = document.getElementById('vcpu-body');
     modal.classList.add('show');
 
-    // 如果已有缓存数据先显示
-    if (a && a.vcpu_data) {
-        renderVcpuTable(a.vcpu_data);
-    } else {
-        body.innerHTML = '<div style="text-align:center;padding:20px">加载中...</div>';
-    }
+    // 始终先显示加载动画，等后端返回最新数据
+    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在扫描全部区域 vCPU 配额，可能需要 1-2 分钟...</div></div>`;
 
-    // 实时获取
     try {
         const res = await api(`/accounts/${id}/vcpus`, { method: 'POST' });
         renderVcpuTable(res.regions);
+        toast('vCPU 检测完成');
         // 更新缓存
         if (a) {
             a.vcpu_data = res.regions;
@@ -339,7 +335,7 @@ async function showVcpuDetail(id) {
             a.max_on_demand = res.max_on_demand || 0;
             a.total_usage = res.total_usage || 0;
         }
-        // 实时更新卡片上的 vCPU 标签（不重新加载整个列表）
+        // 实时更新卡片上的 vCPU 标签
         const card = document.querySelector(`.acc-card[data-id="${id}"]`);
         if (card) {
             const vcpuEl = card.querySelector('.acc-vcpu');
@@ -348,13 +344,12 @@ async function showVcpuDetail(id) {
             if (vcpuEl && max) {
                 vcpuEl.textContent = `⚡ ${usage}/${max} vCPUs`;
             } else if (!vcpuEl && max) {
-                // 之前没有 vcpu 标签，需要插入
                 const left = card.querySelector('.acc-card-left');
                 if (left) left.insertAdjacentHTML('beforeend', `<span class="acc-vcpu" onclick="showVcpuDetail(${id})" title="点击查看详情">⚡ ${usage}/${max} vCPUs</span>`);
             }
         }
     } catch (e) {
-        body.innerHTML = `<div style="color:var(--red);padding:20px">获取失败: ${e.message}</div>`;
+        body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">获取失败: ${e.message}</div>`;
     }
 }
 
