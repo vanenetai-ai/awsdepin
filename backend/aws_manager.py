@@ -152,24 +152,33 @@ class AwsManager:
         )
         return sg_id
 
-    def _ensure_key_pair(self, region: str) -> str:
+    def _ensure_key_pair(self, region: str) -> tuple:
+        """返回 (key_name, private_key_pem)，已存在的密钥从本地文件读取"""
         key_name = f"depin-key-{region}"
         ec2 = self._get_client("ec2", region)
+        import os
+        key_dir = "/app/data/keys"
+        key_path = os.path.join(key_dir, f"{key_name}.pem")
         try:
             ec2.describe_key_pairs(KeyNames=[key_name])
-            return key_name
+            # 密钥已存在，尝试从本地读取私钥
+            if os.path.exists(key_path):
+                with open(key_path, "r") as f:
+                    return key_name, f.read()
+            return key_name, None
         except Exception:
             pass
         resp = ec2.create_key_pair(KeyName=key_name)
+        private_key = resp["KeyMaterial"]
         # 保存私钥到本地
-        import os
-        key_dir = "/app/data/keys"
         os.makedirs(key_dir, exist_ok=True)
-        key_path = os.path.join(key_dir, f"{key_name}.pem")
         with open(key_path, "w") as f:
-            f.write(resp["KeyMaterial"])
-        os.chmod(key_path, 0o600)
-        return key_name
+            f.write(private_key)
+        try:
+            os.chmod(key_path, 0o600)
+        except Exception:
+            pass
+        return key_name, private_key
 
     def launch_instance(
         self,
@@ -195,7 +204,7 @@ class AwsManager:
                 raise ValueError(f"No Ubuntu AMI found in region {region}")
 
         sg_id = self._ensure_security_group(region)
-        key_name = self._ensure_key_pair(region)
+        key_name, private_key = self._ensure_key_pair(region)
         ud = user_data or DEFAULT_USER_DATA
 
         ec2 = self._get_client("ec2", region)
@@ -224,6 +233,7 @@ class AwsManager:
             instance_type=instance_type,
             state=inst_data["State"]["Name"],
             key_name=key_name,
+            private_key=private_key,
         )
         self.db.add(instance)
         self.db.commit()

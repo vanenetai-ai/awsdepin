@@ -76,6 +76,7 @@ class Instance(Base):
     public_ip = Column(String(50))
     private_ip = Column(String(50))
     key_name = Column(String(100))
+    private_key = Column(Text)  # PEM 私钥，用于 SSH 连接
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
