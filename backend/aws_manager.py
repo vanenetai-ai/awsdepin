@@ -578,18 +578,22 @@ class AwsManager:
                 pool.submit(self._detect_country): "country",
                 pool.submit(self.get_vcpu_quotas_all_regions): "vcpus",
             }
-            for future in as_completed(futures, timeout=150):
-                key = futures[future]
-                try:
-                    results[key] = future.result(timeout=140)
-                except Exception as e:
-                    logger.debug(f"Detection {key} failed: {e}")
-                    results[key] = None
+            try:
+                for future in as_completed(futures, timeout=150):
+                    key = futures[future]
+                    try:
+                        results[key] = future.result(timeout=140)
+                    except Exception as e:
+                        logger.debug(f"Detection {key} failed: {e}")
+                        results[key] = None
+            except Exception as e:
+                logger.warning(f"as_completed timeout, got {len(results)}/{len(futures)} results: {e}")
 
         # 邮箱: 优先 organizations，其次 budgets，最后 credential report
         email = results.get("email_org") or results.get("email_budgets") or results.get("email_cred")
         if not email:
-            email = f"root ({info['account_id']})"
+            # 只有数据库里也没有邮箱时才用 fallback
+            email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
 
         # 注册时间
@@ -606,10 +610,11 @@ class AwsManager:
             info["total_usage"] = vcpu_result.get("total_usage", 0)
             info["vcpu_data"] = vcpu_result.get("regions")
         else:
-            info["total_vcpus"] = 5
-            info["max_on_demand"] = 5
-            info["total_usage"] = 0
-            info["vcpu_data"] = None
+            # vCPU 检测失败，保留数据库已有值，不覆盖
+            info["total_vcpus"] = self.account.total_vcpus or 0
+            info["max_on_demand"] = self.account.max_on_demand or 0
+            info["total_usage"] = self.account.total_usage or 0
+            info["vcpu_data"] = self.account.vcpu_data
 
         # 更新数据库
         self.account.email = info["email"]
@@ -714,20 +719,23 @@ class AwsManager:
                 pool.submit(_detect_sso): "sso",
                 pool.submit(_detect_licenses): "licenses",
             }
-            for future in as_completed(tasks, timeout=60):
-                key = tasks[future]
-                try:
-                    val = future.result(timeout=55)
-                    if key == "models":
-                        result["bedrock_models"] = val
-                    elif key == "quotas":
-                        result["bedrock_quotas"] = val
-                    elif key == "sso":
-                        result["sso_instances"] = val
-                    elif key == "licenses":
-                        result["licenses"] = val
-                except Exception as e:
-                    logger.debug(f"AI detection {key} failed: {e}")
+            try:
+                for future in as_completed(tasks, timeout=60):
+                    key = tasks[future]
+                    try:
+                        val = future.result(timeout=55)
+                        if key == "models":
+                            result["bedrock_models"] = val
+                        elif key == "quotas":
+                            result["bedrock_quotas"] = val
+                        elif key == "sso":
+                            result["sso_instances"] = val
+                        elif key == "licenses":
+                            result["licenses"] = val
+                    except Exception as e:
+                        logger.debug(f"AI detection {key} failed: {e}")
+            except Exception as e:
+                logger.warning(f"AI as_completed timeout: {e}")
 
         return result
 
