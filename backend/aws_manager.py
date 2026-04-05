@@ -357,6 +357,46 @@ class AwsManager:
         self._cred_report_cache = rows
         return rows
 
+    def _detect_primary_email(self) -> str | None:
+        """通过 account:GetPrimaryEmail 获取 root 邮箱 (需要权限或 Organization)"""
+        try:
+            sts = self._get_client("sts")
+            account_id = sts.get_caller_identity()["Account"]
+            acct = self._get_client("account", "us-east-1")
+            resp = acct.get_primary_email(AccountId=account_id)
+            email = resp.get("PrimaryEmail", "")
+            if email and "@" in email:
+                return email
+        except Exception as e:
+            logger.debug(f"get_primary_email failed: {e}")
+        return None
+
+    def _detect_email_from_organizations(self) -> str | None:
+        """从 Organizations 获取邮箱 (describe_account 或 describe_organization)"""
+        try:
+            sts = self._get_client("sts")
+            account_id = sts.get_caller_identity()["Account"]
+            org = self._get_client("organizations")
+            # 先尝试 describe_account (能拿到具体账号邮箱)
+            try:
+                resp = org.describe_account(AccountId=account_id)
+                email = resp.get("Account", {}).get("Email", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                pass
+            # 再尝试 describe_organization (拿 master 邮箱)
+            try:
+                resp = org.describe_organization()
+                email = resp.get("Organization", {}).get("MasterAccountEmail", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"Organizations email failed: {e}")
+        return None
+
     def _detect_email_from_account_contact(self) -> str | None:
         """从 Account contact information 获取邮箱或名字"""
         try:
@@ -564,8 +604,10 @@ class AwsManager:
 
         # 并行执行所有检测任务 - 不设超时，等每个任务完成
         results = {}
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        with ThreadPoolExecutor(max_workers=7) as pool:
             futures = {
+                pool.submit(self._detect_primary_email): "email_primary",
+                pool.submit(self._detect_email_from_organizations): "email_org",
                 pool.submit(self._detect_email_from_account_contact): "email_contact",
                 pool.submit(self._detect_email_from_budgets): "email_budgets",
                 pool.submit(self._detect_creation_time): "creation_time",
@@ -580,8 +622,14 @@ class AwsManager:
                     logger.warning(f"Detection {key} failed: {e}")
                     results[key] = None
 
-        # 邮箱: 优先 account contact，其次 budgets
-        email = results.get("email_contact") or results.get("email_budgets")
+        # 邮箱优先级: primary_email > organizations > account_contact(邮箱) > budgets > account_contact(名字)
+        email = results.get("email_primary") or results.get("email_org") or results.get("email_budgets")
+        # account_contact 可能返回邮箱或名字，邮箱优先
+        contact_result = results.get("email_contact")
+        if not email and contact_result and "@" in contact_result:
+            email = contact_result
+        if not email and contact_result:
+            email = contact_result  # FullName 作为显示名
         if not email:
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
