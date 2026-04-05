@@ -202,7 +202,13 @@ async function detectAccount(id) {
     showLoading('正在检测账号信息...');
     try {
         const res = await api(`/accounts/${id}/detect`, { method: 'POST' });
-        toast(`检测完成: ${res.email || res.name}`);
+        if (res._proxy_error) {
+            toast('⚠️ 代理连接失败！请检查代理设置', 'error');
+        } else if (res._errors && res._errors.length > 0) {
+            toast(`检测完成 (${res._errors.length}个警告): ${res.email || res.name}`, 'warning');
+        } else {
+            toast(`检测完成: ${res.email || res.name}`);
+        }
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
     finally { hideLoading(); if (btn) btn.classList.remove('loading'); }

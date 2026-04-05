@@ -589,7 +589,7 @@ class AwsManager:
 
     def detect_account_info(self) -> dict:
         """一次性检测账号所有信息并更新数据库 - 全部串行执行，确保稳定"""
-        info = {"email": None, "arn": None, "account_id": None, "_errors": []}
+        info = {"email": None, "arn": None, "account_id": None, "_errors": [], "_proxy_error": False}
 
         # 先获取 STS 身份
         try:
@@ -598,8 +598,14 @@ class AwsManager:
             info["arn"] = identity.get("Arn", "")
             info["account_id"] = identity.get("Account", "")
         except Exception as e:
+            err_str = str(e)
             logger.error(f"STS failed: {e}")
-            info["_errors"].append(f"STS: {e}")
+            # 检测是否是代理错误
+            if "proxy" in err_str.lower() or "407" in err_str or "ProxyConnectionError" in err_str:
+                info["_errors"].append(f"代理连接失败: {err_str[:150]}")
+                info["_proxy_error"] = True
+            else:
+                info["_errors"].append(f"AWS 连接失败: {err_str[:150]}")
             return info
 
         # 串行执行所有检测任务 - 避免线程安全问题
