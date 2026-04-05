@@ -553,7 +553,7 @@ class AwsManager:
         return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
     def detect_account_info(self) -> dict:
-        """一次性检测账号所有信息并更新数据库"""
+        """一次性检测账号所有信息并更新数据库（含 vCPU 配额）"""
         info = {}
 
         # 1. 邮箱/ARN/账号ID
@@ -567,7 +567,21 @@ class AwsManager:
         # 3. 国家
         info["country"] = self.get_account_country()
 
-        # 4. 更新数据库
+        # 4. vCPU 配额
+        try:
+            vcpu_result = self.get_vcpu_quotas_all_regions()
+            info["total_vcpus"] = vcpu_result["total_vcpus"]
+            info["max_on_demand"] = vcpu_result["max_on_demand"]
+            info["total_usage"] = vcpu_result["total_usage"]
+            info["vcpu_data"] = vcpu_result["regions"]
+            self.account.total_vcpus = vcpu_result["total_vcpus"]
+            self.account.max_on_demand = vcpu_result["max_on_demand"]
+            self.account.total_usage = vcpu_result["total_usage"]
+            self.account.vcpu_data = vcpu_result["regions"]
+        except Exception as e:
+            logger.warning(f"vU detection failed for account {self.account.id}: {e}")
+
+        # 5. 更新数据库
         if email_info.get("email"):
             self.account.email = email_info["email"]
             self.account.name = email_info["email"]  # 用邮箱作为名称

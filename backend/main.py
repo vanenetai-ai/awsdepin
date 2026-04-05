@@ -345,6 +345,8 @@ async def detect_account(account_id: int, user: User = Depends(get_current_user)
         "register_time": str(account.register_time) if account.register_time else None,
         "register_country": account.register_country,
         "name": account.name,
+        "max_on_demand": getattr(account, 'max_on_demand', 0) or 0,
+        "total_usage": getattr(account, 'total_usage', 0) or 0,
     }
 
 @app.post("/api/accounts/{account_id}/vcpus")
