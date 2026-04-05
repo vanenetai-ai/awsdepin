@@ -587,11 +587,30 @@ class AwsManager:
         total_usage = sum(d["on_demand_usage"] for d in regions_data.values())
         return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
+    def _make_detect_client(self, service: str, region: str = None):
+        """为并行检测创建独立的 boto3 client（不使用缓存，线程安全）"""
+        region = region or self.account.default_region
+        slow_services = {"service-quotas", "iam", "account", "organizations", "support", "budgets", "bedrock", "sso-admin", "license-manager"}
+        if service in slow_services:
+            config_kwargs = {"connect_timeout": 10, "read_timeout": 30, "retries": {"max_attempts": 2}}
+        else:
+            config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
+        if self.proxy_config:
+            config_kwargs["proxies"] = self.proxy_config
+        return boto3.client(
+            service,
+            aws_access_key_id=self.account.access_key_id,
+            aws_secret_access_key=self.account.secret_access_key,
+            region_name=region,
+            config=Config(**config_kwargs),
+        )
+
     def detect_account_info(self) -> dict:
-        """一次性检测账号所有信息并更新数据库 - 全部串行执行，确保稳定"""
+        """一次性检测账号所有信息并更新数据库 - 并行执行，每个任务独立 client"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         info = {"email": None, "arn": None, "account_id": None, "_errors": [], "_proxy_error": False}
 
-        # 先获取 STS 身份
+        # 先获取 STS 身份（必须先拿到 account_id）
         try:
             sts = self._get_client("sts")
             identity = sts.get_caller_identity()
@@ -600,7 +619,6 @@ class AwsManager:
         except Exception as e:
             err_str = str(e)
             logger.error(f"STS failed: {e}")
-            # 检测是否是代理错误
             if "proxy" in err_str.lower() or "407" in err_str or "ProxyConnectionError" in err_str:
                 info["_errors"].append(f"代理连接失败: {err_str[:150]}")
                 info["_proxy_error"] = True
@@ -608,37 +626,148 @@ class AwsManager:
                 info["_errors"].append(f"AWS 连接失败: {err_str[:150]}")
             return info
 
-        # 串行执行所有检测任务 - 避免线程安全问题
-        results = {}
-        tasks = [
-            ("email_primary", self._detect_primary_email),
-            ("email_org", self._detect_email_from_organizations),
-            ("email_contact", self._detect_email_from_account_contact),
-            ("email_budgets", self._detect_email_from_budgets),
-            ("creation_time", self._detect_creation_time),
-            ("country", self._detect_country),
-        ]
-        for key, func in tasks:
+        account_id = info["account_id"]
+
+        # 每个并行任务用独立 client，线程安全
+        def _task_primary_email():
+            acct = self._make_detect_client("account", "us-east-1")
+            resp = acct.get_primary_email(AccountId=account_id)
+            email = resp.get("PrimaryEmail", "")
+            return email if email and "@" in email else None
+
+        def _task_org_email():
+            org = self._make_detect_client("organizations")
             try:
-                results[key] = func()
-                logger.info(f"Detection {key}: {results[key]}")
-            except Exception as e:
-                logger.warning(f"Detection {key} failed: {e}")
-                info["_errors"].append(f"{key}: {str(e)[:100]}")
-                results[key] = None
+                resp = org.describe_account(AccountId=account_id)
+                email = resp.get("Account", {}).get("Email", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                pass
+            try:
+                resp = org.describe_organization()
+                email = resp.get("Organization", {}).get("MasterAccountEmail", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                pass
+            return None
+
+        def _task_budgets_email():
+            bgt = self._make_detect_client("budgets", "us-east-1")
+            resp = bgt.describe_budgets(AccountId=account_id, MaxResults=10)
+            for budget in resp.get("Budgets", []):
+                try:
+                    notifs = bgt.describe_notifications_for_budget(
+                        AccountId=account_id, BudgetName=budget["BudgetName"]
+                    )
+                    for n in notifs.get("Notifications", []):
+                        subs = bgt.describe_subscribers_for_notification(
+                            AccountId=account_id,
+                            BudgetName=budget["BudgetName"],
+                            Notification=n
+                        )
+                        for s in subs.get("Subscribers", []):
+                            if s.get("SubscriptionType") == "EMAIL":
+                                addr = s.get("Address", "")
+                                if "@" in addr:
+                                    return addr
+                except Exception:
+                    continue
+            return None
+
+        def _task_contact_email():
+            acct = self._make_detect_client("account", "us-east-1")
+            contact = acct.get_contact_information()
+            ci = contact.get("ContactInformation", {})
+            email = ci.get("EmailAddress", "")
+            if email and "@" in email:
+                return email
+            name = ci.get("FullName", "")
+            return name if name else None
+
+        def _task_creation_time():
+            import time as _time, csv, io
+            iam = self._make_detect_client("iam")
+            for _ in range(3):
+                try:
+                    resp = iam.generate_credential_report()
+                    if resp.get("State") == "COMPLETE":
+                        break
+                except Exception:
+                    pass
+                _time.sleep(1)
+            resp = iam.get_credential_report()
+            report = resp["Content"].decode("utf-8")
+            rows = list(csv.DictReader(io.StringIO(report)))
+            for row in rows:
+                if ":root" in row.get("arn", ""):
+                    creation_str = row.get("user_creation_time", "")
+                    if creation_str and creation_str != "N/A":
+                        from dateutil import parser as dateparser
+                        return dateparser.parse(creation_str)
+                    break
+            # fallback
+            try:
+                user = iam.get_user()
+                return user["User"].get("CreateDate")
+            except Exception:
+                pass
+            return None
+
+        def _task_country():
+            try:
+                acct = self._make_detect_client("account", "us-east-1")
+                contact = acct.get_contact_information()
+                country = contact.get("ContactInformation", {}).get("CountryCode", "")
+                if country:
+                    return country
+            except Exception:
+                pass
+            region = self.account.default_region
+            region_country = {
+                "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
+                "eu-west-1": "IE", "eu-west-2": "GB", "eu-west-3": "FR", "eu-central-1": "DE",
+                "eu-north-1": "SE", "ap-northeast-1": "JP", "ap-northeast-2": "KR",
+                "ap-northeast-3": "JP", "ap-southeast-1": "SG", "ap-southeast-2": "AU",
+                "ap-south-1": "IN", "sa-east-1": "BR", "ca-central-1": "CA",
+            }
+            return region_country.get(region, "US")
+
+        # 并行执行所有检测任务
+        task_map = {
+            "email_primary": _task_primary_email,
+            "email_org": _task_org_email,
+            "email_budgets": _task_budgets_email,
+            "email_contact": _task_contact_email,
+            "creation_time": _task_creation_time,
+            "country": _task_country,
+        }
+        results = {}
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            futures = {pool.submit(fn): key for key, fn in task_map.items()}
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result()
+                    logger.info(f"Detection {key}: {results[key]}")
+                except Exception as e:
+                    err_msg = str(e)[:100]
+                    logger.warning(f"Detection {key} failed: {err_msg}")
+                    info["_errors"].append(f"{key}: {err_msg}")
+                    results[key] = None
 
         # vCPU 单独调用（内部有自己的线程池）
         try:
             results["vcpus"] = self.get_vcpu_quotas_all_regions()
-            logger.info(f"Detection vcpus: total={results['vcpus'].get('total_vcpus')}, max={results['vcpus'].get('max_on_demand')}")
+            logger.info(f"Detection vcpus: total={results['vcpus'].get('total_vcpus')}")
         except Exception as e:
             logger.warning(f"Detection vcpus failed: {e}")
             info["_errors"].append(f"vcpus: {str(e)[:100]}")
             results["vcpus"] = None
 
-        # 邮箱优先级: primary_email > organizations > account_contact(邮箱) > budgets > account_contact(名字)
+        # 邮箱优先级: primary > org > budgets > contact(邮箱) > contact(名字)
         email = results.get("email_primary") or results.get("email_org") or results.get("email_budgets")
-        # account_contact 可能返回邮箱或名字，邮箱优先
         contact_result = results.get("email_contact")
         if not email and contact_result and "@" in contact_result:
             email = contact_result
@@ -647,14 +776,10 @@ class AwsManager:
         if not email:
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
-
-        # 注册时间
         info["register_time"] = results.get("creation_time")
-
-        # 国家
         info["country"] = results.get("country") or "US"
 
-        # vCPU (全区域扫描) - 必须是真实数据
+        # vCPU
         vcpu_result = results.get("vcpus")
         if isinstance(vcpu_result, dict) and vcpu_result.get("regions"):
             info["total_vcpus"] = vcpu_result.get("total_vcpus", 0)
