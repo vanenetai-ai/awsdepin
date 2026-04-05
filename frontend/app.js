@@ -16,6 +16,17 @@ async function api(path, opts = {}) {
     return res.json();
 }
 
+function showLoading(text = '处理中，请稍候...') {
+    const el = document.getElementById('global-loading');
+    const txt = document.getElementById('loading-text');
+    if (txt) txt.textContent = text;
+    if (el) el.classList.add('show');
+}
+function hideLoading() {
+    const el = document.getElementById('global-loading');
+    if (el) el.classList.remove('show');
+}
+
 function toast(msg, type = 'success') {
     const c = document.getElementById('toast-container');
     const el = document.createElement('div');
@@ -172,6 +183,7 @@ function updateBatchBar() {
 async function batchDeleteSelected() {
     if (!selectedAccounts.size) return;
     if (!confirm(`确定删除选中的 ${selectedAccounts.size} 个账号？`)) return;
+    showLoading('正在批量删除账号...');
     try {
         await api('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids: [...selectedAccounts] }) });
         toast(`已删除 ${selectedAccounts.size} 个账号`);
@@ -179,30 +191,31 @@ async function batchDeleteSelected() {
         updateBatchBar();
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 
 async function detectAccount(id) {
     const btn = event?.target;
     if (btn) btn.classList.add('loading');
-    toast('正在检测账号信息...', 'info');
+    showLoading('正在检测账号信息...');
     try {
         const res = await api(`/accounts/${id}/detect`, { method: 'POST' });
         toast(`检测完成: ${res.email || res.name}`);
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
-    finally { if (btn) btn.classList.remove('loading'); }
+    finally { hideLoading(); if (btn) btn.classList.remove('loading'); }
 }
 
 async function detectAllAccounts() {
     const btn = event?.target;
     if (btn) { btn.classList.add('loading'); btn.textContent = '检测中...'; }
-    toast('正在并发检测所有账号...', 'info');
+    showLoading('正在并发检测所有账号，请耐心等待...');
     try {
         const res = await api('/accounts/detect-all', { method: 'POST' });
         toast(`检测完成: ${res.detected} 成功, ${res.errors} 失败`);
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
-    finally { if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
+    finally { hideLoading(); if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
 }
 
 async function showVcpuDetail(id) {
@@ -280,6 +293,7 @@ async function saveAccountEdit(e) {
 
 async function createAccount(e) {
     e.preventDefault();
+    showLoading('正在添加账号...');
     try {
         const data = { name: document.getElementById('acc-name').value, access_key_id: document.getElementById('acc-key').value, secret_access_key: document.getElementById('acc-secret').value, default_region: document.getElementById('acc-region').value };
         const res = await api('/accounts', { method: 'POST', body: JSON.stringify(data) });
@@ -287,6 +301,7 @@ async function createAccount(e) {
         toast(res.verify?.valid ? '账号已添加，验证通过' : `账号已添加，验证失败: ${res.verify?.error || ''}`);
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 
 async function verifyAccount(id) {
@@ -298,11 +313,14 @@ async function verifyAccount(id) {
 
 async function deleteAccount(id) {
     if (!confirm('确定删除此账号？')) return;
+    showLoading('正在删除账号...');
     try { await api(`/accounts/${id}`, { method: 'DELETE' }); toast('账号已删除'); loadAccounts(); } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 
 async function batchCreateAccounts(e) {
     e.preventDefault();
+    showLoading('正在批量添加账号...');
     try {
         const data = { text: document.getElementById('batch-acc-text').value, default_region: document.getElementById('batch-acc-region').value };
         const res = await api('/accounts/batch', { method: 'POST', body: JSON.stringify(data) });
@@ -311,6 +329,7 @@ async function batchCreateAccounts(e) {
         document.getElementById('batch-acc-text').value = '';
         loadAccounts();
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 
 // ==================== Instances ====================
@@ -356,19 +375,24 @@ function updateInstanceBatchBar() {
 async function batchDeleteInstances() {
     if (!selectedInstances.size) return;
     if (!confirm(`确定删除选中的 ${selectedInstances.size} 个实例记录？`)) return;
+    showLoading('正在批量删除实例...');
     try {
         await api('/instances/batch-delete', { method: 'POST', body: JSON.stringify({ ids: [...selectedInstances] }) });
         toast(`已删除 ${selectedInstances.size} 个实例`);
         selectedInstances.clear();
         loadInstances();
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 async function deleteInstanceRecord(id) {
     if (!confirm('确定删除此实例记录？')) return;
+    showLoading('正在删除实例记录...');
     try { await api(`/instances/${id}`, { method: 'DELETE' }); toast('已删除'); loadInstances(); } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 async function launchInstance(e) {
     e.preventDefault();
+    showLoading('正在启动实例，请耐心等待...');
     try {
         const count = parseInt(document.getElementById('launch-count').value) || 1;
         const selectedAccounts = Array.from(document.getElementById('launch-account').selectedOptions).map(o => parseInt(o.value));
@@ -394,12 +418,13 @@ async function launchInstance(e) {
         toast(`批量启动完成: ${totalOk} 成功, ${totalErr} 失败`);
         loadInstances();
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
-async function syncInstance(id) { try { const res = await api(`/instances/${id}/sync`, { method: 'POST' }); toast(`已同步: ${res.state}`); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
-async function startInstance(id) { try { await api(`/instances/${id}/start`, { method: 'POST' }); toast('启动指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
-async function stopInstance(id) { try { await api(`/instances/${id}/stop`, { method: 'POST' }); toast('停止指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
-async function terminateInstance(id) { if (!confirm('确定终止？')) return; try { await api(`/instances/${id}/terminate`, { method: 'POST' }); toast('已终止'); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
-async function syncAllInstances() { try { const res = await api('/instances/sync-all', { method: 'POST' }); toast(`已同步 ${res.synced} 个`); loadInstances(); } catch (e) { toast(e.message, 'error'); } }
+async function syncInstance(id) { showLoading('正在同步实例...'); try { const res = await api(`/instances/${id}/sync`, { method: 'POST' }); toast(`已同步: ${res.state}`); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
+async function startInstance(id) { showLoading('正在启动实例...'); try { await api(`/instances/${id}/start`, { method: 'POST' }); toast('启动指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
+async function stopInstance(id) { showLoading('正在停止实例...'); try { await api(`/instances/${id}/stop`, { method: 'POST' }); toast('停止指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
+async function terminateInstance(id) { if (!confirm('确定终止？')) return; showLoading('正在终止实例...'); try { await api(`/instances/${id}/terminate`, { method: 'POST' }); toast('已终止'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
+async function syncAllInstances() { showLoading('正在同步所有实例...'); try { const res = await api('/instances/sync-all', { method: 'POST' }); toast(`已同步 ${res.synced} 个`); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
 // ==================== Proxies ====================
 async function loadProxies() {
@@ -430,7 +455,7 @@ async function testProxy(id) {
     } catch (e) { toast(e.message, 'error'); if (el) el.innerHTML = '<span class="badge badge-red">错误</span>'; }
 }
 async function testAllProxies() {
-    toast('正在测试所有代理...', 'info');
+    showLoading('正在测试所有代理，请耐心等待...');
     try {
         const res = await api('/proxies/test-all', { method: 'POST' });
         toast(`测试完成: ${res.ok}/${res.total} 可用`);
@@ -439,11 +464,12 @@ async function testAllProxies() {
             if (el) el.innerHTML = r.ok ? `<span class="badge badge-green">${r.ip}</span>` : `<span class="badge badge-red">失败</span>`;
         }
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 async function createProxy(e) { e.preventDefault(); try { const data = { protocol: document.getElementById('proxy-protocol').value, host: document.getElementById('proxy-host').value, port: parseInt(document.getElementById('proxy-port').value), username: document.getElementById('proxy-user').value || null, password: document.getElementById('proxy-pass').value || null }; await api('/proxies', { method: 'POST', body: JSON.stringify(data) }); hideModal('proxy-modal'); toast('代理已添加'); loadProxies(); } catch (e) { toast(e.message, 'error'); } }
 async function toggleProxy(id) { try { const res = await api(`/proxies/${id}/toggle`, { method: 'PUT' }); toast(res.is_active ? '已启用' : '已禁用'); loadProxies(); } catch (e) { toast(e.message, 'error'); } }
-async function deleteProxy(id) { if (!confirm('确定删除？')) return; try { await api(`/proxies/${id}`, { method: 'DELETE' }); toast('已删除'); loadProxies(); } catch (e) { toast(e.message, 'error'); } }
-async function batchCreateProxies(e) { e.preventDefault(); try { const data = { text: document.getElementById('batch-proxy-text').value }; const res = await api('/proxies/batch-text', { method: 'POST', body: JSON.stringify(data) }); hideModal('batch-proxy-modal'); toast(`批量添加: ${res.created} 成功`); document.getElementById('batch-proxy-text').value = ''; loadProxies(); } catch (e) { toast(e.message, 'error'); } }
+async function deleteProxy(id) { if (!confirm('确定删除？')) return; showLoading('正在删除代理...'); try { await api(`/proxies/${id}`, { method: 'DELETE' }); toast('已删除'); loadProxies(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
+async function batchCreateProxies(e) { e.preventDefault(); showLoading('正在批量添加代理...'); try { const data = { text: document.getElementById('batch-proxy-text').value }; const res = await api('/proxies/batch-text', { method: 'POST', body: JSON.stringify(data) }); hideModal('batch-proxy-modal'); toast(`批量添加: ${res.created} 成功`); document.getElementById('batch-proxy-text').value = ''; loadProxies(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
 // ==================== Projects ====================
 let projectsCache = [];
@@ -470,6 +496,7 @@ async function loadTasks() {
 }
 async function deployTask(e) {
     e.preventDefault();
+    showLoading('正在部署项目，请耐心等待...');
     try {
         const cf = {};
         document.querySelectorAll('#deploy-config-fields input').forEach(f => { if (f.value) cf[f.dataset.key] = f.value; });
@@ -487,12 +514,15 @@ async function deployTask(e) {
         }
         loadTasks();
     } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
 async function deleteTask(id) {
     if (!confirm('确定删除此部署任务？')) return;
+    showLoading('正在删除任务...');
     try { await api(`/tasks/${id}`, { method: 'DELETE' }); toast('任务已删除'); loadTasks(); } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
 }
-async function checkHealth(id) { try { const res = await api(`/tasks/${id}/health`, { method: 'POST' }); toast(`健康检查: ${res.status} ${res.message || ''}`, 'info'); } catch (e) { toast(e.message, 'error'); } }
+async function checkHealth(id) { showLoading('正在健康检查...'); try { const res = await api(`/tasks/${id}/health`, { method: 'POST' }); toast(`健康检查: ${res.status} ${res.message || ''}`, 'info'); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
 // ==================== Helpers ====================
 async function loadAccountOptions(sid) { try { const l = await api('/accounts'); document.getElementById(sid).innerHTML = l.map(a => `<option value="${a.id}">${a.name} (${a.default_region})</option>`).join(''); } catch(e){} }
