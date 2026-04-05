@@ -250,7 +250,7 @@ def delete_account(account_id: int, user: User = Depends(get_current_user), db: 
 
 @app.post("/api/accounts/batch")
 async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """批量添加账号 - 支持多种格式，每行一个"""
+    """批量添加账号 - 并发验证检测，大幅提速"""
     # 检查代理池
     from proxy_manager import ProxyManager
     pm = ProxyManager(db)
@@ -261,6 +261,8 @@ async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(g
     created, errors = [], []
     loop = asyncio.get_event_loop()
 
+    # 第一步：先串行创建所有账号记录（DB操作很快）
+    accounts_to_verify = []
     for idx, line in enumerate(lines):
         try:
             parts = line.split()
@@ -281,24 +283,34 @@ async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(g
             db.add(account)
             db.commit()
             db.refresh(account)
-
-            # 验证 + 自动检测 (使用代理)
-            def _verify_and_detect(a=account):
-                mgr = AwsManager(a, db, use_proxy=True)
-                result = mgr.verify_credentials()
-                if result.get("valid"):
-                    try:
-                        mgr.detect_account_info()
-                    except Exception:
-                        pass
-                return result
-
-            result = await loop.run_in_executor(executor, _verify_and_detect)
-            db.refresh(account)
-            created.append({"id": account.id, "name": account.email or name, "verify": result})
+            accounts_to_verify.append((idx, name, account.id))
         except Exception as e:
             errors.append({"line": idx+1, "error": str(e)})
 
+    # 第二步：并发验证+检测所有账号（耗时操作）
+    async def _verify_one(idx, name, account_id):
+        try:
+            def do():
+                s = SessionLocal()
+                try:
+                    a = s.query(AwsAccount).get(account_id)
+                    mgr = AwsManager(a, s, use_proxy=True)
+                    result = mgr.verify_credentials()
+                    if result.get("valid"):
+                        try:
+                            mgr.detect_account_info()
+                        except Exception:
+                            pass
+                    s.refresh(a)
+                    return {"id": a.id, "name": a.email or name, "verify": result}
+                finally:
+                    s.close()
+            r = await loop.run_in_executor(executor, do)
+            created.append(r)
+        except Exception as e:
+            errors.append({"line": idx+1, "error": str(e)})
+
+    await asyncio.gather(*[_verify_one(idx, name, aid) for idx, name, aid in accounts_to_verify])
     return {"created": created, "errors": errors}
 
 
