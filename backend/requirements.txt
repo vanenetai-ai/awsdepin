@@ -8,3 +8,4 @@ python-multipart==0.0.6
 cryptography==41.0.7
 apscheduler==3.10.4
 psycopg2-binary==2.9.9
+paramiko==3.4.0

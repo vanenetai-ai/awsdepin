@@ -1,70 +1,67 @@
+import io
+import time
 import logging
+import paramiko
 from sqlalchemy.orm import Session
 from models import Instance, DepinProject, DepinTask
-from aws_manager import AwsManager, DEFAULT_USER_DATA
 
 logger = logging.getLogger(__name__)
 
-# 预置 DePIN 项目安装脚本
+# Titan L2 Edge Node 官方安装步骤
+# https://titannet.gitbook.io/titan-network-en/resource-network-test/operate-nodes/l2-edge-node/installation-and-earnings/operation-on-linux
+TITAN_VERSION = "v0.1.20"
+TITAN_BUILD = "246b9dd"
+TITAN_TARBALL = f"titan-edge_{TITAN_VERSION}_{TITAN_BUILD}_linux-amd64.tar.gz"
+TITAN_URL = f"https://github.com/Titannet-dao/titan-node/releases/download/{TITAN_VERSION}/{TITAN_TARBALL}"
+
 BUILTIN_PROJECTS = [
     {
         "name": "titan-network",
-        "description": "Titan Network - 去中心化CDN与存储网络 (https://test4.titannet.io/) 需要 Identity Code",
-        "install_script": """#!/bin/bash
+        "description": "Titan Network L2 Edge Node - 去中心化CDN与存储 (需要 Identity Code hash)",
+        "install_script": f"""#!/bin/bash
 set -e
 
-IDENTITY_CODE="${identity_code}"
-if [ -z "$IDENTITY_CODE" ]; then
-    echo "ERROR: Identity Code is required! Get it from https://test4.titannet.io/"
+HASH="${{identity_code}}"
+if [ -z "$HASH" ]; then
+    echo "ERROR: Identity Code hash is required! Get it from https://test4.titannet.io/"
     exit 1
 fi
 
-cd /opt
+echo "=== Installing Titan L2 Edge Node ==="
 
-# 安装依赖
-apt-get update && apt-get install -y wget unzip
-
-# 下载 Titan Agent
-if [ ! -f /opt/titanagent/agent ]; then
-    wget -q https://pcdn.titannet.io/test4/bin/agent-linux.zip -O /tmp/agent-linux.zip
-    mkdir -p /opt/titanagent
-    unzip -o /tmp/agent-linux.zip -d /opt/titanagent
-    chmod +x /opt/titanagent/agent
-    rm -f /tmp/agent-linux.zip
+# 下载 Titan Edge
+cd /tmp
+if [ ! -f {TITAN_TARBALL} ]; then
+    wget -q {TITAN_URL} -O {TITAN_TARBALL}
 fi
 
-# 创建工作目录
-mkdir -p /opt/titanagent/data
+# 解压
+tar -zxf {TITAN_TARBALL}
+cd titan-edge_{TITAN_VERSION}_{TITAN_BUILD}_linux-amd64
 
-# 创建 systemd 服务
-cat > /etc/systemd/system/titan-agent.service << EOF
-[Unit]
-Description=Titan Network Agent
-After=network.target
+# 安装二进制和库
+sudo cp titan-edge /usr/local/bin/titan-edge
+sudo cp libgoworkerd.so /usr/local/lib/libgoworkerd.so
+sudo ldconfig
 
-[Service]
-Type=simple
-ExecStart=/opt/titanagent/agent --working-dir=/opt/titanagent/data --server-url=https://test4-api.titannet.io --key=${identity_code}
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# 停止旧进程(如果存在)
-systemctl stop titan-agent 2>/dev/null || true
-pkill -f '/opt/titanagent/agent' 2>/dev/null || true
+# 停止旧进程
+pkill -f 'titan-edge daemon' 2>/dev/null || true
 sleep 2
 
-# 启动服务
-systemctl daemon-reload
-systemctl enable titan-agent
-systemctl start titan-agent
+# 启动 daemon (后台)
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+nohup titan-edge daemon start --init --url https://cassini-locator.titannet.io:5000/rpc/v0 > /var/log/titan-edge.log 2>&1 &
 
-echo "Titan Network agent started with Identity Code: ${identity_code:0:8}..."
+# 等待 daemon 启动
+echo "Waiting for daemon to start..."
+sleep 10
+
+# 绑定设备
+titan-edge bind --hash=$HASH https://api-test1.container1.titannet.io/api/v2/device/binding
+
+echo "=== Titan L2 Edge Node installed and bound successfully ==="
 """,
-        "health_check_cmd": "systemctl is-active titan-agent && journalctl -u titan-agent --no-pager -n 5",
+        "health_check_cmd": "pgrep -f 'titan-edge daemon' && tail -5 /var/log/titan-edge.log",
         "config_template": {"identity_code": ""},
     },
     {
@@ -81,8 +78,8 @@ if ! command -v docker &> /dev/null; then
 fi
 
 docker pull cambriantech/grass-node:latest
-docker run -d --name grass-node --restart=always \\
-    -e GRASS_USER_ID="${GRASS_USER_ID}" \\
+docker run -d --name grass-node --restart=always \
+    -e GRASS_USER_ID="${GRASS_USER_ID}" \
     cambriantech/grass-node:latest
 
 echo "Grass node started successfully"
@@ -104,8 +101,8 @@ if ! command -v docker &> /dev/null; then
 fi
 
 docker pull nodepay/node:latest
-docker run -d --name nodepay --restart=always \\
-    -e NP_TOKEN="${NP_TOKEN}" \\
+docker run -d --name nodepay --restart=always \
+    -e NP_TOKEN="${NP_TOKEN}" \
     nodepay/node:latest
 
 echo "Nodepay node started successfully"
@@ -123,6 +120,47 @@ echo "Nodepay node started successfully"
 ]
 
 
+def ssh_execute(ip: str, private_key_pem: str, script: str, username: str = "ubuntu", timeout: int = 300) -> str:
+    """通过 SSH 在远程实例上执行脚本（SFTP 上传后执行），返回输出"""
+    key = paramiko.RSAKey.from_private_key(io.StringIO(private_key_pem))
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    # 重试连接（实例刚启动可能还没准备好）
+    for attempt in range(5):
+        try:
+            client.connect(ip, username=username, pkey=key, timeout=15, banner_timeout=15)
+            break
+        except Exception as e:
+            if attempt == 4:
+                raise ConnectionError(f"SSH connect failed after 5 attempts: {e}")
+            logger.info(f"SSH attempt {attempt+1} to {ip} failed, retrying in 10s...")
+            time.sleep(10)
+
+    try:
+        # 通过 SFTP 上传脚本到临时文件
+        sftp = client.open_sftp()
+        remote_path = "/tmp/_depin_deploy.sh"
+        with sftp.file(remote_path, "w") as f:
+            f.write(script)
+        sftp.chmod(remote_path, 0o755)
+        sftp.close()
+
+        # 执行脚本
+        stdin, stdout, stderr = client.exec_command(
+            f"sudo bash {remote_path} 2>&1",
+            timeout=timeout,
+        )
+        output = stdout.read().decode("utf-8", errors="replace")
+        exit_code = stdout.channel.recv_exit_status()
+
+        if exit_code != 0:
+            output += f"\n[EXIT CODE]: {exit_code}"
+        return output
+    finally:
+        client.close()
+
+
 class DepinManager:
     def __init__(self, db: Session):
         self.db = db
@@ -132,7 +170,6 @@ class DepinManager:
         for proj in BUILTIN_PROJECTS:
             existing = self.db.query(DepinProject).filter(DepinProject.name == proj["name"]).first()
             if existing:
-                # 更新已有项目的脚本和配置
                 existing.description = proj["description"]
                 existing.install_script = proj["install_script"]
                 existing.health_check_cmd = proj.get("health_check_cmd", "")
@@ -150,12 +187,12 @@ class DepinManager:
 
     def deploy_project(
         self,
-        aws_mgr: AwsManager,
+        aws_mgr,
         instance: Instance,
         project: DepinProject,
         config: dict = None,
     ) -> DepinTask:
-        """在实例上部署 DePIN 项目"""
+        """在实例上通过 SSH 部署 DePIN 项目"""
         task = DepinTask(
             instance_id=instance.id,
             project_id=project.id,
@@ -166,43 +203,72 @@ class DepinManager:
         self.db.commit()
 
         try:
+            # 检查实例是否有 IP 和私钥
+            if not instance.public_ip:
+                # 尝试同步获取 IP
+                aws_mgr.sync_instance(instance)
+                self.db.refresh(instance)
+            if not instance.public_ip:
+                raise ValueError("实例没有公网 IP，请先同步实例状态")
+            if not instance.private_key:
+                raise ValueError("实例没有保存 SSH 私钥，无法连接")
+
             # 构建安装脚本，替换配置变量
             script = project.install_script
             if config:
                 for key, value in config.items():
                     script = script.replace(f"${{{key}}}", str(value))
 
-            # 通过 SSM 执行安装脚本
-            cmd_id = aws_mgr.run_command_ssm(
-                instance.instance_id,
-                instance.region,
-                [script],
-            )
-            task.status = "running"
-            task.log = f"SSM Command ID: {cmd_id}"
+            # 通过 SSH 执行
+            task.log = "正在通过 SSH 连接..."
             self.db.commit()
+
+            output = ssh_execute(
+                ip=instance.public_ip,
+                private_key_pem=instance.private_key,
+                script=script,
+                username="ubuntu",
+                timeout=600,
+            )
+
+            # 检查是否有错误
+            if "[EXIT CODE]:" in output and "[EXIT CODE]: 0" not in output:
+                task.status = "failed"
+            else:
+                task.status = "running"
+            task.log = output[-2000:] if len(output) > 2000 else output  # 截断过长日志
+
         except Exception as e:
             task.status = "failed"
-            task.log = str(e)
-            self.db.commit()
-            logger.error(f"Deploy failed: {e}")
+            task.log = f"部署失败: {str(e)}"
+            logger.error(f"Deploy failed for instance {instance.id}: {e}")
 
+        self.db.commit()
         self.db.refresh(task)
         return task
 
-    def check_health(self, aws_mgr: AwsManager, task: DepinTask) -> dict:
-        """检查 DePIN 任务健康状态"""
+    def check_health(self, aws_mgr, task: DepinTask) -> dict:
+        """通过 SSH 检查 DePIN 任务健康状态"""
         project = self.db.query(DepinProject).get(task.project_id)
         if not project or not project.health_check_cmd:
             return {"status": "unknown", "message": "No health check configured"}
 
         instance = self.db.query(Instance).get(task.instance_id)
+        if not instance.public_ip or not instance.private_key:
+            return {"status": "error", "message": "实例无 IP 或无 SSH 密钥"}
+
         try:
-            cmd_id = aws_mgr.run_command_ssm(
-                instance.instance_id,
-                instance.region,
-                [project.health_check_cmd],
+            output = ssh_execute(
+                ip=instance.public_ip,
+                private_key_pem=instance.private_key,
+                script=project.health_check_cmd,
+                username="ubuntu",
+                timeout=30,
             )
-            return {"status": "checking", "command_id": cmd_id}
+            is_ok = "[EXIT CODE]:" not in output or "[EXIT CODE]: 0" in output
+            task.status = "running" if is_ok else "failed"
+            task.log = output[-1000:]
+            self.db.commit()
+            return {"status": task.status, "message": output[:500]}
         except Exception as e:
             return {"status": "error", "message": str(e)}
