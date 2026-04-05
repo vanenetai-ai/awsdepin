@@ -87,7 +87,7 @@ class AwsManager:
         if cache_key in self._client_cache:
             return self._client_cache[cache_key]
         # 某些 API 需要更长超时
-        slow_services = {"service-quotas", "iam", "account", "organizations"}
+        slow_services = {"service-quotas", "iam", "account", "organizations", "support"}
         if service in slow_services:
             config_kwargs = {"connect_timeout": 10, "read_timeout": 30, "retries": {"max_attempts": 2}}
         else:
@@ -338,7 +338,7 @@ class AwsManager:
     # ==================== 账号信息检测 ====================
 
     def get_account_email_and_arn(self) -> dict:
-        """获取账号邮箱、ARN、账号ID - 多种方法尝试"""
+        """获取账号邮箱、ARN、账号ID - 通过 AWS Support 工单系统"""
         result = {"email": None, "arn": None, "account_id": None}
         try:
             sts = self._get_client("sts")
@@ -349,97 +349,58 @@ class AwsManager:
             logger.error(f"STS failed: {e}")
             return result
 
-        # 方法1: Account get-contact-information (最直接，需要账单权限)
+        # 通过 AWS Support 工单系统获取邮箱
+        # describe_cases 返回的 submittedBy 字段包含账号邮箱
+        # ccEmailAddresses 也可能包含邮箱
         try:
-            account_client = self._get_client("account", "us-east-1")
-            contact = account_client.get_contact_information()
-            email = contact.get("ContactInformation", {}).get("EmailAddress", "")
-            if email:
-                result["email"] = email
-        except Exception:
-            pass
-
-        # 方法2: Organizations describe_account 获取邮箱
-        if not result["email"]:
-            try:
-                org = self._get_client("organizations")
-                acct = org.describe_account(AccountId=result["account_id"])
-                email = acct["Account"].get("Email", "")
-                if email:
-                    result["email"] = email
-            except Exception:
-                pass
-
-        # 方法2b: Organizations list_accounts 获取邮箱 (管理账号)
-        if not result["email"]:
-            try:
-                org = self._get_client("organizations")
-                resp = org.list_accounts(MaxResults=5)
-                for acct in resp.get("Accounts", []):
-                    if acct.get("Id") == result["account_id"]:
-                        email = acct.get("Email", "")
-                        if email:
-                            result["email"] = email
-                            break
-            except Exception:
-                pass
-
-        # 方法3: IAM 账号别名
-        if not result["email"]:
-            try:
-                iam = self._get_client("iam")
-                aliases = iam.list_account_aliases().get("AccountAliases", [])
-                if aliases:
-                    result["email"] = aliases[0]
-            except Exception:
-                pass
-
-        # 方法4: IAM credential report 获取 root 邮箱
-        if not result["email"]:
-            try:
-                import time, csv, io
-                iam = self._get_client("iam")
-                # 尝试多次生成报告
-                for _ in range(3):
-                    try:
-                        resp = iam.generate_credential_report()
-                        if resp.get("State") == "COMPLETE":
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(2)
-                resp = iam.get_credential_report()
-                report = resp["Content"].decode("utf-8")
-                reader = csv.DictReader(io.StringIO(report))
-                for row in reader:
-                    user = row.get("user", "")
-                    arn_val = row.get("arn", "")
-                    # root 账号: arn 包含 :root, user 列是 <root_account> 或邮箱
-                    if ":root" in arn_val:
-                        if "@" in user:
-                            result["email"] = user
-                            break
-                        # 有些报告 user 是 <root_account>，无法获取邮箱
-                        continue
-                    # 非 root 行: 如果 user 包含 @ 可能是邮箱格式的用户名
-                    if "@" in user:
-                        result["email"] = user
+            support = self._get_client("support", "us-east-1")
+            resp = support.describe_cases(
+                includeResolvedCases=True,
+                includeCommunications=True,
+                maxResults=10,
+            )
+            cases = resp.get("cases", [])
+            for case in cases:
+                # submittedBy 是提交工单的邮箱
+                submitted_by = case.get("submittedBy", "")
+                if submitted_by and "@" in submitted_by:
+                    result["email"] = submitted_by
+                    break
+                # 检查 ccEmailAddresses
+                cc_emails = case.get("ccEmailAddresses", [])
+                for cc in cc_emails:
+                    if "@" in cc:
+                        result["email"] = cc
                         break
-            except Exception as e:
-                logger.debug(f"Credential report failed: {e}")
+                if result["email"]:
+                    break
+                # 检查通信记录中的邮箱
+                comms = case.get("recentCommunications", {}).get("communications", [])
+                for comm in comms:
+                    submitted = comm.get("submittedBy", "")
+                    if submitted and "@" in submitted:
+                        result["email"] = submitted
+                        break
+                if result["email"]:
+                    break
+        except Exception as e:
+            logger.debug(f"Support describe_cases failed: {e}")
 
-        # 方法4: 从 ARN 推断
-        if not result["email"] and result["arn"]:
-            arn = result["arn"]
-            if ":user/" in arn:
-                result["email"] = arn.split(":user/")[-1]
-            elif ":root" in arn:
-                # root 密钥，用账号ID作为标识
-                result["email"] = f"root ({result['account_id']})"
-
-        # 方法5: 用 access key 前缀 + 账号ID 作为 fallback
+        # 如果没有工单，尝试创建一个测试工单来触发邮箱显示
         if not result["email"]:
-            result["email"] = f"{self.account.access_key_id[:8]}...({result['account_id']})"
+            try:
+                support = self._get_client("support", "us-east-1")
+                # describe_services 本身不返回邮箱，但可以验证 support API 可用
+                # 尝试 describe_trusted_advisor_checks 获取账号信息
+                resp = support.describe_trusted_advisor_checks(language="en")
+                # Trusted Advisor 不直接返回邮箱，但如果 support API 可用
+                # 说明账号有 support 权限，邮箱可能在其他地方
+            except Exception:
+                pass
+
+        # fallback: 用账号ID标识
+        if not result["email"]:
+            result["email"] = f"root ({result['account_id']})"
 
         return result
 
