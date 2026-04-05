@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405j">
+    <link rel="stylesheet" href="style.css?v=20260405k">
 </head>
 <body>
     <nav class="sidebar">
@@ -208,6 +208,24 @@
                         <option value="t3.micro">加载中...</option>
                     </select>
                 </div>
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>磁盘大小 (GiB)</label>
+                        <input type="number" id="launch-volume-size" value="20" min="8" max="16384" placeholder="20">
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label>磁盘类型</label>
+                        <select id="launch-volume-type">
+                            <option value="gp3">gp3 (通用SSD, 推荐)</option>
+                            <option value="gp2">gp2 (通用SSD)</option>
+                            <option value="io1">io1 (高性能SSD)</option>
+                            <option value="io2">io2 (高性能SSD)</option>
+                            <option value="st1">st1 (吞吐优化HDD)</option>
+                            <option value="sc1">sc1 (冷存储HDD)</option>
+                            <option value="standard">standard (磁介质)</option>
+                        </select>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label>数量 (每个账号启动几个)</label>
                     <input type="number" id="launch-count" value="1" min="1" max="20" placeholder="1">
@@ -405,6 +423,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260405j"></script>
+    <script src="app.js?v=20260405k"></script>
 </body>
 </html>

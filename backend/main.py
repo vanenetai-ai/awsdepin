@@ -74,6 +74,8 @@ class LaunchRequest(BaseModel):
     region: Optional[str] = None
     instance_type: str = "t3.micro"
     ami_id: Optional[str] = None
+    volume_size: int = 20
+    volume_type: str = "gp3"
 
 class DeployRequest(BaseModel):
     instance_id: int
@@ -92,6 +94,8 @@ class BatchLaunchRequest(BaseModel):
     region: Optional[str] = None
     instance_type: str = "t3.micro"
     count: int = 1
+    volume_size: int = 20
+    volume_type: str = "gp3"
 
 class BatchDeployRequest(BaseModel):
     instance_ids: list[int]
@@ -427,7 +431,7 @@ async def launch_instance(data: LaunchRequest, user: User = Depends(get_current_
     loop = asyncio.get_event_loop()
     def _launch():
         mgr = AwsManager(account, db)
-        return mgr.launch_instance(region=data.region, instance_type=data.instance_type)
+        return mgr.launch_instance(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
     instance = await loop.run_in_executor(executor, _launch)
     return {
         "id": instance.id, "instance_id": instance.instance_id,
@@ -449,7 +453,7 @@ async def batch_launch(data: BatchLaunchRequest, user: User = Depends(get_curren
                 try:
                     acc = s.query(AwsAccount).get(account.id)
                     mgr = AwsManager(acc, s)
-                    inst = mgr.launch_instance(region=data.region, instance_type=data.instance_type)
+                    inst = mgr.launch_instance(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
                     return {"id": inst.id, "instance_id": inst.instance_id, "region": inst.region}
                 finally:
                     s.close()
@@ -603,37 +607,102 @@ def batch_delete_instances(data: BatchDeleteRequest, user: User = Depends(get_cu
 
 @app.get("/api/instances/types")
 def list_instance_types(user: User = Depends(get_current_user)):
-    """返回常用 EC2 实例类型列表"""
+    """返回完整 EC2 实例类型列表"""
     return [
-        {"type": "t2.micro", "vcpu": 1, "mem": "1 GiB", "category": "通用"},
-        {"type": "t2.small", "vcpu": 1, "mem": "2 GiB", "category": "通用"},
-        {"type": "t2.medium", "vcpu": 2, "mem": "4 GiB", "category": "通用"},
-        {"type": "t2.large", "vcpu": 2, "mem": "8 GiB", "category": "通用"},
-        {"type": "t2.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "通用"},
-        {"type": "t3.micro", "vcpu": 2, "mem": "1 GiB", "category": "通用"},
-        {"type": "t3.small", "vcpu": 2, "mem": "2 GiB", "category": "通用"},
-        {"type": "t3.medium", "vcpu": 2, "mem": "4 GiB", "category": "通用"},
-        {"type": "t3.large", "vcpu": 2, "mem": "8 GiB", "category": "通用"},
-        {"type": "t3.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "通用"},
-        {"type": "t3.2xlarge", "vcpu": 8, "mem": "32 GiB", "category": "通用"},
-        {"type": "t3a.micro", "vcpu": 2, "mem": "1 GiB", "category": "通用AMD"},
-        {"type": "t3a.small", "vcpu": 2, "mem": "2 GiB", "category": "通用AMD"},
-        {"type": "t3a.medium", "vcpu": 2, "mem": "4 GiB", "category": "通用AMD"},
-        {"type": "t3a.large", "vcpu": 2, "mem": "8 GiB", "category": "通用AMD"},
-        {"type": "t3a.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "通用AMD"},
-        {"type": "t3a.2xlarge", "vcpu": 8, "mem": "32 GiB", "category": "通用AMD"},
-        {"type": "m5.large", "vcpu": 2, "mem": "8 GiB", "category": "内存优化"},
-        {"type": "m5.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "内存优化"},
-        {"type": "m5.2xlarge", "vcpu": 8, "mem": "32 GiB", "category": "内存优化"},
-        {"type": "m5a.large", "vcpu": 2, "mem": "8 GiB", "category": "内存AMD"},
-        {"type": "m5a.xlarge", "vcpu": 4, "mem": "16 GiB", "category": "内存AMD"},
-        {"type": "c5.large", "vcpu": 2, "mem": "4 GiB", "category": "计算优化"},
-        {"type": "c5.xlarge", "vcpu": 4, "mem": "8 GiB", "category": "计算优化"},
-        {"type": "c5.2xlarge", "vcpu": 8, "mem": "16 GiB", "category": "计算优化"},
-        {"type": "c5a.large", "vcpu": 2, "mem": "4 GiB", "category": "计算AMD"},
-        {"type": "c5a.xlarge", "vcpu": 4, "mem": "8 GiB", "category": "计算AMD"},
-        {"type": "r5.large", "vcpu": 2, "mem": "16 GiB", "category": "大内存"},
-        {"type": "r5.xlarge", "vcpu": 4, "mem": "32 GiB", "category": "大内存"},
+        # === 通用突发 (T系列) ===
+        {"type":"t2.nano","vcpu":1,"mem":"0.5 GiB","category":"通用突发"},
+        {"type":"t2.micro","vcpu":1,"mem":"1 GiB","category":"通用突发"},
+        {"type":"t2.small","vcpu":1,"mem":"2 GiB","category":"通用突发"},
+        {"type":"t2.medium","vcpu":2,"mem":"4 GiB","category":"通用突发"},
+        {"type":"t2.large","vcpu":2,"mem":"8 GiB","category":"通用突发"},
+        {"type":"t2.xlarge","vcpu":4,"mem":"16 GiB","category":"通用突发"},
+        {"type":"t2.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用突发"},
+        {"type":"t3.nano","vcpu":2,"mem":"0.5 GiB","category":"通用突发"},
+        {"type":"t3.micro","vcpu":2,"mem":"1 GiB","category":"通用突发"},
+        {"type":"t3.small","vcpu":2,"mem":"2 GiB","category":"通用突发"},
+        {"type":"t3.medium","vcpu":2,"mem":"4 GiB","category":"通用突发"},
+        {"type":"t3.large","vcpu":2,"mem":"8 GiB","category":"通用突发"},
+        {"type":"t3.xlarge","vcpu":4,"mem":"16 GiB","category":"通用突发"},
+        {"type":"t3.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用突发"},
+        {"type":"t3a.nano","vcpu":2,"mem":"0.5 GiB","category":"通用突发AMD"},
+        {"type":"t3a.micro","vcpu":2,"mem":"1 GiB","category":"通用突发AMD"},
+        {"type":"t3a.small","vcpu":2,"mem":"2 GiB","category":"通用突发AMD"},
+        {"type":"t3a.medium","vcpu":2,"mem":"4 GiB","category":"通用突发AMD"},
+        {"type":"t3a.large","vcpu":2,"mem":"8 GiB","category":"通用突发AMD"},
+        {"type":"t3a.xlarge","vcpu":4,"mem":"16 GiB","category":"通用突发AMD"},
+        {"type":"t3a.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用突发AMD"},
+        # === 通用 (M系列) ===
+        {"type":"m5.large","vcpu":2,"mem":"8 GiB","category":"通用"},
+        {"type":"m5.xlarge","vcpu":4,"mem":"16 GiB","category":"通用"},
+        {"type":"m5.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用"},
+        {"type":"m5.4xlarge","vcpu":16,"mem":"64 GiB","category":"通用"},
+        {"type":"m5.8xlarge","vcpu":32,"mem":"128 GiB","category":"通用"},
+        {"type":"m5.12xlarge","vcpu":48,"mem":"192 GiB","category":"通用"},
+        {"type":"m5.16xlarge","vcpu":64,"mem":"256 GiB","category":"通用"},
+        {"type":"m5a.large","vcpu":2,"mem":"8 GiB","category":"通用AMD"},
+        {"type":"m5a.xlarge","vcpu":4,"mem":"16 GiB","category":"通用AMD"},
+        {"type":"m5a.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用AMD"},
+        {"type":"m5a.4xlarge","vcpu":16,"mem":"64 GiB","category":"通用AMD"},
+        {"type":"m5a.8xlarge","vcpu":32,"mem":"128 GiB","category":"通用AMD"},
+        {"type":"m6i.large","vcpu":2,"mem":"8 GiB","category":"通用6代"},
+        {"type":"m6i.xlarge","vcpu":4,"mem":"16 GiB","category":"通用6代"},
+        {"type":"m6i.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用6代"},
+        {"type":"m6i.4xlarge","vcpu":16,"mem":"64 GiB","category":"通用6代"},
+        {"type":"m6i.8xlarge","vcpu":32,"mem":"128 GiB","category":"通用6代"},
+        {"type":"m6a.large","vcpu":2,"mem":"8 GiB","category":"通用6代AMD"},
+        {"type":"m6a.xlarge","vcpu":4,"mem":"16 GiB","category":"通用6代AMD"},
+        {"type":"m6a.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用6代AMD"},
+        {"type":"m6a.4xlarge","vcpu":16,"mem":"64 GiB","category":"通用6代AMD"},
+        {"type":"m7i.large","vcpu":2,"mem":"8 GiB","category":"通用7代"},
+        {"type":"m7i.xlarge","vcpu":4,"mem":"16 GiB","category":"通用7代"},
+        {"type":"m7i.2xlarge","vcpu":8,"mem":"32 GiB","category":"通用7代"},
+        {"type":"m7i.4xlarge","vcpu":16,"mem":"64 GiB","category":"通用7代"},
+        # === 计算优化 (C系列) ===
+        {"type":"c5.large","vcpu":2,"mem":"4 GiB","category":"计算优化"},
+        {"type":"c5.xlarge","vcpu":4,"mem":"8 GiB","category":"计算优化"},
+        {"type":"c5.2xlarge","vcpu":8,"mem":"16 GiB","category":"计算优化"},
+        {"type":"c5.4xlarge","vcpu":16,"mem":"32 GiB","category":"计算优化"},
+        {"type":"c5.9xlarge","vcpu":36,"mem":"72 GiB","category":"计算优化"},
+        {"type":"c5a.large","vcpu":2,"mem":"4 GiB","category":"计算AMD"},
+        {"type":"c5a.xlarge","vcpu":4,"mem":"8 GiB","category":"计算AMD"},
+        {"type":"c5a.2xlarge","vcpu":8,"mem":"16 GiB","category":"计算AMD"},
+        {"type":"c5a.4xlarge","vcpu":16,"mem":"32 GiB","category":"计算AMD"},
+        {"type":"c6i.large","vcpu":2,"mem":"4 GiB","category":"计算6代"},
+        {"type":"c6i.xlarge","vcpu":4,"mem":"8 GiB","category":"计算6代"},
+        {"type":"c6i.2xlarge","vcpu":8,"mem":"16 GiB","category":"计算6代"},
+        {"type":"c6i.4xlarge","vcpu":16,"mem":"32 GiB","category":"计算6代"},
+        {"type":"c6a.large","vcpu":2,"mem":"4 GiB","category":"计算6代AMD"},
+        {"type":"c6a.xlarge","vcpu":4,"mem":"8 GiB","category":"计算6代AMD"},
+        {"type":"c6a.2xlarge","vcpu":8,"mem":"16 GiB","category":"计算6代AMD"},
+        {"type":"c7i.large","vcpu":2,"mem":"4 GiB","category":"计算7代"},
+        {"type":"c7i.xlarge","vcpu":4,"mem":"8 GiB","category":"计算7代"},
+        {"type":"c7i.2xlarge","vcpu":8,"mem":"16 GiB","category":"计算7代"},
+        # === 内存优化 (R系列) ===
+        {"type":"r5.large","vcpu":2,"mem":"16 GiB","category":"内存优化"},
+        {"type":"r5.xlarge","vcpu":4,"mem":"32 GiB","category":"内存优化"},
+        {"type":"r5.2xlarge","vcpu":8,"mem":"64 GiB","category":"内存优化"},
+        {"type":"r5.4xlarge","vcpu":16,"mem":"128 GiB","category":"内存优化"},
+        {"type":"r5a.large","vcpu":2,"mem":"16 GiB","category":"内存AMD"},
+        {"type":"r5a.xlarge","vcpu":4,"mem":"32 GiB","category":"内存AMD"},
+        {"type":"r5a.2xlarge","vcpu":8,"mem":"64 GiB","category":"内存AMD"},
+        {"type":"r6i.large","vcpu":2,"mem":"16 GiB","category":"内存6代"},
+        {"type":"r6i.xlarge","vcpu":4,"mem":"32 GiB","category":"内存6代"},
+        {"type":"r6i.2xlarge","vcpu":8,"mem":"64 GiB","category":"内存6代"},
+        {"type":"r6a.large","vcpu":2,"mem":"16 GiB","category":"内存6代AMD"},
+        {"type":"r6a.xlarge","vcpu":4,"mem":"32 GiB","category":"内存6代AMD"},
+        # === 存储优化 ===
+        {"type":"i3.large","vcpu":2,"mem":"15.25 GiB","category":"存储优化"},
+        {"type":"i3.xlarge","vcpu":4,"mem":"30.5 GiB","category":"存储优化"},
+        {"type":"i3.2xlarge","vcpu":8,"mem":"61 GiB","category":"存储优化"},
+        {"type":"i3en.large","vcpu":2,"mem":"16 GiB","category":"存储优化"},
+        {"type":"i3en.xlarge","vcpu":4,"mem":"32 GiB","category":"存储优化"},
+        # === GPU/加速计算 ===
+        {"type":"g4dn.xlarge","vcpu":4,"mem":"16 GiB","category":"GPU"},
+        {"type":"g4dn.2xlarge","vcpu":8,"mem":"32 GiB","category":"GPU"},
+        {"type":"g4dn.4xlarge","vcpu":16,"mem":"64 GiB","category":"GPU"},
+        {"type":"g5.xlarge","vcpu":4,"mem":"16 GiB","category":"GPU"},
+        {"type":"g5.2xlarge","vcpu":8,"mem":"32 GiB","category":"GPU"},
+        {"type":"p3.2xlarge","vcpu":8,"mem":"61 GiB","category":"GPU高性能"},
     ]
 
 @app.get("/api/instances/amis")

@@ -402,14 +402,16 @@ async function launchInstance(e) {
         hideModal('launch-modal');
         toast(`正在为 ${selectedAccounts.length} 个账号各启动 ${count} 个实例...`, 'info');
         let totalOk = 0, totalErr = 0;
+        const volumeSize = parseInt(document.getElementById('launch-volume-size').value) || 20;
+        const volumeType = document.getElementById('launch-volume-type').value || 'gp3';
         const promises = selectedAccounts.map(async (accountId) => {
             try {
                 if (count > 1) {
-                    const res = await api('/instances/batch-launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType, count }) });
+                    const res = await api('/instances/batch-launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType, count, volume_size: volumeSize, volume_type: volumeType }) });
                     totalOk += res.launched?.length || 0;
                     totalErr += res.errors?.length || 0;
                 } else {
-                    await api('/instances/launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType }) });
+                    await api('/instances/launch', { method: 'POST', body: JSON.stringify({ account_id: accountId, region, instance_type: instanceType, volume_size: volumeSize, volume_type: volumeType }) });
                     totalOk++;
                 }
             } catch (err) { totalErr++; }
@@ -541,6 +543,7 @@ async function loadInstanceTypes() {
         const types = await api('/instances/types');
         const sel = document.getElementById('launch-type');
         sel.innerHTML = types.map(t => `<option value="${t.type}">${t.type} (${t.vcpu}C/${t.mem}) [${t.category}]</option>`).join('');
+        refreshSearchSelect('launch-type');
     } catch(e){}
 }
 async function loadAmiOptions() {
@@ -548,8 +551,121 @@ async function loadAmiOptions() {
         const amis = await api('/instances/amis');
         const sel = document.getElementById('launch-ami');
         if (sel) sel.innerHTML = amis.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
+        refreshSearchSelect('launch-ami');
     } catch(e){}
 }
 
+// ==================== Searchable Select Component ====================
+function createSearchSelect(selectEl) {
+    if (!selectEl || selectEl.dataset.ssInit) return;
+    selectEl.dataset.ssInit = '1';
+    selectEl.style.display = 'none';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'search-select-wrap';
+    selectEl.parentNode.insertBefore(wrap, selectEl);
+    wrap.appendChild(selectEl);
+
+    const display = document.createElement('div');
+    display.className = 'ss-display';
+    wrap.appendChild(display);
+
+    const dropdown = document.createElement('div');
+    dropdown.className = 'ss-dropdown';
+    const search = document.createElement('input');
+    search.className = 'ss-search';
+    search.type = 'text';
+    search.placeholder = '🔍 搜索...';
+    dropdown.appendChild(search);
+    const list = document.createElement('div');
+    list.className = 'ss-list';
+    dropdown.appendChild(list);
+    wrap.appendChild(dropdown);
+
+    function renderItems() {
+        list.innerHTML = '';
+        const opts = selectEl.options;
+        if (!opts.length) { list.innerHTML = '<div class="ss-empty">无选项</div>'; return; }
+        for (let i = 0; i < opts.length; i++) {
+            const item = document.createElement('div');
+            item.className = 'ss-item' + (opts[i].selected ? ' selected' : '');
+            item.textContent = opts[i].textContent;
+            item.dataset.idx = i;
+            item.addEventListener('click', () => {
+                selectEl.selectedIndex = i;
+                selectEl.dispatchEvent(new Event('change'));
+                updateDisplay();
+                close();
+            });
+            list.appendChild(item);
+        }
+    }
+
+    function updateDisplay() {
+        const sel = selectEl.options[selectEl.selectedIndex];
+        display.textContent = sel ? sel.textContent : '请选择';
+    }
+
+    function open() {
+        wrap.classList.add('open');
+        search.value = '';
+        renderItems();
+        search.focus();
+    }
+    function close() { wrap.classList.remove('open'); }
+
+    display.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (wrap.classList.contains('open')) close(); else open();
+        // close others
+        document.querySelectorAll('.search-select-wrap.open').forEach(w => { if (w !== wrap) w.classList.remove('open'); });
+    });
+
+    search.addEventListener('input', () => {
+        const q = search.value.toLowerCase();
+        list.querySelectorAll('.ss-item').forEach(item => {
+            item.classList.toggle('hidden', !item.textContent.toLowerCase().includes(q));
+        });
+    });
+    search.addEventListener('click', e => e.stopPropagation());
+
+    document.addEventListener('click', () => close());
+    wrap.addEventListener('click', e => e.stopPropagation());
+
+    // observe option changes
+    const observer = new MutationObserver(() => { updateDisplay(); });
+    observer.observe(selectEl, { childList: true, subtree: true });
+
+    updateDisplay();
+    return { refresh: () => { renderItems(); updateDisplay(); } };
+}
+
+// 对所有非 multiple 的 select 应用搜索功能
+const _ssInstances = {};
+function initSearchSelects() {
+    document.querySelectorAll('select:not([multiple]):not([data-ss-init])').forEach(sel => {
+        // 跳过太少选项的 (<=3)
+        if (sel.options.length <= 3 && !sel.id.includes('type') && !sel.id.includes('region') && !sel.id.includes('ami') && !sel.id.includes('volume')) return;
+        _ssInstances[sel.id] = createSearchSelect(sel);
+    });
+}
+
+function refreshSearchSelect(id) {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    if (!sel.dataset.ssInit) {
+        _ssInstances[id] = createSearchSelect(sel);
+    } else if (_ssInstances[id]) {
+        _ssInstances[id].refresh();
+    }
+    // 更新 display text
+    const wrap = sel.closest('.search-select-wrap');
+    if (wrap) {
+        const display = wrap.querySelector('.ss-display');
+        const opt = sel.options[sel.selectedIndex];
+        if (display && opt) display.textContent = opt.textContent;
+    }
+}
+
 // ==================== Init ====================
-if (checkAuth()) { showUserInfo(); loadDashboard(); }
+if (checkAuth()) { showUserInfo(); loadDashboard(); setTimeout(initSearchSelects, 100); }

@@ -197,6 +197,8 @@ class AwsManager:
         region: str = None,
         instance_type: str = "t3.micro",
         user_data: str = None,
+        volume_size: int = 20,
+        volume_type: str = "gp3",
     ) -> Instance:
         region = region or self.account.default_region
         ami_id = UBUNTU_AMIS.get(region)
@@ -228,6 +230,14 @@ class AwsManager:
             KeyName=key_name,
             SecurityGroupIds=[sg_id],
             UserData=ud,
+            BlockDeviceMappings=[{
+                "DeviceName": "/dev/sda1",
+                "Ebs": {
+                    "VolumeSize": volume_size,
+                    "VolumeType": volume_type,
+                    "DeleteOnTermination": True,
+                },
+            }],
             TagSpecifications=[{
                 "ResourceType": "instance",
                 "Tags": [
