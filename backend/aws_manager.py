@@ -369,18 +369,6 @@ class AwsManager:
             logger.debug(f"Account contact email failed: {e}")
         return None
 
-    def _detect_email_from_organizations(self) -> str | None:
-        """从 Organizations describe_organization 获取 MasterAccountEmail"""
-        try:
-            org = self._get_client("organizations")
-            resp = org.describe_organization()
-            email = resp.get("Organization", {}).get("MasterAccountEmail", "")
-            if email and "@" in email:
-                return email
-        except Exception as e:
-            logger.debug(f"Organizations API failed: {e}")
-        return None
-
     def _detect_email_from_budgets(self) -> str | None:
         """从 Budgets 通知订阅者获取邮箱"""
         try:
@@ -570,12 +558,10 @@ class AwsManager:
 
         # 并行执行所有检测任务 - 不设超时，等每个任务完成
         results = {}
-        with ThreadPoolExecutor(max_workers=7) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
                 pool.submit(self._detect_email_from_account_contact): "email_contact",
-                pool.submit(self._detect_email_from_organizations): "email_org",
                 pool.submit(self._detect_email_from_budgets): "email_budgets",
-                pool.submit(self._detect_email_from_credential_report): "email_cred",
                 pool.submit(self._detect_creation_time): "creation_time",
                 pool.submit(self._detect_country): "country",
                 pool.submit(self.get_vcpu_quotas_all_regions): "vcpus",
@@ -588,8 +574,8 @@ class AwsManager:
                     logger.warning(f"Detection {key} failed: {e}")
                     results[key] = None
 
-        # 邮箱: 优先 account contact，其次 organizations，再 budgets，最后 credential report
-        email = results.get("email_contact") or results.get("email_org") or results.get("email_budgets") or results.get("email_cred")
+        # 邮箱: 优先 account contact，其次 budgets
+        email = results.get("email_contact") or results.get("email_budgets")
         if not email:
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
