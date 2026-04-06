@@ -65,296 +65,213 @@ echo "=== Titan L2 Edge Node installed and bound successfully ==="
         "config_template": {"identity_code": ""},
     },
     {
-        "name": "grass-node",
-        "description": "Grass (GetGrass) - 去中心化带宽共享网络，需要 Grass 账号邮箱和密码",
+        "name": "traffmonetizer",
+        "description": "TraffMonetizer - 带宽变现 (✅ VPS/数据中心IP兼容)。需要 Token，从 https://traffmonetizer.com 获取",
         "install_script": """#!/bin/bash
 set -e
-cd /home/ubuntu
+TOKEN="${traffmonetizer_token}"
+if [ -z "$TOKEN" ]; then echo "ERROR: Token 不能为空"; exit 1; fi
 
-GRASS_USER="${grass_email}"
-GRASS_PASS="${grass_password}"
-
-if [ -z "$GRASS_USER" ] || [ -z "$GRASS_PASS" ]; then
-    echo "ERROR: Grass 邮箱和密码不能为空！请在 https://app.getgrass.io/ 注册账号"
-    exit 1
-fi
-
-# 安装 Docker
 if ! command -v docker &> /dev/null; then
     curl -fsSL https://get.docker.com | sh
     systemctl enable docker && systemctl start docker
-    usermod -aG docker ubuntu
 fi
 
-# 停止旧容器
-docker rm -f grass 2>/dev/null || true
+docker rm -f traffmonetizer 2>/dev/null || true
+docker pull traffmonetizer/cli_v2:latest
+docker run -d --name traffmonetizer --restart=always \
+    traffmonetizer/cli_v2:latest \
+    start accept status --token "$TOKEN" --device-name "depin-$(hostname)"
 
-# 使用 MRColorR/get-grass 官方镜像
-docker pull mrcolorrain/grass:latest
-docker run -d --name grass --restart=always \
-    -h "depin-$(hostname)" \
-    -e GRASS_USER="$GRASS_USER" \
-    -e GRASS_PASS="$GRASS_PASS" \
-    mrcolorrain/grass:latest
-
-echo "=== Grass node started successfully ==="
-echo "账号: $GRASS_USER"
-echo "镜像: mrcolorrain/grass:latest"
-docker ps --filter name=grass --format 'Status: {{.Status}}'
+echo "=== TraffMonetizer 已启动 ==="
+docker ps --filter name=traffmonetizer --format 'Status: {{.Status}}'
 """,
-        "health_check_cmd": "docker ps --filter name=grass --format '{{.Status}}'",
-        "config_template": {"grass_email": "", "grass_password": ""},
+        "health_check_cmd": "docker ps --filter name=traffmonetizer --format '{{.Status}}'",
+        "config_template": {"traffmonetizer_token": ""},
     },
     {
-        "name": "money4band",
-        "description": "Money4Band 多合一被动收入 - 同时运行多个带宽共享App (基于 MRColorR/money4band)。留空的 App 会自动跳过。⚠️ AWS VPS 仅支持部分 App",
+        "name": "repocket",
+        "description": "Repocket - 带宽共享 (✅ VPS/数据中心IP兼容)。需要邮箱和 API Key，从 https://app.repocket.co 获取",
         "install_script": """#!/bin/bash
 set -e
-cd /home/ubuntu
+EMAIL="${repocket_email}"
+APIKEY="${repocket_apikey}"
+if [ -z "$EMAIL" ] || [ -z "$APIKEY" ]; then echo "ERROR: 邮箱和 API Key 不能为空"; exit 1; fi
 
-DEVICE_NAME="m4b-$(hostname | head -c 8)"
-
-# ===== 用户凭据 =====
-# VPS 兼容的 App (Datacenter IP 可用)
-TRAFFMONETIZER_TOKEN="${traffmonetizer_token}"
-REPOCKET_EMAIL="${repocket_email}"
-REPOCKET_APIKEY="${repocket_apikey}"
-PROXYRACK_API_KEY="${proxyrack_apikey}"
-PROXYLITE_USER_ID="${proxylite_userid}"
-
-# 住宅 IP 才能用的 App (AWS 上可能不工作，但可以试)
-HONEYGAIN_EMAIL="${honeygain_email}"
-HONEYGAIN_PASSWORD="${honeygain_password}"
-EARNAPP_UUID="${earnapp_uuid}"
-PACKETSTREAM_CID="${packetstream_cid}"
-GRASS_EMAIL="${grass_email}"
-GRASS_PASS="${grass_password}"
-GRADIENT_EMAIL="${gradient_email}"
-GRADIENT_PASSWORD="${gradient_password}"
-
-# 安装 Docker
 if ! command -v docker &> /dev/null; then
-    echo "=== Installing Docker ==="
     curl -fsSL https://get.docker.com | sh
     systemctl enable docker && systemctl start docker
-    usermod -aG docker ubuntu
 fi
 
-# 安装 Docker Compose plugin
-if ! docker compose version &> /dev/null; then
-    echo "=== Installing Docker Compose ==="
-    apt-get update && apt-get install -y docker-compose-plugin
-fi
+docker rm -f repocket 2>/dev/null || true
+docker pull repocket/repocket:latest
+docker run -d --name repocket --restart=always \
+    -e RP_EMAIL="$EMAIL" \
+    -e RP_API_KEY="$APIKEY" \
+    repocket/repocket:latest
 
-# 创建工作目录
-mkdir -p /opt/money4band/.data
-cd /opt/money4band
-
-echo "=== Generating Money4Band docker-compose.yml ==="
-
-# 生成 docker-compose.yml
-cat > docker-compose.yml << 'COMPOSE_HEAD'
-version: "3.9"
-services:
-  watchtower:
-    container_name: m4b_watchtower
-    image: containrrr/watchtower:latest
-    environment:
-      - WATCHTOWERNTERVAL=3600
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_SCOPE=m4b
-    labels:
-      - "com.centurylinklabs.watchtower.scope=m4b"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    restart: always
-COMPOSE_HEAD
-
-# TraffMonetizer (VPS 兼容)
-if [ -n "$TRAFFMONETIZER_TOKEN" ]; then
-cat >> docker-compose.yml << EOF
-
-  traffmonetizer:
-    container_name: ${DEVICE_NAME}_traffmonetizer
-    image: traffmonetizer/cli_v2:latest
-    command: ["start", "accept", "status", "--token", "${TRAFFMONETIZER_TOKEN}", "--device-name", "${DEVICE_NAME}"]
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ TraffMonetizer 已添加"
-fi
-
-# Repocket (VPS 兼容)
-if [ -n "$REPOCKET_EMAIL" ] && [ -n "$REPOCKET_APIKEY" ]; then
-cat >> docker-compose.yml << EOF
-
-  repocket:
-    container_name: ${DEVICE_NAME}_repocket
-    image: repocket/repocket:latest
-    environment:
-      - RP_EMAIL=${REPOCKET_EMAIL}
-      - RP_API_KEY=${REPOCKET_APIKEY}
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ Repocket 已添加"
-fi
-
-# Proxyrack (VPS 兼容)
-if [ -n "$PROXYRACK_API_KEY" ]; then
-cat >> docker-compose.yml << EOF
-
-  proxyrack:
-    container_name: ${DEVICE_NAME}_proxyrack
-    image: proxyrack/pop:latest
-    environment:
-      - api_key=${PROXYRACK_API_KEY}
-      - device_name=${DEVICE_NAME}
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ Proxyrack 已添加"
-fi
-
-# Proxylite (VPS 兼容)
-if [ -n "$PROXYLITE_USER_ID" ]; then
-cat >> docker-compose.yml << EOF
-
-  proxylite:
-    container_name: ${DEVICE_NAME}_proxylite
-    image: proxylite/proxyservice:latest
-    environment:
-      - USER_ID=${PROXYLITE_USER_ID}
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ Proxylite 已添加"
-fi
-
-# HoneyGain (需要住宅 IP)
-if [ -n "$HONEYGAIN_EMAIL" ] && [ -n "$HONEYGAIN_PASSWORD" ]; then
-cat >> docker-compose.yml << EOF
-
-  honeygain:
-    container_name: ${DEVICE_NAME}_honeygain
-    image: honeygain/honeygain:latest
-    command: ["-tou-accept", "-email", "${HONEYGAIN_EMAIL}", "-pass", "${HONEYGAIN_PASSWORD}", "-device", "${DEVICE_NAME}"]
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ HoneyGain 已添加 (⚠️ 需要住宅IP)"
-fi
-
-# EarnApp (需要住宅 IP)
-if [ -n "$EARNAPP_UUID" ]; then
-cat >> docker-compose.yml << EOF
-
-  earnapp:
-    container_name: ${DEVICE_NAME}_earnapp
-    image: fazalfarhan01/earnapp:lite
-    environment:
-      - EARNAPP_UUID=${EARNAPP_UUID}
-      - EARNAPP_TERM=yes
-    volumes:
-      - .data/.earnapp:/etc/earnapp
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ EarnApp 已添加 (⚠️ 需要住宅IP)"
-fi
-
-# PacketStream (需要住宅 IP)
-if [ -n "$PACKETSTREAM_CID" ]; then
-cat >> docker-compose.yml << EOF
-
-  packetstream:
-    container_name: ${DEVICE_NAME}_packetstream
-    image: packetstream/psclient:latest
-    environment:
-      - CID=${PACKETSTREAM_CID}
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 256m
-EOF
-echo "  ✅ PacketStream 已添加 (⚠️ 需要住宅IP)"
-fi
-
-# Grass (需要住宅 IP)
-if [ -n "$GRASS_EMAIL" ] && [ -n "$GRASS_PASS" ]; then
-cat >> docker-compose.yml << EOF
-
-  grass:
-    container_name: ${DEVICE_NAME}_grass
-    image: mrcolorrain/grass:latest
-    hostname: ${DEVICE_NAME}_grass
-    environment:
-      - GRASS_USER=${GRASS_EMAIL}
-      - GRASS_PASS=${GRASS_PASS}
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 512m
-EOF
-echo "  ✅ Grass 已添加 (⚠️ 需要住宅IP)"
-fi
-
-# Gradient (需要住宅 IP)
-if [ -n "$GRADIENT_EMAIL" ] && [ -n "$GRADIENT_PASSWORD" ]; then
-cat >> docker-compose.yml << EOF
-
-  gradient:
-    container_name: ${DEVICE_NAME}_gradient
-    image: mrcolorrain/gradient:latest
-    hostname: ${DEVICE_NAME}_gradient
-    environment:
-      - GRADIENT_EMAIL=${GRADIENT_EMAIL}
-      - GRADIENT_PASS=${GRADIENT_PASSWORD}
-    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
-    restart: always
-    cpus: 0.5
-    mem_limit: 512m
-EOF
-echo "  ✅ Gradient 已添加 (⚠️ 需要住宅IP)"
-fi
-
-echo ""
-echo "=== Starting Money4Band Stack ==="
-cd /opt/money4band
-docker compose up -d
-
-echo ""
-echo "=== Money4Band 部署完成 ==="
-docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+echo "=== Repocket 已启动 ==="
+docker ps --filter name=repocket --format 'Status: {{.Status}}'
 """,
-        "health_check_cmd": "cd /opt/money4band && docker compose ps --format 'table {{.Name}}\\t{{.Status}}'",
-        "config_template": {
-            "traffmonetizer_token": "",
-            "repocket_email": "",
-            "repocket_apikey": "",
-            "proxyrack_apikey": "",
-            "proxylite_userid": "",
-            "honeygain_email": "",
-            "honeygain_password": "",
-            "earnapp_uuid": "",
-            "packetstream_cid": "",
-            "grass_email": "",
-            "grass_password": "",
-            "gradient_email": "",
-            "gradient_password": "",
-        },
+        "health_check_cmd": "docker ps --filter name=repocket --format '{{.Status}}'",
+        "config_template": {"repocket_email": "", "repocket_apikey": ""},
+    },
+    {
+        "name": "proxyrack",
+        "description": "Proxyrack - 代理网络 (✅ VPS/数据中心IP兼容)。需要 API Key，从 https://peer.proxyrack.com 获取",
+        "install_script": """#!/bin/bash
+set -e
+API_KEY="${proxyrack_apikey}"
+if [ -z "$API_KEY" ]; then echo "ERROR: API Key 不能为空"; exit 1; fi
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f proxyrack 2>/dev/null || true
+docker pull proxyrack/pop:latest
+docker run -d --name proxyrack --restart=always \
+    -e api_key="$API_KEY" \
+    -e device_name="depin-$(hostname)" \
+    proxyrack/pop:latest
+
+echo "=== Proxyrack 已启动 ==="
+docker ps --filter name=proxyrack --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=proxyrack --format '{{.Status}}'",
+        "config_template": {"proxyrack_apikey": ""},
+    },
+    {
+        "name": "proxylite",
+        "description": "Proxylite - 代理网络 (✅ VPS/数据中心IP兼容)。需要 User ID，从 https://proxylite.ru 获取",
+        "install_script": """#!/bin/bash
+set -e
+USER_ID="${proxylite_userid}"
+if [ -z "$USER_ID" ]; then echo "ERROR: User ID 不能为空"; exit 1; fi
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f proxylite 2>/dev/null || true
+docker pull proxylite/proxyservice:latest
+docker run -d --name proxylite --restart=always \
+    -e USER_ID="$USER_ID" \
+    proxylite/proxyservice:latest
+
+echo "=== Proxylite 已启动 ==="
+docker ps --filter name=proxylite --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=proxylite --format '{{.Status}}'",
+        "config_template": {"proxylite_userid": ""},
+    },
+    {
+        "name": "peer2profit",
+        "description": "Peer2Profit - P2P带宽共享 (✅ VPS/数据中心IP兼容)。需要邮箱，从 https://peer2profit.com 获取",
+        "install_script": """#!/bin/bash
+set -e
+EMAIL="${peer2profit_email}"
+if [ -z "$EMAIL" ]; then echo "ERROR: 邮箱不能为空"; exit 1; fi
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f peer2profit 2>/dev/null || true
+docker pull mrcolorrain/peer2profit:latest
+docker run -d --name peer2profit --restart=always \
+    -e P2P_EMAIL="$EMAIL" \
+    mrcolorrain/peer2profit:latest
+
+echo "=== Peer2Profit 已启动 ==="
+docker ps --filter name=peer2profit --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=peer2profit --format '{{.Status}}'",
+        "config_template": {"peer2profit_email": ""},
+    },
+    {
+        "name": "bitping",
+        "description": "Bitping - 去中心化网络监测 (✅ VPS/数据中心IP兼容)。需要邮箱和密码，从 https://app.bitping.com 注册",
+        "install_script": """#!/bin/bash
+set -e
+EMAIL="${bitping_email}"
+PASSWORD="${bitping_password}"
+if [ -z "$EMAIL" ] || [ -z "$PASSWORD" ]; then echo "ERROR: 邮箱和密码不能为空"; exit 1; fi
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f bitping 2>/dev/null || true
+mkdir -p /opt/bitping
+docker pull mrcolorrain/bitping:latest
+docker run -d --name bitping --restart=always \
+    -v /opt/bitping:/root/.bitping \
+    mrcolorrain/bitping:latest \
+    bitping-node --server --email "$EMAIL" --password "$PASSWORD"
+
+echo "=== Bitping 已启动 ==="
+docker ps --filter name=bitping --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=bitping --format '{{.Status}}'",
+        "config_template": {"bitping_email": "", "bitping_password": ""},
+    },
+    {
+        "name": "mystnode",
+        "description": "Mysterium Network (MystNode) - 去中心化VPN节点 (✅ VPS/数据中心IP兼容)。启动后需通过 Web 面板完成设置",
+        "install_script": """#!/bin/bash
+set -e
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f mystnode 2>/dev/null || true
+mkdir -p /opt/mysterium-node
+docker pull mysteriumnetwork/myst:latest
+docker run -d --name mystnode --restart=always \
+    --cap-add NET_ADMIN \
+    -p 4449:4449 \
+    -v /opt/mysterium-node:/var/lib/mysterium-node \
+    mysteriumnetwork/myst:latest \
+    service --agreed-terms-and-conditions
+
+echo "=== MystNode 已启动 ==="
+echo "请访问 http://实例IP:4449 完成节点设置"
+docker ps --filter name=mystnode --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=mystnode --format '{{.Status}}'",
+        "config_template": {},
+    },
+    {
+        "name": "earnfm",
+        "description": "EarnFM - 带宽共享赚取收益 (✅ VPS/数据中心IP兼容)。需要 API Key，从 https://earn.fm 获取",
+        "install_script": """#!/bin/bash
+set -e
+API_KEY="${earnfm_apikey}"
+if [ -z "$API_KEY" ]; then echo "ERROR: API Key 不能为空"; exit 1; fi
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f earnfm 2>/dev/null || true
+docker pull earnfm/earnfm-client:latest
+docker run -d --name earnfm --restart=always \
+    -e EARNFM_TOKEN="$API_KEY" \
+    earnfm/earnfm-client:latest
+
+echo "=== EarnFM 已启动 ==="
+docker ps --filter name=earnfm --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=earnfm --format '{{.Status}}'",
+        "config_template": {"earnfm_apikey": ""},
     },
     {
         "name": "nodepay",
