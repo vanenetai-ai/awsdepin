@@ -106,6 +106,257 @@ docker ps --filter name=grass --format 'Status: {{.Status}}'
         "config_template": {"grass_email": "", "grass_password": ""},
     },
     {
+        "name": "money4band",
+        "description": "Money4Band 多合一被动收入 - 同时运行多个带宽共享App (基于 MRColorR/money4band)。留空的 App 会自动跳过。⚠️ AWS VPS 仅支持部分 App",
+        "install_script": """#!/bin/bash
+set -e
+cd /home/ubuntu
+
+DEVICE_NAME="m4b-$(hostname | head -c 8)"
+
+# ===== 用户凭据 =====
+# VPS 兼容的 App (Datacenter IP 可用)
+TRAFFMONETIZER_TOKEN="${traffmonetizer_token}"
+REPOCKET_EMAIL="${repocket_email}"
+REPOCKET_APIKEY="${repocket_apikey}"
+PROXYRACK_API_KEY="${proxyrack_apikey}"
+PROXYLITE_USER_ID="${proxylite_userid}"
+
+# 住宅 IP 才能用的 App (AWS 上可能不工作，但可以试)
+HONEYGAIN_EMAIL="${honeygain_email}"
+HONEYGAIN_PASSWORD="${honeygain_password}"
+EARNAPP_UUID="${earnapp_uuid}"
+PACKETSTREAM_CID="${packetstream_cid}"
+GRASS_EMAIL="${grass_email}"
+GRASS_PASS="${grass_password}"
+GRADIENT_EMAIL="${gradient_email}"
+GRADIENT_PASSWORD="${gradient_password}"
+
+# 安装 Docker
+if ! command -v docker &> /dev/null; then
+    echo "=== Installing Docker ==="
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+    usermod -aG docker ubuntu
+fi
+
+# 安装 Docker Compose plugin
+if ! docker compose version &> /dev/null; then
+    echo "=== Installing Docker Compose ==="
+    apt-get update && apt-get install -y docker-compose-plugin
+fi
+
+# 创建工作目录
+mkdir -p /opt/money4band/.data
+cd /opt/money4band
+
+echo "=== Generating Money4Band docker-compose.yml ==="
+
+# 生成 docker-compose.yml
+cat > docker-compose.yml << 'COMPOSE_HEAD'
+version: "3.9"
+services:
+  watchtower:
+    container_name: m4b_watchtower
+    image: containrrr/watchtower:latest
+    environment:
+      - WATCHTOWERNTERVAL=3600
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_SCOPE=m4b
+    labels:
+      - "com.centurylinklabs.watchtower.scope=m4b"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+COMPOSE_HEAD
+
+# TraffMonetizer (VPS 兼容)
+if [ -n "$TRAFFMONETIZER_TOKEN" ]; then
+cat >> docker-compose.yml << EOF
+
+  traffmonetizer:
+    container_name: ${DEVICE_NAME}_traffmonetizer
+    image: traffmonetizer/cli_v2:latest
+    command: ["start", "accept", "status", "--token", "${TRAFFMONETIZER_TOKEN}", "--device-name", "${DEVICE_NAME}"]
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ TraffMonetizer 已添加"
+fi
+
+# Repocket (VPS 兼容)
+if [ -n "$REPOCKET_EMAIL" ] && [ -n "$REPOCKET_APIKEY" ]; then
+cat >> docker-compose.yml << EOF
+
+  repocket:
+    container_name: ${DEVICE_NAME}_repocket
+    image: repocket/repocket:latest
+    environment:
+      - RP_EMAIL=${REPOCKET_EMAIL}
+      - RP_API_KEY=${REPOCKET_APIKEY}
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ Repocket 已添加"
+fi
+
+# Proxyrack (VPS 兼容)
+if [ -n "$PROXYRACK_API_KEY" ]; then
+cat >> docker-compose.yml << EOF
+
+  proxyrack:
+    container_name: ${DEVICE_NAME}_proxyrack
+    image: proxyrack/pop:latest
+    environment:
+      - api_key=${PROXYRACK_API_KEY}
+      - device_name=${DEVICE_NAME}
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ Proxyrack 已添加"
+fi
+
+# Proxylite (VPS 兼容)
+if [ -n "$PROXYLITE_USER_ID" ]; then
+cat >> docker-compose.yml << EOF
+
+  proxylite:
+    container_name: ${DEVICE_NAME}_proxylite
+    image: proxylite/proxyservice:latest
+    environment:
+      - USER_ID=${PROXYLITE_USER_ID}
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ Proxylite 已添加"
+fi
+
+# HoneyGain (需要住宅 IP)
+if [ -n "$HONEYGAIN_EMAIL" ] && [ -n "$HONEYGAIN_PASSWORD" ]; then
+cat >> docker-compose.yml << EOF
+
+  honeygain:
+    container_name: ${DEVICE_NAME}_honeygain
+    image: honeygain/honeygain:latest
+    command: ["-tou-accept", "-email", "${HONEYGAIN_EMAIL}", "-pass", "${HONEYGAIN_PASSWORD}", "-device", "${DEVICE_NAME}"]
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ HoneyGain 已添加 (⚠️ 需要住宅IP)"
+fi
+
+# EarnApp (需要住宅 IP)
+if [ -n "$EARNAPP_UUID" ]; then
+cat >> docker-compose.yml << EOF
+
+  earnapp:
+    container_name: ${DEVICE_NAME}_earnapp
+    image: fazalfarhan01/earnapp:lite
+    environment:
+      - EARNAPP_UUID=${EARNAPP_UUID}
+      - EARNAPP_TERM=yes
+    volumes:
+      - .data/.earnapp:/etc/earnapp
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ EarnApp 已添加 (⚠️ 需要住宅IP)"
+fi
+
+# PacketStream (需要住宅 IP)
+if [ -n "$PACKETSTREAM_CID" ]; then
+cat >> docker-compose.yml << EOF
+
+  packetstream:
+    container_name: ${DEVICE_NAME}_packetstream
+    image: packetstream/psclient:latest
+    environment:
+      - CID=${PACKETSTREAM_CID}
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 256m
+EOF
+echo "  ✅ PacketStream 已添加 (⚠️ 需要住宅IP)"
+fi
+
+# Grass (需要住宅 IP)
+if [ -n "$GRASS_EMAIL" ] && [ -n "$GRASS_PASS" ]; then
+cat >> docker-compose.yml << EOF
+
+  grass:
+    container_name: ${DEVICE_NAME}_grass
+    image: mrcolorrain/grass:latest
+    hostname: ${DEVICE_NAME}_grass
+    environment:
+      - GRASS_USER=${GRASS_EMAIL}
+      - GRASS_PASS=${GRASS_PASS}
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 512m
+EOF
+echo "  ✅ Grass 已添加 (⚠️ 需要住宅IP)"
+fi
+
+# Gradient (需要住宅 IP)
+if [ -n "$GRADIENT_EMAIL" ] && [ -n "$GRADIENT_PASSWORD" ]; then
+cat >> docker-compose.yml << EOF
+
+  gradient:
+    container_name: ${DEVICE_NAME}_gradient
+    image: mrcolorrain/gradient:latest
+    hostname: ${DEVICE_NAME}_gradient
+    environment:
+      - GRADIENT_EMAIL=${GRADIENT_EMAIL}
+      - GRADIENT_PASS=${GRADIENT_PASSWORD}
+    labels: ["com.centurylinklabs.watchtower.scope=m4b"]
+    restart: always
+    cpus: 0.5
+    mem_limit: 512m
+EOF
+echo "  ✅ Gradient 已添加 (⚠️ 需要住宅IP)"
+fi
+
+echo ""
+echo "=== Starting Money4Band Stack ==="
+cd /opt/money4band
+docker compose up -d
+
+echo ""
+echo "=== Money4Band 部署完成 ==="
+docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+""",
+        "health_check_cmd": "cd /opt/money4band && docker compose ps --format 'table {{.Name}}\\t{{.Status}}'",
+        "config_template": {
+            "traffmonetizer_token": "",
+            "repocket_email": "",
+            "repocket_apikey": "",
+            "proxyrack_apikey": "",
+            "proxylite_userid": "",
+            "honeygain_email": "",
+            "honeygain_password": "",
+            "earnapp_uuid": "",
+            "packetstream_cid": "",
+            "grass_email": "",
+            "grass_password": "",
+            "gradient_email": "",
+            "gradient_password": "",
+        },
+    },
+    {
         "name": "nodepay",
         "description": "Nodepay - 去中心化AI数据网络",
         "install_script": """#!/bin/bash
