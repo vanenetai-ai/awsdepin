@@ -66,26 +66,44 @@ echo "=== Titan L2 Edge Node installed and bound successfully ==="
     },
     {
         "name": "grass-node",
-        "description": "Grass - 去中心化带宽共享网络",
+        "description": "Grass (GetGrass) - 去中心化带宽共享网络，需要 Grass 账号邮箱和密码",
         "install_script": """#!/bin/bash
 set -e
 cd /home/ubuntu
 
+GRASS_USER="${grass_email}"
+GRASS_PASS="${grass_password}"
+
+if [ -z "$GRASS_USER" ] || [ -z "$GRASS_PASS" ]; then
+    echo "ERROR: Grass 邮箱和密码不能为空！请在 https://app.getgrass.io/ 注册账号"
+    exit 1
+fi
+
+# 安装 Docker
 if ! command -v docker &> /dev/null; then
     curl -fsSL https://get.docker.com | sh
     systemctl enable docker && systemctl start docker
     usermod -aG docker ubuntu
 fi
 
-docker pull cambriantech/grass-node:latest
-docker run -d --name grass-node --restart=always \
-    -e GRASS_USER_ID="${GRASS_USER_ID}" \
-    cambriantech/grass-node:latest
+# 停止旧容器
+docker rm -f grass 2>/dev/null || true
 
-echo "Grass node started successfully"
+# 使用 MRColorR/get-grass 官方镜像
+docker pull mrcolorrain/grass:latest
+docker run -d --name grass --restart=always \
+    -h "depin-$(hostname)" \
+    -e GRASS_USER="$GRASS_USER" \
+    -e GRASS_PASS="$GRASS_PASS" \
+    mrcolorrain/grass:latest
+
+echo "=== Grass node started successfully ==="
+echo "账号: $GRASS_USER"
+echo "镜像: mrcolorrain/grass:latest"
+docker ps --filter name=grass --format 'Status: {{.Status}}'
 """,
-        "health_check_cmd": "docker ps --filter name=grass-node --format '{{.Status}}'",
-        "config_template": {"GRASS_USER_ID": ""},
+        "health_check_cmd": "docker ps --filter name=grass --format '{{.Status}}'",
+        "config_template": {"grass_email": "", "grass_password": ""},
     },
     {
         "name": "nodepay",
