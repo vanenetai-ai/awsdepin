@@ -274,6 +274,98 @@ docker ps --filter name=earnfm --format 'Status: {{.Status}}'
         "config_template": {"earnfm_apikey": ""},
     },
     {
+        "name": "xmrig",
+        "description": "XMRig - Monero (XMR) CPU 挖矿 (✅ VPS兼容，纯CPU算力变现)。需要 XMR 钱包地址，推荐矿池: pool.hashvault.pro",
+        "install_script": """#!/bin/bash
+set -e
+WALLET="${xmr_wallet}"
+POOL="${xmr_pool}"
+WORKER="depin-$(hostname)"
+
+if [ -z "$WALLET" ]; then echo "ERROR: XMR 钱包地址不能为空"; exit 1; fi
+if [ -z "$POOL" ]; then POOL="pool.hashvault.pro:443"; fi
+
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+docker rm -f xmrig 2>/dev/null || true
+docker pull miningcontainers/xmrig:latest
+docker run -d --name xmrig --restart=always \
+    miningcontainers/xmrig:latest \
+    -o "$POOL" -u "$WALLET" -p "$WORKER" --tls --coin monero --donate-level 1
+
+echo "=== XMRig 已启动 ==="
+echo "钱包: $WALLET"
+echo "矿池: $POOL"
+echo "矿工: $WORKER"
+docker ps --filter name=xmrig --format 'Status: {{.Status}}'
+""",
+        "health_check_cmd": "docker ps --filter name=xmrig --format '{{.Status}}' && docker logs --tail 5 xmrig 2>&1",
+        "config_template": {"xmr_wallet": "", "xmr_pool": "pool.hashvault.pro:443"},
+    },
+    {
+        "name": "golem-provider",
+        "description": "Golem Network - 去中心化算力市场 (✅ VPS兼容)。出租 CPU 算力赚取 GLM 代币，需要 Polygon 钱包地址收款",
+        "install_script": """#!/bin/bash
+set -e
+WALLET="${golem_wallet}"
+SUBNET="${golem_subnet}"
+
+if [ -z "$WALLET" ]; then echo "ERROR: Polygon 钱包地址不能为空 (用于接收 GLM)"; exit 1; fi
+if [ -z "$SUBNET" ]; then SUBNET="public"; fi
+
+# 安装 Golem Provider
+curl -sSf https://join.golem.network/as-provider | bash -
+
+# 配置钱包地址
+golemsp settings set --account "$WALLET"
+golemsp settings set --payment-network polygon
+
+# 设置节点名称
+golemsp settings set --node-name "depin-$(hostname)"
+
+# 启动 provider (后台)
+nohup golemsp run --subnet "$SUBNET" > /var/log/golem-provider.log 2>&1 &
+
+echo "=== Golem Provider 已启动 ==="
+echo "钱包: $WALLET"
+echo "子网: $SUBNET"
+echo "查看状态: golemsp status"
+sleep 5
+golemsp status || true
+""",
+        "health_check_cmd": "golemsp status 2>&1 || echo 'Golem not running'",
+        "config_template": {"golem_wallet": "", "golem_subnet": "public"},
+    },
+    {
+        "name": "bacalhau-node",
+        "description": "Bacalhau - 去中心化计算网络 (✅ VPS兼容)。提供 CPU 算力执行 Docker/WASM 计算任务",
+        "install_script": """#!/bin/bash
+set -e
+
+# 安装 Docker
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker && systemctl start docker
+fi
+
+# 安装 Bacalhau
+curl -sL https://get.bacalhau.org/install.sh | bash
+
+# 启动 compute node
+nohup bacalhau serve --node-type compute --job-selection-accept-networked > /var/log/bacalhau.log 2>&1 &
+
+echo "=== Bacalhau Compute Node 已启动 ==="
+sleep 3
+bacalhau node list --local 2>&1 || true
+tail -5 /var/log/bacalhau.log 2>/dev/null || true
+""",
+        "health_check_cmd": "pgrep -f 'bacalhau serve' && tail -5 /var/log/bacalhau.log 2>&1",
+        "config_template": {},
+    },
+    {
         "name": "nodepay",
         "description": "Nodepay - 去中心化AI数据网络",
         "install_script": """#!/bin/bash
