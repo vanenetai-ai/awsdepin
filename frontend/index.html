@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260405r">
+    <link rel="stylesheet" href="style.css?v=20260509a">
 </head>
 <body>
     <nav class="sidebar">
@@ -186,7 +186,13 @@
             <form onsubmit="launchInstance(event)">
                 <div class="form-group">
                     <label>选择账号 (可多选，按住 Ctrl 批量开机)</label>
-                    <select id="launch-account" multiple size="5" style="min-height:100px"></select>
+                    <div class="ms-toolbar">
+                        <input type="text" id="launch-account-search" class="search-input ms-search" placeholder="🔍 搜索邮箱 / 分组 / 区域 / 实例数..." oninput="filterMultiSelect('launch-account-search','launch-account','launch-account-count')">
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="multiSelectAll('launch-account', true)">全选可见</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="multiSelectAll('launch-account', false)">清空</button>
+                        <span class="ms-count" id="launch-account-count">0 / 0</span>
+                    </div>
+                    <select id="launch-account" multiple size="8" style="min-height:180px"></select>
                 </div>
                 <div class="form-group">
                     <label>区域</label>
@@ -314,7 +320,13 @@
             <form onsubmit="deployTask(event)">
                 <div class="form-group">
                     <label>选择实例 (可多选，按住 Ctrl 批量部署)</label>
-                    <select id="deploy-instance" multiple size="5" style="min-height:100px"></select>
+                    <div class="ms-toolbar">
+                        <input type="text" id="deploy-instance-search" class="search-input ms-search" placeholder="🔍 搜索 IP / 账号 / 区域 / 已部署项目..." oninput="filterMultiSelect('deploy-instance-search','deploy-instance','deploy-instance-count')">
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="multiSelectAll('deploy-instance', true)">全选可见</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="multiSelectAll('deploy-instance', false)">清空</button>
+                        <span class="ms-count" id="deploy-instance-count">0 / 0</span>
+                    </div>
+                    <select id="deploy-instance" multiple size="8" style="min-height:180px"></select>
                 </div>
                 <div class="form-group">
                     <label>选择项目</label>
@@ -442,6 +454,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260405r"></script>
+    <script src="app.js?v=20260509a"></script>
 </body>
 </html>

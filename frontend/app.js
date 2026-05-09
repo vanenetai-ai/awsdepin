@@ -148,6 +148,7 @@ function renderAccountCards(list) {
                     ${flag ? `<span class="acc-flag">${flag}</span>` : ''}
                     ${age ? `<span class="acc-age">${age}</span>` : ''}
                     ${vcpuText ? `<span class="acc-vcpu" onclick="showVcpuDetail(${a.id})" title="点击查看详情">⚡ ${vcpuText}</span>` : ''}
+                    <span class="acc-instances ${(a.instance_count||0) > 0 ? 'has' : ''}" onclick="viewAccountInstances(${a.id})" title="查看该账号的实例">🖥 ${a.instance_count || 0} 实例</span>
                 </div>
                 <div class="acc-card-actions">
                     <button class="acc-toggle-btn" onclick="toggleCardExpand(${a.id})">▼</button>
@@ -180,6 +181,22 @@ function renderAccountCards(list) {
 function toggleCardExpand(id) {
     const el = document.getElementById('acc-expand-' + id);
     if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function viewAccountInstances(accountId) {
+    const a = accountsCache.find(x => x.id === accountId);
+    const name = a ? (a.email || a.name || String(accountId)) : String(accountId);
+    // 切换到实例 Tab
+    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    const navInst = document.querySelector('.nav-item[data-tab="instances"]');
+    const tabInst = document.getElementById('tab-instances');
+    if (navInst) navInst.classList.add('active');
+    if (tabInst) tabInst.classList.add('active');
+    // 设置搜索框并触发过滤
+    const search = document.getElementById('instance-search');
+    if (search) search.value = name.split('@')[0] || name;
+    loadInstances().then(() => filterInstances());
 }
 
 function toggleAccountSelect(id, checked) {
@@ -697,13 +714,69 @@ async function deleteTask(id) {
 async function checkHealth(id) { showLoading('正在健康检查...'); try { const res = await api(`/tasks/${id}/health`, { method: 'POST' }); toast(`健康检查: ${res.status} ${res.message || ''}`, 'info'); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
 // ==================== Helpers ====================
-async function loadAccountOptions(sid) { try { const l = accountsCache.length ? accountsCache : await api('/accounts'); document.getElementById(sid).innerHTML = l.map(a => `<option value="${a.id}">${a.email || a.name} (${a.default_region})</option>`).join(''); } catch(e){} }
+async function loadAccountOptions(sid) {
+    try {
+        const l = accountsCache.length ? accountsCache : await api('/accounts');
+        const sel = document.getElementById(sid);
+        sel.innerHTML = l.map(a => {
+            const name = a.email || a.name;
+            const cnt = a.instance_count || 0;
+            const grp = a.group_name ? ` [${a.group_name}]` : '';
+            const label = `${name} (${a.default_region})${grp} · 实例: ${cnt}`;
+            const search = `${name} ${a.name || ''} ${a.default_region} ${a.group_name || ''} ${a.note || ''} ${a.aws_account_id || ''}`.toLowerCase();
+            return `<option value="${a.id}" data-search="${search}" data-count="${cnt}">${label}</option>`;
+        }).join('');
+        // 触发搜索计数更新
+        if (sid === 'launch-account') filterMultiSelect('launch-account-search', 'launch-account', 'launch-account-count');
+    } catch(e){}
+}
 async function loadInstanceOptions(sid) {
     try {
         const l = await api('/instances');
         const sel = document.getElementById(sid);
-        sel.innerHTML = l.filter(i => i.state==='running').map(i => `<option value="${i.id}" selected>${i.public_ip||i.instance_id} (${i.account_name})</option>`).join('');
+        sel.innerHTML = l.filter(i => i.state === 'running').map(i => {
+            const ip = i.public_ip || i.instance_id;
+            const projs = (i.projects && i.projects !== '-') ? i.projects : '';
+            const projText = projs ? ` · 已部署: ${projs}` : ' · 未部署';
+            const label = `${ip} (${i.account_name} / ${i.region})${projText}`;
+            const search = `${ip} ${i.instance_id || ''} ${i.account_name || ''} ${i.region || ''} ${i.instance_type || ''} ${projs}`.toLowerCase();
+            return `<option value="${i.id}" data-search="${search}" data-projects="${projs}" selected>${label}</option>`;
+        }).join('');
+        if (sid === 'deploy-instance') filterMultiSelect('deploy-instance-search', 'deploy-instance', 'deploy-instance-count');
     } catch(e){}
+}
+
+// ==================== Searchable Multi-Select (modal) ====================
+function filterMultiSelect(searchId, selectId, countId) {
+    const q = (document.getElementById(searchId)?.value || '').trim().toLowerCase();
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    let visible = 0;
+    const total = sel.options.length;
+    for (const opt of sel.options) {
+        const hay = (opt.dataset.search || opt.textContent || '').toLowerCase();
+        const match = !q || hay.includes(q);
+        opt.hidden = !match;
+        // 原生 <select> 里 hidden 在部分浏览器不生效, 额外用样式
+        opt.style.display = match ? '' : 'none';
+        if (!match && opt.selected) opt.selected = false;
+        if (match) visible++;
+    }
+    const cnt = document.getElementById(countId);
+    if (cnt) cnt.textContent = `${visible} / ${total}`;
+}
+
+function multiSelectAll(selectId, selectVisible) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    for (const opt of sel.options) {
+        if (selectVisible) {
+            if (opt.style.display !== 'none' && !opt.hidden) opt.selected = true;
+        } else {
+            opt.selected = false;
+        }
+    }
+    sel.dispatchEvent(new Event('change'));
 }
 async function loadProjectOptions(sid) { try { if (!projectsCache.length) projectsCache = await api('/projects'); document.getElementById(sid).innerHTML = projectsCache.map(p => `<option value="${p.id}">${p.name}</option>`).join(''); } catch(e){} }
 async function loadProjectConfig() { const pid = document.getElementById('deploy-project').value; const c = document.getElementById('deploy-config-fields'); c.innerHTML = ''; try { const p = await api(`/projects/${pid}`); if (p.config_template) for (const [k,v] of Object.entries(p.config_template)) c.innerHTML += `<div class="form-group"><label>${k}</label><input type="text" data-key="${k}" value="${v}" placeholder="${k}"></div>`; } catch(e){} }
