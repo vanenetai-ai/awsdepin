@@ -926,4 +926,145 @@ class AwsManager:
 
         return result
 
+    # ==================== 账单查询 ====================
+    def get_billing(self, year: int, month: int, granularity: str = "DAILY") -> dict:
+        """
+        查询指定年月的账单明细。
+
+        返回结构:
+        {
+            "period": {"start": "2026-05-01", "end": "2026-06-01"},
+            "total": 123.45,
+            "currency": "USD",
+            "by_service": [{"service": "Amazon Elastic Compute Cloud - Compute", "amount": 50.12}],
+            "by_region": [{"region": "us-east-1", "amount": 30.45}],
+            "daily": [{"date": "2026-05-01", "amount": 4.12}],   # granularity=DAILY 时有
+            "monthly_total": 123.45,
+            "error": null
+        }
+        """
+        from calendar import monthrange
+        from datetime import date, timedelta
+
+        # Cost Explorer 是全局服务，端点固定在 us-east-1
+        try:
+            # 参数校验
+            if not (2000 <= year <= 2100):
+                return {"error": "年份无效", "total": 0, "by_service": [], "by_region": [], "daily": []}
+            if not (1 <= month <= 12):
+                return {"error": "月份无效", "total": 0, "by_service": [], "by_region": [], "daily": []}
+
+            # 账单 API 的 End 是 exclusive，取下个月 1 号
+            start_date = date(year, month, 1)
+            last_day = monthrange(year, month)[1]
+            # End 不能超过 "今天"，否则 CE 会报错
+            today = date.today()
+            end_date = date(year, month, last_day) + timedelta(days=1)
+            if end_date > today:
+                end_date = today
+            if start_date >= end_date:
+                return {
+                    "error": "查询区间无效（开始日期不能晚于当前日期）",
+                    "period": {"start": str(start_date), "end": str(end_date)},
+                    "total": 0, "by_service": [], "by_region": [], "daily": [],
+                }
+
+            period = {"Start": str(start_date), "End": str(end_date)}
+
+            ce = self._get_client("ce", "us-east-1")
+
+            result = {
+                "period": {"start": str(start_date), "end": str(end_date)},
+                "total": 0.0,
+                "currency": "USD",
+                "by_service": [],
+                "by_region": [],
+                "daily": [],
+                "monthly_total": 0.0,
+                "error": None,
+            }
+
+            # 1) 按服务分组（MONTHLY，一次返回整月汇总）
+            try:
+                resp = ce.get_cost_and_usage(
+                    TimePeriod=period,
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+                )
+                svc_total = 0.0
+                currency = "USD"
+                svc_agg = {}
+                for r in resp.get("ResultsByTime", []):
+                    for g in r.get("Groups", []):
+                        svc = g["Keys"][0] if g.get("Keys") else "-"
+                        amt_obj = g["Metrics"].get("UnblendedCost", {})
+                        amt = float(amt_obj.get("Amount", 0) or 0)
+                        currency = amt_obj.get("Unit") or currency
+                        svc_agg[svc] = svc_agg.get(svc, 0.0) + amt
+                        svc_total += amt
+                result["currency"] = currency
+                result["monthly_total"] = round(svc_total, 4)
+                result["total"] = round(svc_total, 4)
+                result["by_service"] = sorted(
+                    [{"service": k, "amount": round(v, 4)} for k, v in svc_agg.items() if v > 0],
+                    key=lambda x: x["amount"], reverse=True,
+                )
+            except Exception as e:
+                msg = str(e)
+                if "AccessDenied" in msg or "not authorized" in msg:
+                    result["error"] = "凭证无 Cost Explorer 权限 (ce:GetCostAndUsage)，请在 IAM 授予 AWSBillingReadOnlyAccess 或类似权限。"
+                elif "DataUnavailable" in msg or "has not yet been activated" in msg:
+                    result["error"] = "该账号尚未启用 Cost Explorer。请先登录 AWS 控制台 Billing → Cost Explorer 点击 'Enable Cost Explorer'，约 24h 后可查询。"
+                else:
+                    result["error"] = f"账单查询失败: {msg[:200]}"
+                return result
+
+            # 2) 按区域分组（MONTHLY）
+            try:
+                resp = ce.get_cost_and_usage(
+                    TimePeriod=period,
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    GroupBy=[{"Type": "DIMENSION", "Key": "REGION"}],
+                )
+                reg_agg = {}
+                for r in resp.get("ResultsByTime", []):
+                    for g in r.get("Groups", []):
+                        reg = g["Keys"][0] if g.get("Keys") else "-"
+                        amt = float(g["Metrics"].get("UnblendedCost", {}).get("Amount", 0) or 0)
+                        reg_agg[reg or "-"] = reg_agg.get(reg or "-", 0.0) + amt
+                result["by_region"] = sorted(
+                    [{"region": k, "amount": round(v, 4)} for k, v in reg_agg.items() if v > 0],
+                    key=lambda x: x["amount"], reverse=True,
+                )
+            except Exception as e:
+                logger.warning(f"billing by region failed: {e}")
+
+            # 3) 每日走势
+            if granularity.upper() == "DAILY":
+                try:
+                    resp = ce.get_cost_and_usage(
+                        TimePeriod=period,
+                        Granularity="DAILY",
+                        Metrics=["UnblendedCost"],
+                    )
+                    daily = []
+                    for r in resp.get("ResultsByTime", []):
+                        d = r.get("TimePeriod", {}).get("Start", "")
+                        amt = float(r.get("Total", {}).get("UnblendedCost", {}).get("Amount", 0) or 0)
+                        daily.append({"date": d, "amount": round(amt, 4)})
+                    result["daily"] = daily
+                except Exception as e:
+                    logger.warning(f"billing daily failed: {e}")
+
+            return result
+        except Exception as e:
+            return {
+                "error": f"账单查询异常: {str(e)[:200]}",
+                "total": 0, "by_service": [], "by_region": [], "daily": [],
+            }
+
+
+
 

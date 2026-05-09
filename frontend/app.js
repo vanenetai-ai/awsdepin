@@ -170,6 +170,7 @@ function renderAccountCards(list) {
                 <button class="btn btn-sm btn-secondary" onclick="detectAccount(${a.id})">🔍 检测</button>
                 <button class="btn btn-sm btn-secondary" onclick="detectAI(${a.id})">🤖 AI</button>
                 <button class="btn btn-sm btn-secondary" onclick="showVcpuDetail(${a.id})">⚡ vCPU</button>
+                <button class="btn btn-sm btn-secondary" onclick="showBilling(${a.id})">💰 账单</button>
                 <span class="acc-footer-spacer"></span>
                 <button class="btn btn-sm btn-secondary" onclick="window.location.hash='instances';loadInstances()">EC2 实例</button>
                 <button class="btn btn-sm btn-secondary">Lightsail 实例</button>
@@ -396,6 +397,166 @@ async function showVcpuDetail(id) {
     } catch (e) {
         body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">获取失败: ${e.message}</div>`;
     }
+}
+
+// ==================== Billing ====================
+let _billingAccountId = null;
+
+function showBilling(id) {
+    _billingAccountId = id;
+    const a = accountsCache.find(x => x.id === id);
+    const accName = a ? (a.email || a.name || ('#' + id)) : ('#' + id);
+    const hint = document.getElementById('billing-acc-hint');
+    if (hint) hint.textContent = `账号: ${accName}`;
+
+    // 初始化年份/月份选项（默认当前年月，但上月数据更完整，默认取上月）
+    const now = new Date();
+    let defY = now.getFullYear();
+    let defM = now.getMonth() + 1; // 1-12, 当前月
+    // 默认选上个月
+    let y = defY, m = defM - 1;
+    if (m < 1) { m = 12; y = defY - 1; }
+
+    const ySel = document.getElementById('billing-year');
+    const mSel = document.getElementById('billing-month');
+    if (ySel) {
+        const years = [];
+        for (let i = defY; i >= defY - 5; i--) years.push(i);
+        ySel.innerHTML = years.map(yr => `<option value="${yr}" ${yr===y?'selected':''}>${yr} 年</option>`).join('');
+    }
+    if (mSel) {
+        const months = [];
+        for (let i = 1; i <= 12; i++) months.push(i);
+        mSel.innerHTML = months.map(mo => `<option value="${mo}" ${mo===m?'selected':''}>${mo} 月</option>`).join('');
+    }
+
+    // 重置内容
+    const body = document.getElementById('billing-body');
+    if (body) body.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text2)">选择年月后点击「查询」</div>';
+
+    document.getElementById('billing-modal').classList.add('show');
+}
+
+async function loadBilling() {
+    if (!_billingAccountId) { toast('请先从账号卡片选择账号', 'error'); return; }
+    const year = parseInt(document.getElementById('billing-year').value);
+    const month = parseInt(document.getElementById('billing-month').value);
+    const body = document.getElementById('billing-body');
+    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在查询 Cost Explorer，可能需要 10-30 秒...</div></div>`;
+    try {
+        const res = await api(`/accounts/${_billingAccountId}/billing?year=${year}&month=${month}&granularity=DAILY`);
+        renderBilling(res, year, month);
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">查询失败: ${e.message}</div>`;
+    }
+}
+
+function fmtMoney(amount, currency) {
+    const n = Number(amount || 0);
+    const c = currency || 'USD';
+    const sign = c === 'USD' ? '$' : (c === 'CNY' ? '¥' : '');
+    return `${sign}${n.toFixed(2)} ${c}`;
+}
+
+function renderBilling(data, year, month) {
+    const body = document.getElementById('billing-body');
+    if (!body) return;
+
+    if (data.error) {
+        body.innerHTML = `
+            <div style="padding:14px;background:rgba(239,68,68,0.1);border:1px solid var(--red);border-radius:8px;color:var(--red);font-size:13px;line-height:1.6">
+                <b>⚠️ 查询失败</b><br>${data.error}
+            </div>`;
+        return;
+    }
+
+    const period = data.period || {};
+    const total = data.total || 0;
+    const currency = data.currency || 'USD';
+    const services = data.by_service || [];
+    const regions = data.by_region || [];
+    const daily = data.daily || [];
+
+    // 汇总头
+    let html = `
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+            <div class="stat-card" style="flex:1;min-width:160px;padding:14px">
+                <div class="label">${year} 年 ${month} 月 总消费</div>
+                <div class="value ${total>0?'yellow':''}" style="font-size:22px">${fmtMoney(total, currency)}</div>
+            </div>
+            <div class="stat-card" style="flex:1;min-width:160px;padding:14px">
+                <div class="label">时间区间</div>
+                <div class="value" style="font-size:14px;font-weight:600;color:var(--text2)">${period.start || '-'} ~ ${period.end || '-'}</div>
+            </div>
+            <div class="stat-card" style="flex:1;min-width:120px;padding:14px">
+                <div class="label">服务项数</div>
+                <div class="value blue" style="font-size:22px">${services.length}</div>
+            </div>
+        </div>`;
+
+    // 无消费
+    if (total <= 0 && !services.length) {
+        html += `<div style="padding:20px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">✅ 该月无账单消费</div>`;
+        body.innerHTML = html;
+        return;
+    }
+
+    // 按服务
+    if (services.length) {
+        html += `<div class="ai-section">
+            <div class="ai-section-title">📦 按服务消费 (Top ${services.length})</div>
+            <div class="ai-section-body">
+                <table class="ai-table"><thead><tr><th>服务</th><th style="text-align:right">金额</th><th style="width:100px">占比</th></tr></thead><tbody>`;
+        for (const s of services) {
+            const pct = total > 0 ? (s.amount / total * 100) : 0;
+            html += `<tr>
+                <td>${s.service}</td>
+                <td style="text-align:right;font-weight:600;color:var(--yellow)">${fmtMoney(s.amount, currency)}</td>
+                <td>
+                    <div style="background:var(--bg3);border-radius:6px;height:14px;position:relative;overflow:hidden">
+                        <div style="background:var(--primary);height:100%;width:${pct.toFixed(1)}%"></div>
+                    </div>
+                    <span style="font-size:11px;color:var(--text2)">${pct.toFixed(1)}%</span>
+                </td>
+            </tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+    }
+
+    // 按区域
+    if (regions.length) {
+        html += `<div class="ai-section">
+            <div class="ai-section-title">🌍 按区域消费</div>
+            <div class="ai-section-body">
+                <table class="ai-table"><thead><tr><th>区域</th><th style="text-align:right">金额</th></tr></thead><tbody>`;
+        for (const r of regions) {
+            html += `<tr><td>${r.region || 'Global/-'}</td><td style="text-align:right;font-weight:600">${fmtMoney(r.amount, currency)}</td></tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+    }
+
+    // 每日走势
+    if (daily.length) {
+        const maxAmt = Math.max(...daily.map(d => d.amount || 0), 0.01);
+        html += `<div class="ai-section">
+            <div class="ai-section-title">📈 每日走势</div>
+            <div class="ai-section-body">
+                <div style="display:flex;align-items:flex-end;gap:2px;height:80px;padding:4px 0;border-bottom:1px solid var(--border);margin-bottom:4px">`;
+        for (const d of daily) {
+            const h = maxAmt > 0 ? ((d.amount || 0) / maxAmt * 75) : 0;
+            const color = d.amount > 0 ? 'var(--primary)' : 'var(--border)';
+            html += `<div title="${d.date}: ${fmtMoney(d.amount, currency)}" style="flex:1;min-width:4px;background:${color};height:${h}px;border-radius:2px 2px 0 0;cursor:help"></div>`;
+        }
+        html += `</div>
+                <div style="display:flex;justify-content:space-between;color:var(--text2);font-size:11px">
+                    <span>${daily[0]?.date || ''}</span>
+                    <span>共 ${daily.length} 天 · 最高 ${fmtMoney(maxAmt, currency)}</span>
+                    <span>${daily[daily.length-1]?.date || ''}</span>
+                </div>
+            </div></div>`;
+    }
+
+    body.innerHTML = html;
 }
 
 function renderVcpuTable(regions) {

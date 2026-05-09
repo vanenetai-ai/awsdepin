@@ -374,6 +374,26 @@ async def get_account_vcpus(account_id: int, user: User = Depends(get_current_us
     db.commit()
     return result
 
+
+@app.get("/api/accounts/{account_id}/billing")
+async def get_account_billing(
+    account_id: int,
+    year: int = Query(..., ge=2000, le=2100, description="年份，例如 2026"),
+    month: int = Query(..., ge=1, le=12, description="月份，1-12"),
+    granularity: str = Query("DAILY", description="DAILY 或 MONTHLY"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """查询指定账号某年某月的账单消费明细 (Cost Explorer)"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor,
+        lambda: AwsManager(account, db).get_billing(year=year, month=month, granularity=granularity),
+    )
+    return result
+
+
 @app.post("/api/accounts/batch-delete")
 def batch_delete_accounts(data: BatchDeleteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """批量删除账号"""

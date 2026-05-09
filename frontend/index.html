@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260509a">
+    <link rel="stylesheet" href="style.css?v=20260509b">
 </head>
 <body>
     <nav class="sidebar">
@@ -425,6 +425,33 @@
         </div>
     </div>
 
+    <!-- Billing Modal -->
+    <div class="modal-overlay" id="billing-modal">
+        <div class="modal" style="width:760px;max-height:86vh;overflow-y:auto">
+            <div class="modal-header">
+                <h3>💰 账单消费查询</h3>
+                <button class="modal-close" onclick="hideModal('billing-modal')">&times;</button>
+            </div>
+            <div id="billing-acc-hint" style="padding:4px 0 10px;color:var(--text2);font-size:13px;border-bottom:1px solid var(--border);margin-bottom:12px"></div>
+            <div class="form-row" style="align-items:flex-end">
+                <div class="form-group" style="flex:1">
+                    <label>年份</label>
+                    <select id="billing-year"></select>
+                </div>
+                <div class="form-group" style="flex:1">
+                    <label>月份</label>
+                    <select id="billing-month"></select>
+                </div>
+                <div class="form-group" style="flex:0 0 auto">
+                    <button type="button" class="btn btn-primary" onclick="loadBilling()" style="padding:9px 16px">🔍 查询</button>
+                </div>
+            </div>
+            <div id="billing-body">
+                <div style="text-align:center;padding:20px;color:var(--text2)">选择年月后点击「查询」</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Edit Account Modal -->
     <div class="modal-overlay" id="edit-account-modal">
         <div class="modal">
@@ -454,6 +481,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260509a"></script>
+    <script src="app.js?v=20260509b"></script>
 </body>
 </html>
