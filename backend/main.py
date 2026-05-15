@@ -13,6 +13,7 @@ from typing import Optional
 from database import get_db, init_db, SessionLocal
 from models import User, AwsAccount, Instance, Proxy, DepinProject, DepinTask
 from aws_manager import AwsManager
+from lightsail_manager import LightsailManager, LIGHTSAIL_REGIONS
 from proxy_manager import ProxyManager
 from depin_manager import DepinManager
 from auth import get_current_user, create_token, get_or_create_user, get_user_by_token
@@ -751,6 +752,229 @@ def list_amis(user: User = Depends(get_current_user)):
         {"id": "ubuntu-20.04", "name": "Ubuntu 20.04 LTS", "os": "Ubuntu", "desc": "Ubuntu 20.04 Focal Fossa"},
         {"id": "ubuntu-24.04", "name": "Ubuntu 24.04 LTS", "os": "Ubuntu", "desc": "Ubuntu 24.04 Noble Numbat"},
     ]
+
+
+# ==================== Lightsail (光帆) ====================
+
+class LightsailLaunchRequest(BaseModel):
+    account_id: int
+    region: str
+    availability_zone: Optional[str] = None  # 留空则取该区域第一个可用区
+    blueprint_id: str  # 如 ubuntu_22_04 / wordpress / amazon_linux_2023
+    bundle_id: str     # 如 nano_3_0 / small_3_0 / large_3_0
+    instance_name: str
+    count: int = 1
+    user_data: Optional[str] = None
+    open_default_ports: bool = True
+
+
+@app.get("/api/lightsail/regions")
+def lightsail_list_regions(user: User = Depends(get_current_user)):
+    """列出 Lightsail 支持的所有区域 (静态列表，无需账号)"""
+    return [{"code": k, "display": v} for k, v in LIGHTSAIL_REGIONS.items()]
+
+
+@app.get("/api/lightsail/blueprints")
+async def lightsail_list_blueprints(
+    account_id: int = Query(...),
+    region: Optional[str] = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """列出 Lightsail 蓝图 (操作系统/应用镜像)"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).list_blueprints(region),
+    )
+
+
+@app.get("/api/lightsail/bundles")
+async def lightsail_list_bundles(
+    account_id: int = Query(...),
+    region: Optional[str] = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """列出 Lightsail 套餐 (实例规格)"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).list_bundles(region),
+    )
+
+
+@app.get("/api/lightsail/availability-zones")
+async def lightsail_list_az(
+    account_id: int = Query(...),
+    region: str = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """列出指定区域的可用区"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).list_availability_zones(region),
+    )
+
+
+@app.get("/api/lightsail/instances")
+async def lightsail_list_instances(
+    account_id: int = Query(...),
+    region: Optional[str] = Query(None, description="留空则扫描所有区域"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """列出指定账号的 Lightsail 实例"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+
+    def _list():
+        mgr = LightsailManager(account, db)
+        if region:
+            return {"region": region, "instances": mgr.list_instances(region)}
+        # 扫描所有区域
+        all_data = mgr.list_instances_all_regions()
+        flat = []
+        for r, items in all_data.items():
+            for it in items:
+                it["region"] = r
+                flat.append(it)
+        return {"region": "all", "instances": flat, "by_region": all_data}
+
+    return await loop.run_in_executor(executor, _list)
+
+
+@app.post("/api/lightsail/launch")
+async def lightsail_launch(
+    data: LightsailLaunchRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """创建 Lightsail 实例 (光帆开机)"""
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+
+    def _do():
+        mgr = LightsailManager(account, db)
+        # 如果未指定可用区，取第一个
+        az = data.availability_zone
+        if not az:
+            zones = mgr.list_availability_zones(data.region)
+            if not zones:
+                raise ValueError(f"区域 {data.region} 没有可用区")
+            az = zones[0]
+
+        result = mgr.create_instance(
+            instance_name=data.instance_name,
+            region=data.region,
+            availability_zone=az,
+            blueprint_id=data.blueprint_id,
+            bundle_id=data.bundle_id,
+            user_data=data.user_data,
+            count=data.count,
+        )
+
+        # 自动打开常用端口
+        if data.open_default_ports:
+            for name in result.get("instance_names", []):
+                try:
+                    mgr.open_instance_ports(name, data.region)
+                except Exception as e:
+                    logger.warning(f"open ports for {name} failed: {e}")
+
+        return result
+
+    try:
+        return await loop.run_in_executor(executor, _do)
+    except Exception as e:
+        raise HTTPException(400, f"创建 Lightsail 实例失败: {str(e)[:300]}")
+
+
+@app.post("/api/lightsail/instances/{instance_name}/start")
+async def lightsail_start(
+    instance_name: str,
+    account_id: int = Query(...),
+    region: str = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).start_instance(instance_name, region),
+    )
+
+
+@app.post("/api/lightsail/instances/{instance_name}/stop")
+async def lightsail_stop(
+    instance_name: str,
+    account_id: int = Query(...),
+    region: str = Query(...),
+    force: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).stop_instance(instance_name, region, force=force),
+    )
+
+
+@app.post("/api/lightsail/instances/{instance_name}/reboot")
+async def lightsail_reboot(
+    instance_name: str,
+    account_id: int = Query(...),
+    region: str = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).reboot_instance(instance_name, region),
+    )
+
+
+@app.delete("/api/lightsail/instances/{instance_name}")
+async def lightsail_delete(
+    instance_name: str,
+    account_id: int = Query(...),
+    region: str = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).delete_instance(instance_name, region),
+    )
+
+
+@app.post("/api/lightsail/instances/{instance_name}/open-ports")
+async def lightsail_open_ports(
+    instance_name: str,
+    account_id: int = Query(...),
+    region: str = Query(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """开放常用端口 (22/80/443/3000-9999)"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: LightsailManager(account, db).open_instance_ports(instance_name, region),
+    )
 
 
 # ==================== Proxies ====================

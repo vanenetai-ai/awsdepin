@@ -173,7 +173,7 @@ function renderAccountCards(list) {
                 <button class="btn btn-sm btn-secondary" onclick="showBilling(${a.id})">💰 账单</button>
                 <span class="acc-footer-spacer"></span>
                 <button class="btn btn-sm btn-secondary" onclick="window.location.hash='instances';loadInstances()">EC2 实例</button>
-                <button class="btn btn-sm btn-secondary">Lightsail 实例</button>
+                <button class="btn btn-sm btn-secondary" onclick="showLightsail(${a.id})">⛵ Lightsail 实例</button>
             </div>
         </div>`;
     }).join('');
@@ -1069,6 +1069,234 @@ function refreshSearchSelect(id) {
         const opt = sel.options[sel.selectedIndex];
         if (display && opt) display.textContent = opt.textContent;
     }
+}
+
+// ==================== Lightsail (光帆) ====================
+let _lsAccountId = null;
+let _lsBlueprintsAll = [];   // 完整蓝图列表
+let _lsBundlesAll = [];      // 完整套餐列表
+let _lsRegions = [];         // 区域列表
+
+async function showLightsail(accountId) {
+    _lsAccountId = accountId;
+    const a = accountsCache.find(x => x.id === accountId);
+    const accName = a ? (a.email || a.name || ('#' + accountId)) : ('#' + accountId);
+    const hint = document.getElementById('lightsail-acc-hint');
+    if (hint) hint.textContent = `账号: ${accName}  ·  默认区域: ${a?.default_region || '-'}`;
+
+    // 加载区域列表 (用于过滤下拉)
+    try {
+        if (!_lsRegions.length) _lsRegions = await api('/lightsail/regions');
+        const sel = document.getElementById('ls-region-filter');
+        const def = a?.default_region || '';
+        sel.innerHTML = '<option value="">全部区域 (扫描所有)</option>' +
+            _lsRegions.map(r => `<option value="${r.code}" ${r.code === def ? 'selected' : ''}>${r.display} (${r.code})</option>`).join('');
+    } catch (e) { /* ignore */ }
+
+    document.getElementById('lightsail-list').innerHTML =
+        '<div style="text-align:center;padding:30px;color:var(--text2)">正在加载实例列表...</div>';
+    document.getElementById('lightsail-modal').classList.add('show');
+    loadLightsailInstances();
+}
+
+async function loadLightsailInstances() {
+    if (!_lsAccountId) return;
+    const region = document.getElementById('ls-region-filter')?.value || '';
+    const body = document.getElementById('lightsail-list');
+    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在拉取 Lightsail 实例${region ? ' ('+region+')' : ' (扫描所有区域)'}...</div></div>`;
+    try {
+        const url = region ? `/lightsail/instances?account_id=${_lsAccountId}&region=${region}` : `/lightsail/instances?account_id=${_lsAccountId}`;
+        const res = await api(url);
+        renderLightsailInstances(res.instances || []);
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">获取失败: ${e.message}</div>`;
+    }
+}
+
+function renderLightsailInstances(list) {
+    const body = document.getElementById('lightsail-list');
+    if (!list.length) {
+        body.innerHTML = '<div style="padding:30px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">该区域暂无 Lightsail 实例。点击右上角「+ 创建 Lightsail 实例」开始创建。</div>';
+        return;
+    }
+    let html = `<table class="ai-table" style="width:100%">
+        <thead><tr>
+            <th>名称</th><th>区域</th><th>状态</th><th>蓝图</th><th>套餐</th>
+            <th>公网IP</th><th>规格</th><th>操作</th>
+        </tr></thead><tbody>`;
+    for (const i of list) {
+        const stateColor = i.state === 'running' ? 'green' : (i.state === 'stopped' ? 'red' : (i.state === 'pending' ? 'yellow' : 'gray'));
+        const specs = `${i.cpu || '?'}C / ${i.ram || '?'}GB`;
+        const safeName = i.name.replace(/'/g, "\\'");
+        const region = i.region;
+        html += `<tr>
+            <td><b>${i.name}</b><br><span style="font-size:11px;color:var(--text2)">${i.availability_zone || ''}</span></td>
+            <td>${region}</td>
+            <td><span class="badge badge-${stateColor}">${i.state}</span></td>
+            <td style="font-size:12px">${i.blueprint_name || i.blueprint_id || '-'}</td>
+            <td style="font-size:12px"><code>${i.bundle_id || '-'}</code></td>
+            <td><code>${i.public_ip || '-'}</code>${i.is_static_ip ? ' <span class="badge badge-blue" style="font-size:10px">静态</span>' : ''}</td>
+            <td style="font-size:12px">${specs}</td>
+            <td class="action-btns">
+                ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="lightsailAction('${safeName}','${region}','start')">▶ 启动</button>` : ''}
+                ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="lightsailAction('${safeName}','${region}','stop')">⏹ 停止</button>` : ''}
+                ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="lightsailAction('${safeName}','${region}','reboot')">🔄</button>` : ''}
+                <button class="btn btn-sm btn-secondary" title="开放常用端口" onclick="lightsailAction('${safeName}','${region}','open-ports')">🔓</button>
+                <button class="btn btn-sm btn-danger" onclick="lightsailDelete('${safeName}','${region}')">🗑</button>
+            </td>
+        </tr>`;
+    }
+    html += '</tbody></table>';
+    body.innerHTML = html;
+}
+
+async function lightsailAction(name, region, action) {
+    const labels = { start: '启动', stop: '停止', reboot: '重启', 'open-ports': '开放端口' };
+    showLoading(`正在${labels[action]} Lightsail 实例 ${name}...`);
+    try {
+        await api(`/lightsail/instances/${encodeURIComponent(name)}/${action}?account_id=${_lsAccountId}&region=${region}`, { method: 'POST' });
+        toast(`${labels[action]}指令已发送`);
+        setTimeout(loadLightsailInstances, 1500);
+    } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
+}
+
+async function lightsailDelete(name, region) {
+    if (!confirm(`确定删除 Lightsail 实例 "${name}" (${region}) ？此操作不可恢复！`)) return;
+    showLoading('正在删除 Lightsail 实例...');
+    try {
+        await api(`/lightsail/instances/${encodeURIComponent(name)}?account_id=${_lsAccountId}&region=${region}`, { method: 'DELETE' });
+        toast(`已删除 ${name}`);
+        setTimeout(loadLightsailInstances, 1500);
+    } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
+}
+
+async function showLightsailLaunch() {
+    if (!_lsAccountId) { toast('请先选择账号', 'error'); return; }
+    const a = accountsCache.find(x => x.id === _lsAccountId);
+
+    document.getElementById('ls-name').value = `ls-${Date.now().toString(36)}`;
+    document.getElementById('ls-count').value = '1';
+    document.getElementById('ls-userdata').value = '';
+
+    // 区域下拉
+    const regSel = document.getElementById('ls-region');
+    if (!_lsRegions.length) {
+        try { _lsRegions = await api('/lightsail/regions'); } catch (e) { _lsRegions = []; }
+    }
+    const def = a?.default_region || (_lsRegions[0]?.code || 'us-east-1');
+    regSel.innerHTML = _lsRegions.map(r =>
+        `<option value="${r.code}" ${r.code === def ? 'selected' : ''}>${r.display} (${r.code})</option>`
+    ).join('');
+
+    // 默认分类: Linux/Unix / 标准型 Linux
+    document.getElementById('ls-blueprint-category').value = 'Linux/Unix';
+    document.getElementById('ls-bundle-category').value = '标准型 Linux';
+
+    document.getElementById('lightsail-launch-modal').classList.add('show');
+
+    // 并行加载可用区/蓝图/套餐
+    onLightsailRegionChange();
+}
+
+async function onLightsailRegionChange() {
+    if (!_lsAccountId) return;
+    const region = document.getElementById('ls-region').value;
+    if (!region) return;
+
+    // 1) 可用区
+    try {
+        const azSel = document.getElementById('ls-az');
+        azSel.innerHTML = '<option value="">加载中...</option>';
+        const zones = await api(`/lightsail/availability-zones?account_id=${_lsAccountId}&region=${region}`);
+        azSel.innerHTML = '<option value="">自动 (使用第一个可用区)</option>' +
+            zones.map(z => `<option value="${z}">${z}</option>`).join('');
+    } catch (e) {
+        document.getElementById('ls-az').innerHTML = '<option value="">自动</option>';
+    }
+
+    // 2) 蓝图
+    try {
+        const bp = document.getElementById('ls-blueprint');
+        bp.innerHTML = '<option value="">加载蓝图中...</option>';
+        _lsBlueprintsAll = await api(`/lightsail/blueprints?account_id=${_lsAccountId}&region=${region}`);
+        filterLightsailBlueprints();
+    } catch (e) {
+        document.getElementById('ls-blueprint').innerHTML = `<option value="">加载失败: ${e.message}</option>`;
+    }
+
+    // 3) 套餐
+    try {
+        const bd = document.getElementById('ls-bundle');
+        bd.innerHTML = '<option value="">加载套餐中...</option>';
+        _lsBundlesAll = await api(`/lightsail/bundles?account_id=${_lsAccountId}&region=${region}`);
+        filterLightsailBundles();
+    } catch (e) {
+        document.getElementById('ls-bundle').innerHTML = `<option value="">加载失败: ${e.message}</option>`;
+    }
+}
+
+function filterLightsailBlueprints() {
+    const cat = document.getElementById('ls-blueprint-category').value;
+    const sel = document.getElementById('ls-blueprint');
+    let list = _lsBlueprintsAll;
+    if (cat) list = list.filter(b => b.category === cat);
+    if (!list.length) { sel.innerHTML = '<option value="">无可用蓝图</option>'; return; }
+    sel.innerHTML = list.map(b => {
+        const label = `${b.name}${b.platform === 'WINDOWS' ? ' 🪟' : (b.type === 'app' ? ' 📦' : ' 🐧')} - ${b.description || b.id}`;
+        return `<option value="${b.id}">${label}</option>`;
+    }).join('');
+    refreshSearchSelect('ls-blueprint');
+}
+
+function filterLightsailBundles() {
+    const cat = document.getElementById('ls-bundle-category').value;
+    const sel = document.getElementById('ls-bundle');
+    let list = _lsBundlesAll;
+    if (cat) list = list.filter(b => b.category === cat);
+    if (!list.length) { sel.innerHTML = '<option value="">无可用套餐</option>'; return; }
+    // 按价格排序
+    list = [...list].sort((a, b) => (a.price || 0) - (b.price || 0));
+    sel.innerHTML = list.map(b => {
+        const desc = b.description || `${b.ram} GB · ${b.cpu} vCPU · ${b.disk} GB`;
+        const price = b.price ? `$${b.price}/月` : '';
+        return `<option value="${b.id}">${b.name} - ${desc} ${price ? '· ' + price : ''}</option>`;
+    }).join('');
+    refreshSearchSelect('ls-bundle');
+}
+
+async function lightsailLaunch(e) {
+    e.preventDefault();
+    if (!_lsAccountId) { toast('账号丢失，请重新打开', 'error'); return; }
+
+    const data = {
+        account_id: _lsAccountId,
+        region: document.getElementById('ls-region').value,
+        availability_zone: document.getElementById('ls-az').value || null,
+        blueprint_id: document.getElementById('ls-blueprint').value,
+        bundle_id: document.getElementById('ls-bundle').value,
+        instance_name: document.getElementById('ls-name').value.trim(),
+        count: parseInt(document.getElementById('ls-count').value) || 1,
+        user_data: document.getElementById('ls-userdata').value || null,
+        open_default_ports: document.getElementById('ls-open-ports').checked,
+    };
+
+    if (!data.region || !data.blueprint_id || !data.bundle_id || !data.instance_name) {
+        toast('请填写所有必填项', 'error');
+        return;
+    }
+
+    showLoading(`正在创建 ${data.count} 个 Lightsail 实例...`);
+    try {
+        const res = await api('/lightsail/launch', { method: 'POST', body: JSON.stringify(data) });
+        hideModal('lightsail-launch-modal');
+        const names = (res.instance_names || []).join(', ');
+        toast(`✅ 已创建 ${data.count} 个实例: ${names}`);
+        setTimeout(loadLightsailInstances, 1500);
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally { hideLoading(); }
 }
 
 // ==================== Init ====================
