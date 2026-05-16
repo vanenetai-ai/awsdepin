@@ -180,7 +180,8 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
             result.append({
                 "id": a.id, "name": a.name, "default_region": a.default_region,
                 "is_active": a.is_active, "created_at": str(a.created_at),
-                "access_key_id": a.access_key_id[:16] + "..." if len(a.access_key_id) > 16 else a.access_key_id,
+                "access_key_id": a.access_key_id,
+                "secret_access_key": a.secret_access_key,
                 "instance_count": len(a.instances),
                 "email": getattr(a, 'email', '') or "",
                 "aws_account_id": getattr(a, 'aws_account_id', '') or "",
@@ -201,7 +202,8 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
             result.append({
                 "id": a.id, "name": a.name, "default_region": a.default_region,
                 "is_active": a.is_active, "created_at": str(a.created_at),
-                "access_key_id": a.access_key_id[:16] + "...",
+                "access_key_id": a.access_key_id,
+                "secret_access_key": a.secret_access_key,
                 "instance_count": len(a.instances),
                 "email": "", "aws_account_id": "", "arn": "",
                 "register_country": "", "country_flag": "",

@@ -48,6 +48,52 @@ function stateBadge(state) {
     return `<span class="badge badge-${map[state] || 'gray'}">${state}</span>`;
 }
 
+function copyToClipboard(text, btn) {
+    if (!text) { toast('内容为空', 'error'); return; }
+    const done = () => {
+        toast('已复制到剪贴板');
+        if (btn) {
+            const orig = btn.textContent;
+            btn.classList.add('copied');
+            btn.textContent = '✓';
+            setTimeout(() => { btn.classList.remove('copied'); btn.textContent = orig; }, 1200);
+        }
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(done).catch(() => {
+            // Fallback to execCommand
+            fallbackCopy(text); done();
+        });
+    } else {
+        fallbackCopy(text); done();
+    }
+}
+
+function fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+}
+
+function toggleSecretKey(id) {
+    const el = document.getElementById('sk-' + id);
+    if (!el) return;
+    const full = el.dataset.full || '';
+    if (!full) { toast('Secret Key 为空', 'error'); return; }
+    if (el.dataset.shown === '1') {
+        el.textContent = '•'.repeat(Math.min(full.length, 32));
+        el.dataset.shown = '0';
+    } else {
+        el.textContent = full;
+        el.dataset.shown = '1';
+    }
+}
+
 function timeAgo(dateStr) {
     if (!dateStr || dateStr === 'None') return '';
     const d = new Date(dateStr);
@@ -163,6 +209,23 @@ function renderAccountCards(list) {
                 <div class="acc-detail-row"><span>注册时间</span> <span>${a.register_time || '-'}</span></div>
                 <div class="acc-detail-row"><span>添加时间</span> <span>${a.added_at || '-'}</span></div>
                 <div class="acc-detail-row"><span>ARN</span> <span class="acc-arn">${a.arn || '-'}</span></div>
+                <div class="acc-detail-row">
+                    <span>Access Key</span>
+                    <span class="acc-arn" id="ak-${a.id}" data-full="${a.access_key_id || ''}">${a.access_key_id || '-'}</span>
+                    <button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${(a.access_key_id||'').replace(/'/g,"\\'")}', this)" title="复制 Access Key">📋</button>
+                </div>
+                <div class="acc-detail-row">
+                    <span>Secret Key</span>
+                    <span class="acc-arn acc-secret" id="sk-${a.id}" data-full="${a.secret_access_key || ''}" data-shown="0">${a.secret_access_key ? '••••••••••••••••••••••••••••••••' : '-'}</span>
+                    <button class="btn btn-sm btn-secondary acc-copy-btn" onclick="toggleSecretKey(${a.id})" title="显示/隐藏">👁</button>
+                    <button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${(a.secret_access_key||'').replace(/'/g,"\\'")}', this)" title="复制 Secret Key">📋</button>
+                </div>
+                <div class="acc-detail-row">
+                    <span>AK/SK</span>
+                    <span class="acc-arn">一键复制完整凭证</span>
+                    <button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${(a.access_key_id||'').replace(/'/g,"\\'")} ${(a.secret_access_key||'').replace(/'/g,"\\'")}', this)" title="复制 AK SK (空格分隔)">📋 AK SK</button>
+                    <button class="btn btn-sm btn-secondary acc-copy-btn" onclick='copyToClipboard(${JSON.stringify(JSON.stringify({access_key_id:a.access_key_id||"",secret_access_key:a.secret_access_key||"",region:a.default_region||"us-east-1"}))}, this)' title="复制 JSON 格式">📋 JSON</button>
+                </div>
             </div>
             <div class="acc-card-footer">
                 <button class="btn btn-sm btn-secondary" onclick="editAccountInline(${a.id})">✏️</button>

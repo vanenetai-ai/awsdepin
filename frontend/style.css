@@ -414,12 +414,27 @@ tbody tr:hover { background: rgba(99,102,241,0.04); }
 .acc-detail-row {
     display: flex;
     justify-content: space-between;
+    align-items: center;
+    gap: 8px;
     padding: 3px 0;
     color: var(--text2);
 }
-.acc-detail-row span:first-child { font-weight: 600; }
-.acc-detail-row span:last-child { color: var(--text); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-detail-row > span:first-child { font-weight: 600; flex-shrink: 0; min-width: 80px; }
+.acc-detail-row > span:nth-child(2) { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
 .acc-arn { font-family: monospace; font-size: 11px; }
+.acc-secret { letter-spacing: 1px; }
+.acc-copy-btn {
+    flex-shrink: 0;
+    padding: 2px 8px !important;
+    font-size: 11px !important;
+    line-height: 1.4;
+}
+.acc-copy-btn.copied {
+    background: var(--green) !important;
+    color: white !important;
+    border-color: var(--green) !important;
+}
+
 
 .acc-card-footer {
     display: flex;
