@@ -823,6 +823,97 @@ class AwsManager:
             name = ci.get("FullName", "")
             return name if name else None
 
+        def _task_alternate_contact(contact_type: str):
+            """获取备用联系人邮箱 (BILLING / OPERATIONS / SECURITY)。
+            这是命中率最高的一种方式 — AWS 强制至少配一个备用联系人,
+            很多账号买卖前会把原邮箱留在这里。"""
+            acct = self._make_detect_client("account", "us-east-1")
+            try:
+                # 当前账号查自己: 不传 AccountId
+                resp = acct.get_alternate_contact(AlternateContactType=contact_type)
+            except Exception as e:
+                # 如果是 organization 成员账号，需要传 AccountId
+                msg = str(e)
+                if "ResourceNotFoundException" in msg:
+                    return None
+                if "AccessDeniedException" in msg or "linked account" in msg.lower():
+                    try:
+                        resp = acct.get_alternate_contact(
+                            AccountId=account_id, AlternateContactType=contact_type
+                        )
+                    except Exception:
+                        return None
+                else:
+                    return None
+            ac = resp.get("AlternateContact", {}) if isinstance(resp, dict) else {}
+            email = ac.get("EmailAddress", "")
+            if email and "@" in email:
+                return email
+            name = ac.get("Name", "")
+            return name if name else None
+
+        def _task_alt_billing():    return _task_alternate_contact("BILLING")
+        def _task_alt_operations(): return _task_alternate_contact("OPERATIONS")
+        def _task_alt_security():   return _task_alternate_contact("SECURITY")
+
+        def _task_ses_email():
+            """SES 已验证邮箱 - 注册账号时常用自己的邮箱去验证 SES"""
+            for region in ("us-east-1", "us-west-2", "eu-west-1", self.account.default_region):
+                try:
+                    ses = self._make_detect_client("ses", region)
+                    paginator = None
+                    try:
+                        paginator = ses.get_paginator("list_identities")
+                    except Exception:
+                        pass
+                    candidates = []
+                    if paginator:
+                        for page in paginator.paginate(IdentityType="EmailAddress"):
+                            candidates.extend(page.get("Identities", []) or [])
+                    else:
+                        resp = ses.list_identities(IdentityType="EmailAddress")
+                        candidates = resp.get("Identities", []) or []
+                    for c in candidates:
+                        if c and "@" in c:
+                            return c
+                except Exception:
+                    continue
+            return None
+
+        def _task_sns_email():
+            """SNS Email 订阅 - 很多账号会订阅自己邮箱接收告警"""
+            best = None
+            for region in ("us-east-1", self.account.default_region):
+                try:
+                    sns = self._make_detect_client("sns", region)
+                    paginator = None
+                    try:
+                        paginator = sns.get_paginator("list_subscriptions")
+                    except Exception:
+                        pass
+                    subs = []
+                    if paginator:
+                        for page in paginator.paginate():
+                            subs.extend(page.get("Subscriptions", []) or [])
+                    else:
+                        resp = sns.list_subscriptions()
+                        subs = resp.get("Subscriptions", []) or []
+                    for s in subs:
+                        proto = (s.get("Protocol") or "").lower()
+                        if proto in ("email", "email-json"):
+                            ep = s.get("Endpoint", "")
+                            if ep and "@" in ep:
+                                # 优先非 noreply / aws / amazonaws 邮箱
+                                low = ep.lower()
+                                if "noreply" in low or "no-reply" in low or "@amazonaws" in low or "@aws.amazon" in low:
+                                    if not best:
+                                        best = ep
+                                    continue
+                                return ep
+                except Exception:
+                    continue
+            return best
+
         def _task_creation_time():
             import time as _time, csv, io
             iam = self._make_detect_client("iam")
@@ -877,11 +968,16 @@ class AwsManager:
             "email_org": _task_org_email,
             "email_budgets": _task_budgets_email,
             "email_contact": _task_contact_email,
+            "email_alt_billing": _task_alt_billing,
+            "email_alt_operations": _task_alt_operations,
+            "email_alt_security": _task_alt_security,
+            "email_ses": _task_ses_email,
+            "email_sns": _task_sns_email,
             "creation_time": _task_creation_time,
             "country": _task_country,
         }
         results = {}
-        with ThreadPoolExecutor(max_workers=7) as pool:
+        with ThreadPoolExecutor(max_workers=12) as pool:
             futures = {pool.submit(fn): key for key, fn in task_map.items()}
             for future in as_completed(futures):
                 key = futures[future]
@@ -903,16 +999,46 @@ class AwsManager:
             info["_errors"].append(f"vcpus: {str(e)[:100]}")
             results["vcpus"] = None
 
-        # 邮箱优先级: primary > org > budgets > contact(邮箱) > contact(名字)
-        email = results.get("email_primary") or results.get("email_org") or results.get("email_budgets")
-        contact_result = results.get("email_contact")
-        if not email and contact_result and "@" in contact_result:
-            email = contact_result
-        if not email and contact_result:
-            email = contact_result  # FullName 作为显示名
+        # 邮箱优先级 (从最权威到兜底):
+        # 1. account:GetPrimaryEmail - root 真实主邮箱
+        # 2. account:GetAlternateContact (BILLING/OPERATIONS/SECURITY) - 备用联系人邮箱
+        # 3. organizations:DescribeAccount - 组织内账号邮箱
+        # 4. account:GetContactInformation - 联系信息里的邮箱字段
+        # 5. budgets 订阅 / SES / SNS 等 - 间接邮箱
+        # 6. contact_information 的 FullName - 显示用名字
+        # 7. 兜底: "root (account_id)"
+        ordered_keys = [
+            "email_primary",
+            "email_alt_billing",
+            "email_alt_operations",
+            "email_alt_security",
+            "email_org",
+            "email_contact",       # 此处可能是 FullName，下面会区分
+            "email_budgets",
+            "email_ses",
+            "email_sns",
+        ]
+        # 先找一个真正包含 @ 的邮箱
+        email = None
+        all_emails = []
+        for k in ordered_keys:
+            v = results.get(k)
+            if v and isinstance(v, str) and "@" in v and "amazonaws" not in v.lower():
+                all_emails.append((k, v))
+                if not email:
+                    email = v
+        # 拿不到邮箱时，用 contact 里的 FullName 作为显示名
+        if not email:
+            contact_result = results.get("email_contact")
+            if contact_result:
+                email = contact_result
+        # 最终兜底
         if not email:
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
+        if all_emails:
+            info["email_sources"] = [k for k, _ in all_emails]
+            info["all_emails"] = list({v for _, v in all_emails})
         info["register_time"] = results.get("creation_time")
         info["country"] = results.get("country") or "US"
 
