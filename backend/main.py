@@ -355,11 +355,45 @@ async def detect_account(account_id: int, user: User = Depends(get_current_user)
     }
 
 @app.post("/api/accounts/{account_id}/detect-ai")
-async def detect_ai(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """检测账号 AI 能力: Bedrock 模型、配额、Kiro/SSO、License"""
+async def detect_ai(
+    account_id: int,
+    region: str = Query("us-east-1", description="检测的区域，默认 us-east-1"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """检测账号 AI 能力: 只查指定区域 (默认 us-east-1) 的 Bedrock Anthropic 模型 + Claude 配额"""
     account = _get_user_account(db, user, account_id)
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).detect_ai_info())
+    result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).detect_ai_info(region=region))
+    return result
+
+
+class ClaudeInvokeRequest(BaseModel):
+    prompt: str = "你好"
+    model_id: Optional[str] = None
+    region: str = "us-east-1"
+    max_tokens: int = 256
+
+
+@app.post("/api/accounts/{account_id}/bedrock/invoke")
+async def invoke_claude(
+    account_id: int,
+    data: ClaudeInvokeRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """通过 Bedrock 调用 Claude 模型 - 在面板上直接试聊"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor,
+        lambda: AwsManager(account, db).invoke_claude(
+            prompt=data.prompt,
+            model_id=data.model_id,
+            region=data.region,
+            max_tokens=data.max_tokens,
+        ),
+    )
     return result
 
 
@@ -384,17 +418,26 @@ async def get_account_billing(
     year: int = Query(..., ge=2000, le=2100, description="年份，例如 2026"),
     month: int = Query(..., ge=1, le=12, description="月份，1-12"),
     granularity: str = Query("DAILY", description="DAILY 或 MONTHLY"),
+    _ts: Optional[int] = Query(None, description="客户端时间戳，仅用于绕过缓存"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """查询指定账号某年某月的账单消费明细 (Cost Explorer)"""
+    """查询指定账号某年某月的账单消费明细 (Cost Explorer) - 不缓存，每次都重新查询"""
     account = _get_user_account(db, user, account_id)
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         executor,
         lambda: AwsManager(account, db).get_billing(year=year, month=month, granularity=granularity),
     )
-    return result
+    # 强制禁止任何中间层 (浏览器/nginx/CDN) 缓存账单结果
+    return JSONResponse(
+        content=result,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.post("/api/accounts/batch-delete")

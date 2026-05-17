@@ -43,6 +43,20 @@
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <input type="text" id="account-search" class="search-input" placeholder="🔍 搜索账号/邮箱/分组..." oninput="filterAccounts()">
                     <select id="account-group-filter" class="search-input" onchange="filterAccounts()" style="width:auto;min-width:100px"><option value="">全部分组</option></select>
+                    <select id="account-vcpu-filter" class="search-input" onchange="filterAccounts()" style="width:auto;min-width:140px" title="按 vCPU 配额范围筛选">
+                        <option value="">全部 vCPU</option>
+                        <option value="unknown">未检测</option>
+                        <option value="0">0 (已封号/限制)</option>
+                        <option value="1-5">1-5 vCPU (默认配额)</option>
+                        <option value="6-15">6-15 vCPU</option>
+                        <option value="16-31">16-31 vCPU</option>
+                        <option value="32-63">32-63 vCPU</option>
+                        <option value="64-127">64-127 vCPU</option>
+                        <option value="128-255">128-255 vCPU</option>
+                        <option value="256-511">256-511 vCPU</option>
+                        <option value="512+">512+ vCPU</option>
+                    </select>
+                    <button class="btn btn-secondary" id="vcpu-view-btn" onclick="toggleVcpuGroupView()" title="切换 vCPU 分组视图">📊 vCPU 分组</button>
                     <button class="btn btn-secondary" onclick="detectAllAccounts()">🔍 检测全部</button>
                     <button class="btn btn-secondary" onclick="toggleSelectAll()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>
@@ -586,6 +600,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260515a"></script>
+    <script src="app.js?v=20260518a"></script>
 </body>
 </html>

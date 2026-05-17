@@ -161,30 +161,98 @@ function updateGroupFilter() {
     sel.innerHTML = '<option value="">全部分组</option>' + groups.map(g => `<option value="${g}"${g === cur ? ' selected' : ''}>${g}</option>`).join('');
 }
 
+// vCPU 区间定义 (与 index.html 中下拉选项保持一致)
+const VCPU_BUCKETS = [
+    { key: 'unknown', label: '未检测', match: v => v == null },
+    { key: '0', label: '0 (已封号/限制)', match: v => v === 0 },
+    { key: '1-5', label: '1-5 vCPU (默认配额)', match: v => v >= 1 && v <= 5 },
+    { key: '6-15', label: '6-15 vCPU', match: v => v >= 6 && v <= 15 },
+    { key: '16-31', label: '16-31 vCPU', match: v => v >= 16 && v <= 31 },
+    { key: '32-63', label: '32-63 vCPU', match: v => v >= 32 && v <= 63 },
+    { key: '64-127', label: '64-127 vCPU', match: v => v >= 64 && v <= 127 },
+    { key: '128-255', label: '128-255 vCPU', match: v => v >= 128 && v <= 255 },
+    { key: '256-511', label: '256-511 vCPU', match: v => v >= 256 && v <= 511 },
+    { key: '512+', label: '512+ vCPU', match: v => v >= 512 },
+];
+
+// 获取账号 vCPU 排序值 (max_on_demand)，用于分桶/排序
+function getAccountVcpu(a) {
+    const v = a?.max_on_demand;
+    return (v == null || isNaN(v)) ? null : Number(v);
+}
+
+let _vcpuGroupView = false;
+
+function toggleVcpuGroupView() {
+    _vcpuGroupView = !_vcpuGroupView;
+    const btn = document.getElementById('vcpu-view-btn');
+    if (btn) btn.textContent = _vcpuGroupView ? '📊 vCPU 分组 (已开启)' : '📊 vCPU 分组';
+    filterAccounts();
+}
+
 function filterAccounts() {
     const q = (document.getElementById('account-search')?.value || '').toLowerCase();
     const group = document.getElementById('account-group-filter')?.value || '';
+    const vcpuKey = document.getElementById('account-vcpu-filter')?.value || '';
     const filtered = accountsCache.filter(a => {
         if (group && a.group_name !== group) return false;
+        // vCPU 筛选
+        if (vcpuKey) {
+            const bucket = VCPU_BUCKETS.find(b => b.key === vcpuKey);
+            const v = getAccountVcpu(a);
+            if (!bucket || !bucket.match(v)) return false;
+        }
         if (!q) return true;
         return (a.email || '').toLowerCase().includes(q) || (a.name || '').toLowerCase().includes(q) ||
             (a.group_name || '').toLowerCase().includes(q) || (a.note || '').toLowerCase().includes(q) ||
             (a.aws_account_id || '').includes(q) || String(a.id).includes(q);
     });
-    renderAccountCards(filtered);
+    if (_vcpuGroupView) {
+        renderAccountCardsByVcpu(filtered);
+    } else {
+        renderAccountCards(filtered);
+    }
 }
 
-function renderAccountCards(list) {
+function renderAccountCardsByVcpu(list) {
     const grid = document.getElementById('accounts-grid');
     if (!grid) return;
-    grid.innerHTML = list.map(a => {
-        const displayName = a.email || a.name || a.access_key_id;
-        const age = timeAgo(a.register_time || a.added_at);
-        const flag = a.country_flag || '';
-        const vcpuUsage = a.total_usage || 0;
-        const vcpuText = a.max_on_demand ? `${vcpuUsage}/${a.max_on_demand} vCPUs` : '';
-        const checked = selectedAccounts.has(a.id) ? 'checked' : '';
-        return `
+    // 按 vCPU 桶分组
+    const groups = VCPU_BUCKETS.map(b => ({ ...b, items: [] }));
+    for (const a of list) {
+        const v = getAccountVcpu(a);
+        const g = groups.find(b => b.match(v));
+        if (g) g.items.push(a);
+    }
+    // 大组在上 (从大到小)，未检测放最后
+    const ordered = [...groups].reverse();
+    let html = '';
+    for (const g of ordered) {
+        if (!g.items.length) continue;
+        html += `<div style="grid-column:1/-1;margin:10px 0 4px;padding:8px 12px;background:var(--bg2);border-left:3px solid var(--primary);border-radius:6px;font-size:13px;color:var(--text)">
+            <b>${g.label}</b> <span style="color:var(--text2);font-weight:normal">· ${g.items.length} 个账号</span>
+        </div>`;
+        // 渲染该组内的卡片 (复用 renderAccountCards 的 HTML)
+        const tmp = document.createElement('div');
+        renderAccountCardsInto(tmp, g.items);
+        html += tmp.innerHTML;
+    }
+    grid.innerHTML = html || '<div style="padding:30px;text-align:center;color:var(--text2)">无符合筛选的账号</div>';
+}
+
+function renderAccountCardsInto(container, list) {
+    // 与 renderAccountCards 共享渲染逻辑，仅改变写入目标
+    container.innerHTML = list.map(_renderAccountCardHtml).join('');
+}
+
+function _renderAccountCardHtml(a) {
+    const displayName = a.email || a.name || a.access_key_id;
+    const age = timeAgo(a.register_time || a.added_at);
+    const flag = a.country_flag || '';
+    const vcpuUsage = a.total_usage || 0;
+    const vcpuText = a.max_on_demand ? `${vcpuUsage}/${a.max_on_demand} vCPUs` : '';
+    const checked = selectedAccounts.has(a.id) ? 'checked' : '';
+    return `
         <div class="acc-card" data-id="${a.id}">
             <div class="acc-card-header">
                 <div class="acc-card-left">
@@ -239,7 +307,12 @@ function renderAccountCards(list) {
                 <button class="btn btn-sm btn-secondary" onclick="showLightsail(${a.id})">⛵ Lightsail 实例</button>
             </div>
         </div>`;
-    }).join('');
+}
+
+function renderAccountCards(list) {
+    const grid = document.getElementById('accounts-grid');
+    if (!grid) return;
+    grid.innerHTML = list.map(_renderAccountCardHtml).join('');
 }
 
 function toggleCardExpand(id) {
@@ -329,99 +402,178 @@ async function detectAllAccounts() {
     finally { hideLoading(); if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
 }
 
-// ==================== AI Detection ====================
+// ==================== AI Detection (简化: 只查 us-east-1 Bedrock) ====================
+let _aiAccountId = null;
+let _aiRegion = 'us-east-1';
+let _aiModels = [];
+
+const AI_REGIONS = [
+    { code: 'us-east-1', name: '🇺🇸 美国 弗吉尼亚 (推荐)' },
+    { code: 'us-west-2', name: '🇺🇸 美国 俄勒冈' },
+    { code: 'ap-northeast-1', name: '🇯🇵 日本 东京' },
+    { code: 'ap-southeast-1', name: '🇸🇬 新加坡' },
+    { code: 'eu-west-1', name: '🇮🇪 爱尔兰' },
+    { code: 'eu-central-1', name: '🇩🇪 法兰克福' },
+];
+
 async function detectAI(id) {
+    _aiAccountId = id;
     const a = accountsCache.find(x => x.id === id);
     const body = document.getElementById('ai-body');
     const modal = document.getElementById('ai-modal');
     modal.classList.add('show');
-    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在检测 AI 能力，可能需要 30-60 秒...</div></div>`;
+    renderAiShell(a);
+    await runAiDetect();
+}
 
+function renderAiShell(account) {
+    const body = document.getElementById('ai-body');
+    const accName = account ? (account.email || account.name || ('#' + _aiAccountId)) : ('#' + _aiAccountId);
+    body.innerHTML = `
+        <div style="padding:8px 0;margin-bottom:10px;border-bottom:1px solid var(--border);color:var(--text2);font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <span>账号: <b style="color:var(--text)">${accName}</b></span>
+            <span style="display:flex;align-items:center;gap:6px">
+                <label style="font-size:12px">区域</label>
+                <select id="ai-region" onchange="onAiRegionChange()" style="padding:5px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px">
+                    ${AI_REGIONS.map(r => `<option value="${r.code}" ${r.code === _aiRegion ? 'selected' : ''}>${r.name} (${r.code})</option>`).join('')}
+                </select>
+                <button class="btn btn-sm btn-secondary" onclick="runAiDetect()">🔄 重检</button>
+            </span>
+        </div>
+        <div id="ai-detect-area">
+            <div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在检测 ${_aiRegion} 的 Bedrock Claude 配额...</div></div>
+        </div>
+        <div id="ai-chat-area" style="margin-top:12px"></div>
+    `;
+}
+
+function onAiRegionChange() {
+    _aiRegion = document.getElementById('ai-region').value;
+    runAiDetect();
+}
+
+async function runAiDetect() {
+    if (!_aiAccountId) return;
+    const area = document.getElementById('ai-detect-area');
+    if (area) area.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在检测 ${_aiRegion} 的 Bedrock Claude 配额...</div></div>`;
     try {
-        const res = await api(`/accounts/${id}/detect-ai`, { method: 'POST' });
-        renderAiResults(res, a);
-        toast('AI 检测完成');
+        const res = await api(`/accounts/${_aiAccountId}/detect-ai?region=${_aiRegion}&_ts=${Date.now()}`, { method: 'POST' });
+        renderAiResults(res);
+        renderAiChat(res);
     } catch (e) {
-        body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">检测失败: ${e.message}</div>`;
+        if (area) area.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">检测失败: ${e.message}</div>`;
         toast(e.message, 'error');
     }
 }
 
-function renderAiResults(data, account) {
-    const body = document.getElementById('ai-body');
-    const accName = account ? (account.email || account.name) : '';
+function renderAiResults(data) {
+    const area = document.getElementById('ai-detect-area');
+    if (!area) return;
+    const models = data.bedrock_models || [];
+    const quotas = data.bedrock_quotas || [];
+    _aiModels = models;
+
     let html = '';
 
-    // Header
-    if (accName) html += `<div style="padding:8px 0;margin-bottom:8px;border-bottom:1px solid var(--border);color:var(--text2);font-size:13px">账号: ${accName}</div>`;
-
-    // SSO / Kiro
-    const ssoCount = data.sso_instances || 0;
-    html += `<div class="ai-section">
-        <div class="ai-section-title">🔐 Kiro / IAM Identity Center (SSO)</div>
-        <div class="ai-section-body">
-            ${ssoCount > 0
-                ? `<span class="badge badge-green">已启用</span> ${ssoCount} 个 SSO 实例 (可能有 Kiro 订阅)`
-                : `<span class="badge badge-gray">未检测到</span> 无 SSO 实例`}
-        </div>
-    </div>`;
-
-    // Licenses
-    const licenses = data.licenses || [];
-    html += `<div class="ai-section">
-        <div class="ai-section-title">📜 License Manager 许可证</div>
-        <div class="ai-section-body">`;
-    if (licenses.length) {
-        html += `<table class="ai-table"><thead><tr><th>名称</th><th>产品</th><th>状态</th></tr></thead><tbody>`;
-        for (const l of licenses) {
-            html += `<tr><td>${l.name}</td><td>${l.product}</td><td>${l.status}</td></tr>`;
-        }
-        html += '</tbody></table>';
-    } else {
-        html += '<span style="color:var(--text2)">无许可证</span>';
+    // 错误提示
+    if (data.error) {
+        html += `<div style="padding:10px 12px;background:rgba(239,68,68,0.12);border:1px solid var(--red);border-radius:8px;color:var(--red);font-size:13px;margin-bottom:10px">⚠️ ${data.error}</div>`;
     }
-    html += '</div></div>';
 
-    // Bedrock Models
-    const models = data.bedrock_models || [];
+    // 模型
     html += `<div class="ai-section">
-        <div class="ai-section-title">🧠 Bedrock Anthropic 模型 (us-east-1)</div>
+        <div class="ai-section-title">🧠 Bedrock Anthropic / Claude 模型 (${data.region || _aiRegion})</div>
         <div class="ai-section-body">`;
     if (models.length) {
-        html += `<div style="margin-bottom:6px;color:var(--text2);font-size:12px">共 ${models.length} 个模型</div>`;
-        html += `<table class="ai-table"><thead><tr><th>模型 ID</th><th>名称</th><th>输入</th><th>输出</th></tr></thead><tbody>`;
+        html += `<div style="margin-bottom:6px;color:var(--text2);font-size:12px">共 <b style="color:var(--green)">${models.length}</b> 个 Claude 模型可用</div>`;
+        html += `<table class="ai-table"><thead><tr><th>模型 ID</th><th>名称</th></tr></thead><tbody>`;
         for (const m of models) {
-            html += `<tr>
-                <td><code style="font-size:11px">${m.id}</code></td>
-                <td>${m.name}</td>
-                <td>${(m.input || []).join(', ')}</td>
-                <td>${(m.output || []).join(', ')}</td>
-            </tr>`;
+            html += `<tr><td><code style="font-size:11px">${m.id}</code></td><td>${m.name}</td></tr>`;
         }
         html += '</tbody></table>';
     } else {
-        html += '<span style="color:var(--text2)">未检测到 Anthropic 模型</span>';
+        html += `<span style="color:var(--text2)">该区域未检测到 Claude 模型 ${data.bedrock_enabled ? '（账号未申请模型访问）' : '（Bedrock 未开通或无权限）'}</span>`;
     }
     html += '</div></div>';
 
-    // Bedrock Quotas
-    const quotas = data.bedrock_quotas || [];
+    // 配额
     html += `<div class="ai-section">
-        <div class="ai-section-title">📊 Bedrock 关键配额 (Anthropic/Claude)</div>
+        <div class="ai-section-title">📊 Claude 关键配额 (Tokens / Requests)</div>
         <div class="ai-section-body">`;
     if (quotas.length) {
-        html += `<table class="ai-table"><thead><tr><th>配额名称</th><th>值</th></tr></thead><tbody>`;
+        html += `<table class="ai-table"><thead><tr><th>配额名称</th><th style="text-align:right">值</th></tr></thead><tbody>`;
         for (const q of quotas) {
             const val = q.value >= 1000000 ? (q.value / 1000000).toFixed(1) + 'M' : q.value >= 1000 ? (q.value / 1000).toFixed(1) + 'K' : q.value;
-            html += `<tr><td style="font-size:12px">${q.name}</td><td style="font-weight:bold;color:var(--blue)">${val}</td></tr>`;
+            html += `<tr><td style="font-size:12px">${q.name}</td><td style="text-align:right;font-weight:bold;color:var(--blue)">${val}</td></tr>`;
         }
         html += '</tbody></table>';
     } else {
-        html += '<span style="color:var(--text2)">未检测到 Bedrock 配额 (可能未开通)</span>';
+        html += '<span style="color:var(--text2)">未检测到 Bedrock 配额（可能未开通）</span>';
     }
     html += '</div></div>';
 
-    body.innerHTML = html;
+    area.innerHTML = html;
+}
+
+function renderAiChat(data) {
+    const area = document.getElementById('ai-chat-area');
+    if (!area) return;
+    const models = (data.bedrock_models || []);
+    const enabled = models.length > 0;
+
+    area.innerHTML = `
+        <div class="ai-section">
+            <div class="ai-section-title">💬 Claude 对话测试 (默认发送 "你好")</div>
+            <div class="ai-section-body">
+                <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
+                    <select id="ai-chat-model" style="flex:1;min-width:220px;padding:7px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px" ${enabled ? '' : 'disabled'}>
+                        ${enabled
+                            ? models.map((m, i) => `<option value="${m.id}" ${i === 0 ? 'selected' : ''}>${m.name}</option>`).join('')
+                            : '<option value="">无可用模型</option>'}
+                    </select>
+                    <input type="text" id="ai-chat-prompt" value="你好" placeholder="输入要发送给 Claude 的内容" style="flex:2;min-width:200px;padding:7px 10px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px">
+                    <button class="btn btn-primary btn-sm" onclick="sendAiChat()" ${enabled ? '' : 'disabled'} style="padding:7px 14px">▶ 发送</button>
+                </div>
+                <div id="ai-chat-result" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:13px;line-height:1.6;color:var(--text2);min-height:60px;white-space:pre-wrap;word-break:break-word">
+                    ${enabled ? '点击「发送」开始对话测试' : '该账号在此区域无可用 Claude 模型，无法测试对话'}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+async function sendAiChat() {
+    if (!_aiAccountId) return;
+    const modelSel = document.getElementById('ai-chat-model');
+    const promptEl = document.getElementById('ai-chat-prompt');
+    const resultEl = document.getElementById('ai-chat-result');
+    if (!modelSel || !promptEl || !resultEl) return;
+    const model_id = modelSel.value;
+    const prompt = (promptEl.value || '你好').trim();
+    if (!model_id) { toast('请选择模型', 'error'); return; }
+
+    resultEl.innerHTML = '<div style="display:flex;align-items:center;gap:10px;color:var(--text2)"><div class="spinner" style="width:16px;height:16px;border-width:2px"></div>正在调用 Claude...</div>';
+    try {
+        const res = await api(`/accounts/${_aiAccountId}/bedrock/invoke`, {
+            method: 'POST',
+            body: JSON.stringify({ prompt, model_id, region: _aiRegion, max_tokens: 256 }),
+        });
+        if (res.ok) {
+            const meta = `<div style="color:var(--text2);font-size:11px;margin-bottom:6px;border-bottom:1px solid var(--border);padding-bottom:6px">🤖 ${res.model_id} · 输入 ${res.input_tokens} tokens · 输出 ${res.output_tokens} tokens</div>`;
+            resultEl.innerHTML = meta + `<div style="color:var(--text)">${escapeHtml(res.reply || '(空响应)')}</div>`;
+            toast('Claude 响应成功');
+        } else {
+            resultEl.innerHTML = `<div style="color:var(--red)">❌ ${res.error || '调用失败'}</div>`;
+            toast(res.error || '调用失败', 'error');
+        }
+    } catch (e) {
+        resultEl.innerHTML = `<div style="color:var(--red)">❌ ${e.message}</div>`;
+        toast(e.message, 'error');
+    }
+}
+
+function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 async function showVcpuDetail(id) {
@@ -507,7 +659,9 @@ async function loadBilling() {
     const body = document.getElementById('billing-body');
     body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在查询 Cost Explorer，可能需要 10-30 秒...</div></div>`;
     try {
-        const res = await api(`/accounts/${_billingAccountId}/billing?year=${year}&month=${month}&granularity=DAILY`);
+        // 加时间戳参数 + no-cache 头，确保每次都重新查询，绕过浏览器/nginx 缓存
+        const url = `/accounts/${_billingAccountId}/billing?year=${year}&month=${month}&granularity=DAILY&_ts=${Date.now()}`;
+        const res = await api(url, { headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } });
         renderBilling(res, year, month);
     } catch (e) {
         body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">查询失败: ${e.message}</div>`;

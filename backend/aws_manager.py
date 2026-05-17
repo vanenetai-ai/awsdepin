@@ -815,21 +815,35 @@ class AwsManager:
 
     # ==================== AI 配额检测 ====================
 
-    def detect_ai_info(self) -> dict:
-        """检测 Bedrock AI 配额、Anthropic 模型、Kiro/SSO 订阅 - 无超时，等真实数据"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        result = {"bedrock_models": [], "bedrock_quotas": [], "sso_instances": 0, "licenses": []}
+    def detect_ai_info(self, region: str = "us-east-1") -> dict:
+        """简化版 AI 检测: 只查指定区域 (默认 us-east-1) 的 Bedrock Anthropic 模型 + Claude 配额。
 
-        def _detect_bedrock_models():
-            """只获取 global Claude 模型 (us-east-1)"""
+        返回:
+        {
+            "region": "us-east-1",
+            "bedrock_models": [...],
+            "bedrock_quotas": [...],
+            "bedrock_enabled": bool,    # Bedrock 是否可访问
+            "error": Optional[str],
+        }
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        result = {
+            "region": region,
+            "bedrock_models": [],
+            "bedrock_quotas": [],
+            "bedrock_enabled": False,
+            "error": None,
+        }
+
+        def _detect_models():
             models = []
             try:
-                bedrock = self._get_client("bedrock", "us-east-1")
+                bedrock = self._get_client("bedrock", region)
                 resp = bedrock.list_foundation_models()
                 for m in resp.get("modelSummaries", []):
                     mid = m.get("modelId", "").lower()
                     provider = m.get("providerName", "").lower()
-                    # 只取 anthropic claude 模型
                     if "anthropic" in provider and "claude" in mid:
                         models.append({
                             "id": m.get("modelId", ""),
@@ -838,15 +852,20 @@ class AwsManager:
                             "input": m.get("inputModalities", []),
                             "output": m.get("outputModalities", []),
                         })
+                result["bedrock_enabled"] = True
             except Exception as e:
+                msg = str(e)
+                if "AccessDenied" in msg or "not authorized" in msg or "UnrecognizedClient" in msg:
+                    result["error"] = f"无 Bedrock 访问权限或区域 {region} 未开通"
+                else:
+                    result["error"] = f"Bedrock 查询失败: {msg[:120]}"
                 logger.warning(f"Bedrock models error: {e}")
             return models
 
-        def _detect_bedrock_quotas():
-            """获取 Bedrock 配额 - 只取 Anthropic/Claude 相关"""
+        def _detect_quotas():
             quotas = []
             try:
-                sq = self._get_client("service-quotas", "us-east-1")
+                sq = self._get_client("service-quotas", region)
                 paginator = sq.get_paginator("list_service_quotas")
                 for page in paginator.paginate(ServiceCode="bedrock"):
                     for q in page.get("Quotas", []):
@@ -859,9 +878,9 @@ class AwsManager:
                             })
             except Exception as e:
                 logger.warning(f"Bedrock quotas error: {e}")
-                # fallback: 尝试默认配额
+                # fallback: 默认配额
                 try:
-                    sq = self._get_client("service-quotas", "us-east-1")
+                    sq = self._get_client("service-quotas", region)
                     paginator = sq.get_paginator("list_aws_default_service_quotas")
                     for page in paginator.paginate(ServiceCode="bedrock"):
                         for q in page.get("Quotas", []):
@@ -876,38 +895,11 @@ class AwsManager:
                     pass
             return quotas
 
-        def _detect_sso():
-            """检测 IAM Identity Center (Kiro 订阅)"""
-            try:
-                sso = self._get_client("sso-admin", "us-east-1")
-                resp = sso.list_instances()
-                return len(resp.get("Instances", []))
-            except Exception:
-                return 0
-
-        def _detect_licenses():
-            """检测 License Manager 许可证"""
-            licenses = []
-            try:
-                lm = self._get_client("license-manager", "us-east-1")
-                resp = lm.list_received_licenses(MaxResults=10)
-                for lic in resp.get("Licenses", []):
-                    licenses.append({
-                        "name": lic.get("LicenseName", ""),
-                        "product": lic.get("ProductName", ""),
-                        "status": lic.get("Status", ""),
-                    })
-            except Exception:
-                pass
-            return licenses
-
-        # 并行执行 - 无超时，等每个任务完成
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # 并行执行模型 + 配额查询
+        with ThreadPoolExecutor(max_workers=2) as pool:
             tasks = {
-                pool.submit(_detect_bedrock_models): "models",
-                pool.submit(_detect_bedrock_quotas): "quotas",
-                pool.submit(_detect_sso): "sso",
-                pool.submit(_detect_licenses): "licenses",
+                pool.submit(_detect_models): "models",
+                pool.submit(_detect_quotas): "quotas",
             }
             for future in as_completed(tasks):
                 key = tasks[future]
@@ -917,13 +909,112 @@ class AwsManager:
                         result["bedrock_models"] = val
                     elif key == "quotas":
                         result["bedrock_quotas"] = val
-                    elif key == "sso":
-                        result["sso_instances"] = val
-                    elif key == "licenses":
-                        result["licenses"] = val
                 except Exception as e:
                     logger.warning(f"AI detection {key} failed: {e}")
 
+        return result
+
+    # ==================== Claude 对话 ====================
+
+    def invoke_claude(self, prompt: str = "你好", model_id: str = None, region: str = "us-east-1", max_tokens: int = 256) -> dict:
+        """通过 Bedrock 调用 Claude 模型进行对话测试。
+
+        返回:
+        {
+            "ok": bool,
+            "model_id": str,
+            "region": str,
+            "prompt": str,
+            "reply": str,
+            "input_tokens": int,
+            "output_tokens": int,
+            "error": Optional[str],
+        }
+        """
+        import json as _json
+        result = {
+            "ok": False,
+            "model_id": model_id or "",
+            "region": region,
+            "prompt": prompt,
+            "reply": "",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "error": None,
+        }
+
+        # 自动挑选可用 Claude 模型
+        if not model_id:
+            try:
+                bedrock = self._get_client("bedrock", region)
+                resp = bedrock.list_foundation_models()
+                # 优先用 inference profile 兼容的较新版本
+                preferred_keywords = [
+                    "claude-3-5-sonnet", "claude-3-5-haiku",
+                    "claude-3-haiku", "claude-3-sonnet",
+                    "claude-instant",
+                ]
+                ids = []
+                for m in resp.get("modelSummaries", []):
+                    mid = m.get("modelId", "")
+                    provider = m.get("providerName", "").lower()
+                    if "anthropic" in provider and "claude" in mid.lower():
+                        # 仅保留支持 ON_DEMAND 的模型
+                        inference = m.get("inferenceTypesSupported", []) or []
+                        if not inference or "ON_DEMAND" in inference:
+                            ids.append(mid)
+                # 按偏好排序
+                def _rank(mid):
+                    low = mid.lower()
+                    for i, kw in enumerate(preferred_keywords):
+                        if kw in low:
+                            return i
+                    return 99
+                ids.sort(key=_rank)
+                if not ids:
+                    result["error"] = f"区域 {region} 没有可用的 Claude 模型 (Anthropic provider)"
+                    return result
+                model_id = ids[0]
+                result["model_id"] = model_id
+            except Exception as e:
+                result["error"] = f"列出模型失败: {str(e)[:200]}"
+                return result
+
+        try:
+            runtime = self._get_client("bedrock-runtime", region)
+            body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            resp = runtime.invoke_model(
+                modelId=model_id,
+                body=_json.dumps(body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            payload = _json.loads(resp["body"].read())
+            # Claude 3 messages API 返回结构
+            content_parts = payload.get("content", []) or []
+            text_parts = [c.get("text", "") for c in content_parts if c.get("type") == "text"]
+            reply = "".join(text_parts).strip() or _json.dumps(payload)[:500]
+            usage = payload.get("usage", {}) or {}
+            result.update({
+                "ok": True,
+                "reply": reply,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+            })
+        except Exception as e:
+            msg = str(e)
+            if "AccessDenied" in msg or "not authorized" in msg:
+                result["error"] = f"无权限调用模型 {model_id}: 请在 AWS 控制台 Bedrock → Model access 申请开启该模型"
+            elif "ValidationException" in msg and "on-demand throughput" in msg.lower():
+                result["error"] = f"模型 {model_id} 不支持按需调用，请改用 inference profile 或其它模型"
+            elif "AccessDeniedException" in msg:
+                result["error"] = f"调用被拒绝: {msg[:200]}"
+            else:
+                result["error"] = f"调用失败: {msg[:300]}"
         return result
 
     # ==================== 账单查询 ====================
