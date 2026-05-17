@@ -686,6 +686,77 @@ def batch_delete_instances(data: BatchDeleteRequest, user: User = Depends(get_cu
     db.commit()
     return {"deleted": deleted}
 
+class Ec2DirectAction(BaseModel):
+    account_id: int
+    instance_id: str
+    region: str
+
+
+@app.post("/api/instances/direct/start")
+async def ec2_direct_start(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """通过 instance_id + region 直接启动一个 EC2 实例 (不需要本地 Instance 记录)"""
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: AwsManager(account, db).start_instance(data.instance_id, data.region))
+    return {"ok": True}
+
+
+@app.post("/api/instances/direct/stop")
+async def ec2_direct_stop(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: AwsManager(account, db).stop_instance(data.instance_id, data.region))
+    return {"ok": True}
+
+
+@app.post("/api/instances/direct/reboot")
+async def ec2_direct_reboot(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: AwsManager(account, db).reboot_instance(data.instance_id, data.region))
+    return {"ok": True}
+
+
+@app.post("/api/instances/direct/terminate")
+async def ec2_direct_terminate(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: AwsManager(account, db).terminate_instance(data.instance_id, data.region))
+    return {"ok": True}
+
+
+@app.get("/api/accounts/{account_id}/ec2-detail")
+async def get_account_ec2_detail(
+    account_id: int,
+    region: Optional[str] = Query(None, description="留空扫描所有区域；指定则只查该区域"),
+    all_managed: bool = Query(True, description="True=列出账号所有 EC2 实例（含手动创建的）；False=仅本平台创建的"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """详细列出指定账号下 EC2 实例（含 DNS / AZ / 架构 / launch_time），用于账号-实例面板"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+
+    def _do():
+        mgr = AwsManager(account, db)
+        if region:
+            return {"region": region, "instances": mgr.list_instances_detailed(region, all_managed=all_managed)}
+        all_data = mgr.list_instances_detailed_all_regions(all_managed=all_managed)
+        flat = []
+        for r, items in all_data.items():
+            flat.extend(items)
+        return {"region": "all", "instances": flat, "by_region": all_data}
+
+    try:
+        result = await loop.run_in_executor(executor, _do)
+    except Exception as e:
+        raise HTTPException(400, f"加载实例详情失败: {str(e)[:300]}")
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
 @app.get("/api/instances/types")
 def list_instance_types(user: User = Depends(get_current_user)):
     """返回完整 EC2 实例类型列表"""

@@ -303,7 +303,7 @@ function _renderAccountCardHtml(a) {
                 <button class="btn btn-sm btn-secondary" onclick="showVcpuDetail(${a.id})">⚡ vCPU</button>
                 <button class="btn btn-sm btn-secondary" onclick="showBilling(${a.id})">💰 账单</button>
                 <span class="acc-footer-spacer"></span>
-                <button class="btn btn-sm btn-secondary" onclick="window.location.hash='instances';loadInstances()">EC2 实例</button>
+                <button class="btn btn-sm btn-secondary" onclick="viewAccountInstances(${a.id})">EC2 实例</button>
                 <button class="btn btn-sm btn-secondary" onclick="showLightsail(${a.id})">⛵ Lightsail 实例</button>
             </div>
         </div>`;
@@ -320,20 +320,196 @@ function toggleCardExpand(id) {
     if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
 
+// ==================== 账号 EC2 实例详情面板 ====================
+let _acctInstAccountId = null;
+let _acctInstData = [];
+
 function viewAccountInstances(accountId) {
+    _acctInstAccountId = accountId;
     const a = accountsCache.find(x => x.id === accountId);
-    const name = a ? (a.email || a.name || String(accountId)) : String(accountId);
-    // 切换到实例 Tab
-    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-    const navInst = document.querySelector('.nav-item[data-tab="instances"]');
-    const tabInst = document.getElementById('tab-instances');
-    if (navInst) navInst.classList.add('active');
-    if (tabInst) tabInst.classList.add('active');
-    // 设置搜索框并触发过滤
-    const search = document.getElementById('instance-search');
-    if (search) search.value = name.split('@')[0] || name;
-    loadInstances().then(() => filterInstances());
+    const name = a ? (a.email || a.name || ('#' + accountId)) : ('#' + accountId);
+    const hint = document.getElementById('acct-instances-hint');
+    if (hint) hint.textContent = `账号: ${name}  ·  默认区域: ${a?.default_region || '-'}  ·  仅展示该 AWS 账号下的 EC2 实例`;
+
+    // 重置 UI
+    document.getElementById('acct-inst-search').value = '';
+    document.getElementById('acct-inst-state-filter').value = '';
+    document.getElementById('acct-inst-region-filter').innerHTML = '<option value="">全部区域</option>';
+    document.getElementById('acct-instances-summary').innerHTML = '';
+    document.getElementById('acct-instances-list').innerHTML =
+        '<div style="text-align:center;padding:30px;color:var(--text2)">正在加载实例...</div>';
+
+    document.getElementById('acct-instances-modal').classList.add('show');
+    loadAccountInstancesDetail();
+}
+
+async function loadAccountInstancesDetail() {
+    if (!_acctInstAccountId) return;
+    const body = document.getElementById('acct-instances-list');
+    const summary = document.getElementById('acct-instances-summary');
+    const managedOnly = document.getElementById('acct-inst-managed-only')?.checked ? '0' : '1';
+    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在并发扫描所有区域 EC2 实例（约 10-30 秒）...</div></div>`;
+    summary.innerHTML = '';
+    try {
+        const url = `/accounts/${_acctInstAccountId}/ec2-detail?all_managed=${managedOnly === '1' ? 'false' : 'true'}&_ts=${Date.now()}`;
+        const res = await api(url);
+        _acctInstData = res.instances || [];
+
+        // 填充区域下拉
+        const regions = [...new Set(_acctInstData.map(i => i.region))].sort();
+        const regSel = document.getElementById('acct-inst-region-filter');
+        const cur = regSel.value;
+        regSel.innerHTML = '<option value="">全部区域 (' + _acctInstData.length + ')</option>' +
+            regions.map(r => {
+                const cnt = _acctInstData.filter(i => i.region === r).length;
+                return `<option value="${r}" ${r === cur ? 'selected' : ''}>${r} (${cnt})</option>`;
+            }).join('');
+
+        renderAcctInstances();
+    } catch (e) {
+        body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">加载失败: ${e.message}</div>`;
+        toast(e.message, 'error');
+    }
+}
+
+function renderAcctInstances() {
+    const body = document.getElementById('acct-instances-list');
+    const summary = document.getElementById('acct-instances-summary');
+    if (!_acctInstData) return;
+
+    const region = document.getElementById('acct-inst-region-filter').value;
+    const state = document.getElementById('acct-inst-state-filter').value;
+    const q = (document.getElementById('acct-inst-search').value || '').toLowerCase();
+
+    let list = _acctInstData;
+    if (region) list = list.filter(i => i.region === region);
+    if (state) list = list.filter(i => i.state === state);
+    if (q) list = list.filter(i =>
+        (i.instance_id || '').toLowerCase().includes(q) ||
+        (i.name || '').toLowerCase().includes(q) ||
+        (i.public_ip || '').includes(q) ||
+        (i.private_ip || '').includes(q) ||
+        (i.public_dns || '').toLowerCase().includes(q)
+    );
+
+    // 摘要
+    const states = {};
+    for (const i of list) states[i.state] = (states[i.state] || 0) + 1;
+    const stateBadges = Object.entries(states).map(([s, c]) => {
+        const color = s === 'running' ? 'green' : (s === 'stopped' ? 'red' : (s === 'pending' ? 'yellow' : 'gray'));
+        return `<span class="badge badge-${color}">${s} ${c}</span>`;
+    }).join('');
+    summary.innerHTML = `
+        <div class="stat-card" style="padding:10px 14px;flex:0 0 auto"><div class="label">实例总数</div><div class="value blue" style="font-size:20px">${list.length}</div></div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${stateBadges}</div>
+    `;
+
+    if (!list.length) {
+        body.innerHTML = '<div style="padding:30px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">无符合条件的实例</div>';
+        return;
+    }
+
+    body.innerHTML = list.map(_renderAcctInstanceCard).join('');
+}
+
+function _humanDuration(launchTimeIso) {
+    if (!launchTimeIso) return '-';
+    const t = new Date(launchTimeIso);
+    if (isNaN(t)) return '-';
+    let diff = (Date.now() - t.getTime()) / 1000;
+    if (diff < 0) diff = 0;
+    const d = Math.floor(diff / 86400);
+    const h = Math.floor((diff % 86400) / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    if (d > 0) return `${d} 天 ${h} 小时`;
+    if (h > 0) return `${h} 小时 ${m} 分钟`;
+    return `${m} 分钟`;
+}
+
+function _fmtTime(iso) {
+    if (!iso) return '-';
+    const t = new Date(iso);
+    if (isNaN(t)) return iso;
+    const pad = n => String(n).padStart(2, '0');
+    return `${t.getFullYear()}-${pad(t.getMonth()+1)}-${pad(t.getDate())} ${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`;
+}
+
+function _renderAcctInstanceCard(i) {
+    const stateColor = i.state === 'running' ? 'green' : (i.state === 'stopped' ? 'red' : (i.state === 'pending' ? 'yellow' : 'gray'));
+    const uptime = _humanDuration(i.launch_time);
+    const launchStr = _fmtTime(i.launch_time);
+    const ipBadge = i.is_static_ip ? '<span class="badge badge-blue" style="font-size:10px;margin-left:6px">EIP 静态</span>' : '<span class="badge badge-gray" style="font-size:10px;margin-left:6px">动态</span>';
+    const platform = (i.platform || 'Linux/UNIX').replace(/^Linux\/UNIX$/, 'Linux/UNIX');
+    const arch = i.architecture || '';
+    const az = i.availability_zone || '';
+    const name = i.name || i.instance_id;
+    const publicIp = i.public_ip || '-';
+    const privateIp = i.private_ip || '-';
+    const publicDns = i.public_dns || '-';
+    const privateDns = i.private_dns || '-';
+    const escIid = (i.instance_id || '').replace(/'/g, "\\'");
+    const escRegion = (i.region || '').replace(/'/g, "\\'");
+
+    return `
+    <div class="acc-card" style="margin-bottom:12px">
+        <div class="acc-card-header">
+            <div class="acc-card-left" style="flex-wrap:wrap">
+                <span class="acc-num">🖥</span>
+                <span class="acc-name" title="${name}"><b>${name.length > 32 ? name.substring(0,32)+'...' : name}</b></span>
+                <span class="badge badge-${stateColor}">${i.state}</span>
+                <span class="acc-flag">${i.region}</span>
+                ${i.managed ? '<span class="badge badge-blue" style="font-size:10px">本平台</span>' : ''}
+                <span class="acc-age" title="${launchStr}">⏱ ${uptime}</span>
+            </div>
+        </div>
+        <div style="padding:8px 12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:6px 14px;font-size:12px">
+            <div><span style="color:var(--text2)">实例 ID</span> <code style="font-size:11px">${i.instance_id}</code>
+                <button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${escIid}', this)" title="复制">📋</button>
+            </div>
+            <div><span style="color:var(--text2)">类型</span> <b>${i.instance_type || '-'}</b></div>
+            <div><span style="color:var(--text2)">公网 IP</span> <code>${publicIp}</code>${publicIp !== '-' ? ipBadge : ''}
+                ${publicIp !== '-' ? `<button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${publicIp}', this)">📋</button>` : ''}
+            </div>
+            <div><span style="color:var(--text2)">内网 IP</span> <code>${privateIp}</code></div>
+            <div style="grid-column:span 2"><span style="color:var(--text2)">公网 DNS</span> <code style="font-size:11px;word-break:break-all">${publicDns}</code></div>
+            <div style="grid-column:span 2"><span style="color:var(--text2)">内网 DNS</span> <code style="font-size:11px;word-break:break-all">${privateDns}</code></div>
+            <div><span style="color:var(--text2)">可用区</span> ${az}</div>
+            <div><span style="color:var(--text2)">架构</span> ${platform} ${arch}</div>
+            <div><span style="color:var(--text2)">启动时间</span> ${launchStr}</div>
+            <div><span style="color:var(--text2)">已运行</span> <b style="color:var(--green)">${uptime}</b></div>
+            <div><span style="color:var(--text2)">VPC</span> <code style="font-size:11px">${i.vpc_id || '-'}</code></div>
+            <div><span style="color:var(--text2)">子网</span> <code style="font-size:11px">${i.subnet_id || '-'}</code></div>
+            <div><span style="color:var(--text2)">密钥对</span> ${i.key_name || '-'}</div>
+            <div><span style="color:var(--text2)">监控</span> ${i.monitoring || '-'}</div>
+            <div><span style="color:var(--text2)">AMI</span> <code style="font-size:11px">${i.image_id || '-'}</code></div>
+        </div>
+        <div class="acc-card-footer" style="flex-wrap:wrap">
+            ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="acctInstAction('${escIid}','${escRegion}','start')">▶ 启动</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','stop')">⏹ 停止</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','reboot')">🔄 重启</button>` : ''}
+            ${i.state !== 'terminated' ? `<button class="btn btn-sm btn-danger" onclick="acctInstAction('${escIid}','${escRegion}','terminate')">🗑 终止</button>` : ''}
+            <button class="btn btn-sm btn-secondary" onclick="copyToClipboard('${escIid}', this)" title="复制实例 ID">📋 ID</button>
+            ${publicIp !== '-' ? `<button class="btn btn-sm btn-secondary" onclick="copyToClipboard('ssh -i depin-key-${escRegion}.pem ubuntu@${publicIp}', this)" title="复制 SSH 命令">SSH</button>` : ''}
+        </div>
+    </div>`;
+}
+
+async function acctInstAction(instanceId, region, action) {
+    const labels = { start: '启动', stop: '停止', reboot: '重启', terminate: '终止' };
+    if (action === 'terminate' && !confirm(`确定终止 EC2 实例 ${instanceId} (${region})？此操作不可恢复！`)) return;
+    showLoading(`正在${labels[action] || action} ${instanceId}...`);
+    try {
+        // 通过 direct API 直接操作 (基于 account_id + instance_id + region，无需本地 Instance 记录)
+        await api(`/instances/direct/${action}`, {
+            method: 'POST',
+            body: JSON.stringify({ account_id: _acctInstAccountId, instance_id: instanceId, region }),
+        });
+        toast(`${labels[action] || action}指令已发送`);
+        // 等几秒让 AWS 状态变化后再刷新
+        setTimeout(loadAccountInstancesDetail, 2500);
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally { hideLoading(); }
 }
 
 function toggleAccountSelect(id, checked) {

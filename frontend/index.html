@@ -466,6 +466,37 @@
         </div>
     </div>
 
+    <!-- 账号 EC2 实例详情面板 Modal -->
+    <div class="modal-overlay" id="acct-instances-modal">
+        <div class="modal" style="width:1100px;max-width:96vw;max-height:90vh;overflow-y:auto">
+            <div class="modal-header">
+                <h3>🖥 账号 EC2 实例详情</h3>
+                <button class="modal-close" onclick="hideModal('acct-instances-modal')">&times;</button>
+            </div>
+            <div id="acct-instances-hint" style="padding:4px 0 10px;color:var(--text2);font-size:13px;border-bottom:1px solid var(--border);margin-bottom:12px"></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+                <select id="acct-inst-region-filter" class="search-input" onchange="renderAcctInstances()" style="width:auto;min-width:200px"><option value="">全部区域</option></select>
+                <select id="acct-inst-state-filter" class="search-input" onchange="renderAcctInstances()" style="width:auto;min-width:120px">
+                    <option value="">全部状态</option>
+                    <option value="running">运行中</option>
+                    <option value="stopped">已停止</option>
+                    <option value="pending">启动中</option>
+                    <option value="terminated">已终止</option>
+                </select>
+                <input type="text" id="acct-inst-search" class="search-input" placeholder="🔍 搜索 ID / IP / 名称" oninput="renderAcctInstances()">
+                <span style="flex:1"></span>
+                <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:4px">
+                    <input type="checkbox" id="acct-inst-managed-only" onchange="loadAccountInstancesDetail()"> 仅本平台创建
+                </label>
+                <button type="button" class="btn btn-secondary" onclick="loadAccountInstancesDetail()">🔄 刷新</button>
+            </div>
+            <div id="acct-instances-summary" style="margin-bottom:10px;display:flex;gap:10px;flex-wrap:wrap"></div>
+            <div id="acct-instances-list">
+                <div style="text-align:center;padding:30px;color:var(--text2)">点击「刷新」加载实例</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Lightsail 实例管理 Modal -->
     <div class="modal-overlay" id="lightsail-modal">
         <div class="modal" style="width:880px;max-height:88vh;overflow-y:auto">
@@ -600,6 +631,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260518a"></script>
+    <script src="app.js?v=20260518b"></script>
 </body>
 </html>

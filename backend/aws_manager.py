@@ -335,6 +335,86 @@ class AwsManager:
                 })
         return instances
 
+    def list_instances_detailed(self, region: str, all_managed: bool = False) -> list:
+        """从 AWS API 拉取该区域所有 EC2 实例的详细信息（含 DNS / AZ / 架构 / launch_time）。
+
+        all_managed=False: 只列出本平台 ManagedBy 标签创建的实例
+        all_managed=True: 列出该账号该区域所有实例
+        """
+        ec2 = self._get_client("ec2", region)
+        kwargs = {}
+        if not all_managed:
+            kwargs["Filters"] = [{"Name": "tag:ManagedBy", "Values": ["aws-depin-manager"]}]
+
+        # 同时拉取 EIP 信息（关联到实例 ID）
+        eip_map = {}
+        try:
+            eips = ec2.describe_addresses().get("Addresses", [])
+            for a in eips:
+                iid = a.get("InstanceId")
+                if iid:
+                    eip_map[iid] = a.get("PublicIp")
+        except Exception:
+            pass
+
+        items = []
+        try:
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate(**kwargs):
+                for res in page.get("Reservations", []):
+                    for inst in res.get("Instances", []):
+                        iid = inst["InstanceId"]
+                        public_ip = inst.get("PublicIpAddress")
+                        is_static = bool(eip_map.get(iid)) and (eip_map.get(iid) == public_ip)
+                        # 标签
+                        tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                        items.append({
+                            "instance_id": iid,
+                            "name": tags.get("Name", ""),
+                            "state": inst.get("State", {}).get("Name", "unknown"),
+                            "instance_type": inst.get("InstanceType"),
+                            "region": region,
+                            "availability_zone": inst.get("Placement", {}).get("AvailabilityZone"),
+                            "public_ip": public_ip,
+                            "private_ip": inst.get("PrivateIpAddress"),
+                            "public_dns": inst.get("PublicDnsName") or "",
+                            "private_dns": inst.get("PrivateDnsName") or "",
+                            "image_id": inst.get("ImageId"),
+                            "platform": inst.get("Platform") or inst.get("PlatformDetails") or "Linux/UNIX",
+                            "architecture": inst.get("Architecture", ""),
+                            "vpc_id": inst.get("VpcId"),
+                            "subnet_id": inst.get("SubnetId"),
+                            "key_name": inst.get("KeyName"),
+                            "is_static_ip": is_static,
+                            "elastic_ip": eip_map.get(iid),
+                            "launch_time": inst.get("LaunchTime").isoformat() if inst.get("LaunchTime") else None,
+                            "tags": tags,
+                            "managed": tags.get("ManagedBy") == "aws-depin-manager",
+                            "cpu_options": inst.get("CpuOptions", {}),
+                            "monitoring": inst.get("Monitoring", {}).get("State", "disabled"),
+                        })
+        except Exception as e:
+            logger.warning(f"list_instances_detailed {region} failed: {e}")
+            raise
+        return items
+
+    def list_instances_detailed_all_regions(self, regions: list = None, all_managed: bool = False) -> dict:
+        """并发扫描多个区域的实例详情；返回 {region: [items]}"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if not regions:
+            regions = list(REGION_DISPLAY.keys())
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(len(regions), 16)) as pool:
+            futs = {pool.submit(self.list_instances_detailed, r, all_managed): r for r in regions}
+            for fut in as_completed(futs):
+                r = futs[fut]
+                try:
+                    out[r] = fut.result()
+                except Exception as e:
+                    logger.warning(f"detailed scan {r} failed: {e}")
+                    out[r] = []
+        return out
+
     # ==================== 账号信息检测 ====================
 
     def _get_credential_report(self) -> list:
