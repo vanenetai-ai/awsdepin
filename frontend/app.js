@@ -355,7 +355,7 @@ function toggleCardExpand(id) {
     if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
 
-// ==================== 账号卡片三点下拉菜单 ====================
+// ==================== 账号卡片三点下拉菜单 (fixed 定位，向下展开) ====================
 function toggleAccMenu(id, ev) {
     if (ev) ev.stopPropagation();
     // 关闭其它已打开的菜单
@@ -363,7 +363,48 @@ function toggleAccMenu(id, ev) {
         if (p.id !== `acc-menu-${id}`) p.classList.remove('show');
     });
     const m = document.getElementById('acc-menu-' + id);
-    if (m) m.classList.toggle('show');
+    if (!m) return;
+    const btn = document.querySelector(`#acc-menu-wrap-${id} .acc-menu-btn`);
+    if (m.classList.contains('show')) { m.classList.remove('show'); return; }
+
+    // 把菜单移动到 body 下，避免被任何祖先 overflow/hidden 裁剪
+    if (m.parentElement && m.parentElement.id !== 'acc-menu-portal') {
+        let portal = document.getElementById('acc-menu-portal');
+        if (!portal) {
+            portal = document.createElement('div');
+            portal.id = 'acc-menu-portal';
+            document.body.appendChild(portal);
+        }
+        portal.appendChild(m);
+    }
+
+    m.classList.add('show');
+    positionAccMenu(m, btn);
+}
+
+function positionAccMenu(menu, btn) {
+    if (!menu || !btn) return;
+    const rect = btn.getBoundingClientRect();
+    const menuWidth = menu.offsetWidth || 220;
+    const menuHeight = menu.offsetHeight || 320;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // 默认: 按钮下方，右对齐
+    let top = rect.bottom + 6;
+    let left = rect.right - menuWidth;
+
+    // 下方放不下 → 放到上方
+    if (top + menuHeight > vh - 8 && rect.top - menuHeight - 6 > 8) {
+        top = rect.top - menuHeight - 6;
+    }
+    // 左侧超出 → 贴右边按钮的左
+    if (left < 8) left = Math.min(rect.left, vw - menuWidth - 8);
+    if (left + menuWidth > vw - 8) left = vw - menuWidth - 8;
+    if (top < 8) top = 8;
+
+    menu.style.top = top + 'px';
+    menu.style.left = left + 'px';
 }
 
 function hideAccMenu(id) {
@@ -371,8 +412,16 @@ function hideAccMenu(id) {
     if (m) m.classList.remove('show');
 }
 
-// 全局点击关闭菜单
-document.addEventListener('click', () => {
+// 全局点击关闭菜单 (点菜单内部不关闭)
+document.addEventListener('click', (e) => {
+    if (e.target.closest('.acc-menu-popup') || e.target.closest('.acc-menu-btn')) return;
+    document.querySelectorAll('.acc-menu-popup.show').forEach(p => p.classList.remove('show'));
+});
+// 滚动/缩放时关闭菜单，避免错位
+window.addEventListener('scroll', () => {
+    document.querySelectorAll('.acc-menu-popup.show').forEach(p => p.classList.remove('show'));
+}, true);
+window.addEventListener('resize', () => {
     document.querySelectorAll('.acc-menu-popup.show').forEach(p => p.classList.remove('show'));
 });
 

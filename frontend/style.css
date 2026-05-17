@@ -785,23 +785,26 @@ select[multiple] option:checked {
     font-weight: bold;
     letter-spacing: 1px;
 }
+/* 菜单使用 fixed 定位，由 JS 计算坐标，避免被卡片 overflow:hidden 裁剪 */
 .acc-menu-popup {
-    position: absolute;
-    bottom: calc(100% + 6px);
-    right: 0;
-    min-width: 200px;
+    position: fixed;
+    top: 0;
+    left: 0;
+    min-width: 220px;
+    max-height: 70vh;
+    overflow-y: auto;
     background: var(--bg2);
     border: 1px solid var(--border);
     border-radius: 10px;
     box-shadow: 0 12px 32px rgba(0,0,0,0.5);
     padding: 6px;
-    z-index: 1000;
+    z-index: 9999;
     display: none;
     animation: accMenuIn 0.12s ease-out;
 }
 .acc-menu-popup.show { display: block; }
 @keyframes accMenuIn {
-    from { opacity: 0; transform: translateY(4px); }
+    from { opacity: 0; transform: translateY(-4px); }
     to { opacity: 1; transform: translateY(0); }
 }
 .acc-menu-item {
