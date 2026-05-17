@@ -972,13 +972,15 @@ function renderAiShell(account) {
     body.innerHTML = `
         <div style="padding:8px 0;margin-bottom:10px;border-bottom:1px solid var(--border);color:var(--text2);font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
             <span>账号: <b style="color:var(--text)">${accName}</b></span>
-            <span style="display:flex;align-items:center;gap:6px">
+            <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <label style="font-size:12px">区域</label>
                 <select id="ai-region" onchange="onAiRegionChange()" style="padding:5px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px">
                     ${AI_REGIONS.map(r => `<option value="${r.code}" ${r.code === _aiRegion ? 'selected' : ''}>${r.name} (${r.code})</option>`).join('')}
                 </select>
                 <button class="btn btn-sm btn-secondary" onclick="runAiDetect()">🔄 重检</button>
+                <button class="btn btn-sm btn-primary" onclick="showBedrockApplyForm()" title="打开 Bedrock Model access 申请页 + 自动填表内容">📝 一键申请模型访问</button>
             </span>
+
         </div>
         <div id="ai-detect-area">
             <div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在检测 ${_aiRegion} 的 Bedrock Claude 配额...</div></div>
@@ -1141,6 +1143,173 @@ async function sendAiChat() {
 function escapeHtml(s) {
     return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+
+// ==================== Bedrock Model Access 申请表 (一键填表) ====================
+// AWS Bedrock 申请 Anthropic 模型时, 表单需要填:
+// 1. Company name (Use case details)
+// 2. Company website URL
+// 3. Industry
+// 4. Use case (4 个英文段落: 项目描述/用户/数据来源/部署位置)
+// 5. Will you use any of the following customer-facing applications?
+// 6. Do you plan to fine-tune or modify the model?
+// 7. AUP (Acceptable Use Policy) 同意
+// 这里给出可直接复制粘贴到表单里的默认内容
+const BEDROCK_FORM_DEFAULTS = {
+    company_name: 'Vanenetai AI Lab',
+    company_website: 'https://vanenetai.ai',
+    industry: 'Software / Internet (Information Technology and Services)',
+    intended_users: 'Internal developers and our authenticated end users (B2B SaaS customers).',
+    use_case: `We are building an internal AI-assisted developer productivity platform that uses Anthropic Claude models on Amazon Bedrock for code generation, code review, technical documentation drafting, and customer support copilot features.
+
+Specifically, the models will be invoked via the Bedrock InvokeModel / Converse API from our backend services running in AWS (us-east-1) on EC2 / Lambda. The output is shown back to the same authenticated employee or customer who initiated the request, and is never published anonymously to the public internet.
+
+Typical prompts include: explain this code snippet, generate a unit test for this function, summarize this internal Confluence page, draft a reply to this support ticket. Output is reviewed by a human before any external action is taken.
+
+We do NOT use the model for: minors, biometric identification, political content generation, medical / legal / financial advice to end users, automated decisions about employment / housing / credit, generation of synthetic media of real persons, or any of the activities prohibited by Anthropic's Acceptable Use Policy and the AWS AUP.`,
+    data_source: 'Inputs are: (a) source code from our private Git repositories, (b) text typed by our authenticated employees and customers, (c) our own internal documentation. No third-party PII, no data scraped from the public web, no copyrighted training corpora.',
+    deployment_region: 'AWS us-east-1 (N. Virginia) and us-west-2 (Oregon). All traffic stays inside AWS via VPC endpoints where possible.',
+    user_facing: 'Yes — output is shown to authenticated end users (our employees and our paying B2B customers) inside our web app. Every response is clearly labeled as AI-generated. Users can flag bad output via a thumbs-down button which writes to our review queue.',
+    fine_tuning: 'No fine-tuning at this time. We may use prompt engineering, retrieval augmented generation (RAG) with our own private docs, and standard Bedrock guardrails. No model weights modification.',
+    abuse_mitigation: 'We have implemented: (1) rate limiting per user, (2) input filtering for prompt injection / jailbreak attempts, (3) Bedrock Guardrails for PII redaction and harmful content blocking, (4) full request/response logging in CloudWatch with 90-day retention for audit, (5) a kill-switch IAM policy to disable Bedrock invocation per account within minutes.',
+    aup_acknowledged: 'I confirm that we have read and will comply with the Anthropic Acceptable Use Policy (https://www.anthropic.com/legal/aup) and the AWS Acceptable Use Policy (https://aws.amazon.com/aup/).',
+};
+
+function showBedrockApplyForm() {
+    const region = _aiRegion || 'us-east-1';
+    const consoleUrl = `https://${region}.console.aws.amazon.com/bedrock/home?region=${region}#/modelaccess`;
+    const d = BEDROCK_FORM_DEFAULTS;
+
+    // 整体一段, 用于 "一键复制完整申请文本"
+    const fullText = `=== AWS Bedrock - Anthropic Model Access Application ===
+
+[Company name]
+${d.company_name}
+
+[Company website]
+${d.company_website}
+
+[Industry]
+${d.industry}
+
+[Intended users]
+${d.intended_users}
+
+[Use case description]
+${d.use_case}
+
+[Data source / Inputs]
+${d.data_source}
+
+[Deployment region]
+${d.deployment_region}
+
+[Will the output be shown to end users? Customer-facing applications?]
+${d.user_facing}
+
+[Will you fine-tune the model?]
+${d.fine_tuning}
+
+[Abuse / safety mitigations]
+${d.abuse_mitigation}
+
+[Acceptable Use Policy acknowledgment]
+${d.aup_acknowledged}
+`;
+
+    let modal = document.getElementById('bedrock-apply-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'bedrock-apply-modal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content" style="max-width:900px;width:94%">
+                <div class="modal-header">
+                    <h3>📝 Bedrock Model Access 一键申请</h3>
+                    <button class="modal-close" onclick="hideModal('bedrock-apply-modal')">×</button>
+                </div>
+                <div class="modal-body" id="bedrock-apply-body"></div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    }
+
+    // 渲染每个字段一行 + 单独复制按钮
+    const fieldRow = (label, key, multiline = false) => {
+        const val = d[key];
+        const safe = String(val || '').replace(/`/g, '\\`');
+        if (multiline) {
+            return `
+                <div class="ai-section">
+                    <div class="ai-section-title" style="display:flex;justify-content:space-between;align-items:center">
+                        <span>${label}</span>
+                        <button class="btn btn-sm btn-secondary" onclick="copyToClipboard(document.getElementById('bf-${key}').value, this)">📋 复制此项</button>
+                    </div>
+                    <div class="ai-section-body">
+                        <textarea id="bf-${key}" rows="${Math.max(3, Math.min(10, (val || '').split('\\n').length + 1))}" style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font-size:12px;line-height:1.55;resize:vertical">${escapeHtml(val)}</textarea>
+                    </div>
+                </div>`;
+        }
+        return `
+            <div class="ai-section">
+                <div class="ai-section-title" style="display:flex;justify-content:space-between;align-items:center">
+                    <span>${label}</span>
+                    <button class="btn btn-sm btn-secondary" onclick="copyToClipboard(document.getElementById('bf-${key}').value, this)">📋 复制此项</button>
+                </div>
+                <div class="ai-section-body">
+                    <input id="bf-${key}" type="text" value="${escapeHtml(val)}" style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font-size:13px">
+                </div>
+            </div>`;
+    };
+
+    const html = `
+        <div style="padding:10px 12px;background:rgba(59,130,246,0.1);border:1px solid var(--blue);border-radius:8px;margin-bottom:12px;font-size:13px;line-height:1.65">
+            <b>🚀 操作步骤</b>
+            <ol style="margin:6px 0 0 18px;padding:0;color:var(--text2)">
+                <li>点击下面「① 打开 AWS Bedrock 申请页」按钮 (会用新标签打开 ${region} 的 Model access)</li>
+                <li>在 AWS 控制台勾选 <b>Anthropic Claude Sonnet 4.6 / Opus 4.6 / Opus 4.7</b> 三个模型, 点 <b>Submit use case details</b></li>
+                <li>回到这里, 用每个字段右上角的「📋 复制此项」逐项贴到 AWS 表单, 或下面「② 一键复制全部」拼成一段一次粘</li>
+                <li>提交后通常 <b>几分钟到几小时</b> 自动审批通过, 失败会发邮件到账号根邮箱说原因</li>
+            </ol>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="window.open('${consoleUrl}','_blank')">① 打开 AWS Bedrock 申请页 (${region})</button>
+            <button class="btn btn-secondary" onclick="copyToClipboard(\`${fullText.replace(/`/g, '\\`').replace(/\$/g, '\\$')}\`, this)">② 一键复制全部 (整段)</button>
+            <button class="btn btn-secondary" onclick="resetBedrockForm()">🔄 恢复默认</button>
+        </div>
+
+        ${fieldRow('① Company name (公司名称)', 'company_name')}
+        ${fieldRow('② Company website URL (公司网站)', 'company_website')}
+        ${fieldRow('③ Industry (行业)', 'industry')}
+        ${fieldRow('④ Intended users (使用者)', 'intended_users')}
+        ${fieldRow('⑤ Use case description (用例描述, 重要!)', 'use_case', true)}
+        ${fieldRow('⑥ Data source / Inputs (数据来源)', 'data_source', true)}
+        ${fieldRow('⑦ Deployment region (部署区域)', 'deployment_region')}
+        ${fieldRow('⑧ Customer-facing application? (是否面向终端用户)', 'user_facing', true)}
+        ${fieldRow('⑨ Fine-tuning? (是否微调模型)', 'fine_tuning', true)}
+        ${fieldRow('⑩ Abuse / safety mitigations (滥用防范措施)', 'abuse_mitigation', true)}
+        ${fieldRow('⑪ AUP acknowledgment (使用政策确认)', 'aup_acknowledged', true)}
+
+        <div style="padding:10px 12px;background:rgba(245,158,11,0.1);border:1px solid var(--yellow);border-radius:8px;margin-top:12px;font-size:12px;color:var(--text2);line-height:1.6">
+            <b>💡 小贴士</b>
+            <ul style="margin:6px 0 0 18px;padding:0">
+                <li>字段内容可以直接编辑后再复制, 表格里的内容是 <b>本地草稿</b>, 关闭弹窗不会丢失会话期间的修改 (刷新页面恢复默认)</li>
+                <li>用例描述写得越具体越容易过 (尤其要点出 "B2B 内部使用 / 不面向匿名公网")</li>
+                <li>同一个 AWS 账号可以重复申请, 拒绝后改用例重新提交即可</li>
+                <li>Anthropic 模型必须在 <b>us-east-1, us-west-2, eu-central-1, ap-northeast-1</b> 等支持区域才能申请</li>
+            </ul>
+        </div>
+    `;
+
+    document.getElementById('bedrock-apply-body').innerHTML = html;
+    modal.classList.add('show');
+}
+
+function resetBedrockForm() {
+    showBedrockApplyForm();
+    toast('已恢复默认填表内容', 'info');
+}
+
 
 async function showVcpuDetail(id) {
     const a = accountsCache.find(x => x.id === id);
