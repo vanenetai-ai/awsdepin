@@ -1121,15 +1121,40 @@ class AwsManager:
 
     # ==================== AI 配额检测 ====================
 
+    # 只关注的 3 个 Claude 模型 (id 关键词 -> 显示名)
+    AI_TARGET_MODELS = [
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        ("claude-opus-4-6",   "Claude Opus 4.6"),
+        ("claude-opus-4-7",   "Claude Opus 4.7"),
+    ]
+
+    @classmethod
+    def _is_target_quota(cls, quota_name: str) -> tuple[bool, str | None]:
+        """配额名是否属于 3 个目标模型之一. 返回 (匹配?, 模型显示名)"""
+        n = (quota_name or "").lower().replace(" ", "-").replace(".", "-")
+        for kw, display in cls.AI_TARGET_MODELS:
+            # 匹配多种写法: claude-sonnet-4-6 / claude sonnet 4.6 / claude_sonnet_4_6
+            kw_norm = kw.lower().replace("-", "")
+            n_norm = n.replace("-", "").replace("_", "")
+            if kw_norm in n_norm:
+                return True, display
+        return False, None
+
     def detect_ai_info(self, region: str = "us-east-1") -> dict:
-        """简化版 AI 检测: 只查指定区域 (默认 us-east-1) 的 Bedrock Anthropic 模型 + Claude 配额。
+        """AI 检测: 只查 Claude Sonnet 4.6 / Opus 4.6 / Opus 4.7 三个模型的可用性 + 配额。
+
+        优化:
+        - 模型查询并行 + 只过滤目标模型 ID
+        - 配额查询用 paginator.PaginationConfig(MaxItems=200) 限制翻页
+        - 配额提前用关键字剪枝, 避免返回上百条无关配额
+        - 模型 + 配额并行执行
 
         返回:
         {
             "region": "us-east-1",
-            "bedrock_models": [...],
-            "bedrock_quotas": [...],
-            "bedrock_enabled": bool,    # Bedrock 是否可访问
+            "bedrock_models": [{"id":..., "name":..., "target_name":...}],   # 仅 3 个目标
+            "bedrock_quotas": [{"name":..., "value":..., "model":...}],     # 仅 3 个模型相关
+            "bedrock_enabled": bool,
             "error": Optional[str],
         }
         """
@@ -1148,16 +1173,28 @@ class AwsManager:
                 bedrock = self._get_client("bedrock", region)
                 resp = bedrock.list_foundation_models()
                 for m in resp.get("modelSummaries", []):
-                    mid = m.get("modelId", "").lower()
+                    mid = m.get("modelId", "")
+                    mid_low = mid.lower()
                     provider = m.get("providerName", "").lower()
-                    if "anthropic" in provider and "claude" in mid:
-                        models.append({
-                            "id": m.get("modelId", ""),
-                            "name": m.get("modelName", ""),
-                            "provider": m.get("providerName", ""),
-                            "input": m.get("inputModalities", []),
-                            "output": m.get("outputModalities", []),
-                        })
+                    if "anthropic" not in provider:
+                        continue
+                    # 只保留 3 个目标模型
+                    matched = None
+                    for kw, display in self.AI_TARGET_MODELS:
+                        if kw in mid_low:
+                            matched = display
+                            break
+                    if not matched:
+                        continue
+                    models.append({
+                        "id": mid,
+                        "name": m.get("modelName", ""),
+                        "target_name": matched,
+                        "provider": m.get("providerName", ""),
+                        "input": m.get("inputModalities", []),
+                        "output": m.get("outputModalities", []),
+                        "status": m.get("modelLifecycle", {}).get("status", ""),
+                    })
                 result["bedrock_enabled"] = True
             except Exception as e:
                 msg = str(e)
@@ -1169,36 +1206,42 @@ class AwsManager:
             return models
 
         def _detect_quotas():
+            """只拉 3 个目标模型的 token / request 配额, 限制最多翻 2 页"""
             quotas = []
-            try:
-                sq = self._get_client("service-quotas", region)
-                paginator = sq.get_paginator("list_service_quotas")
-                for page in paginator.paginate(ServiceCode="bedrock"):
-                    for q in page.get("Quotas", []):
-                        name = q.get("QuotaName", "").lower()
-                        if ("anthropic" in name or "claude" in name) and ("token" in name or "request" in name):
-                            quotas.append({
-                                "name": q.get("QuotaName", ""),
-                                "value": q.get("Value", 0),
-                                "code": q.get("QuotaCode", ""),
-                            })
-            except Exception as e:
-                logger.warning(f"Bedrock quotas error: {e}")
-                # fallback: 默认配额
+
+            def _scan(api_method: str):
                 try:
                     sq = self._get_client("service-quotas", region)
-                    paginator = sq.get_paginator("list_aws_default_service_quotas")
-                    for page in paginator.paginate(ServiceCode="bedrock"):
+                    paginator = sq.get_paginator(api_method)
+                    # 限制最多 200 条 (一页 100, 顶多翻 2 页), 避免拖慢
+                    page_iter = paginator.paginate(
+                        ServiceCode="bedrock",
+                        PaginationConfig={"MaxItems": 200, "PageSize": 100},
+                    )
+                    for page in page_iter:
                         for q in page.get("Quotas", []):
-                            name = q.get("QuotaName", "").lower()
-                            if ("anthropic" in name or "claude" in name) and ("token" in name or "request" in name):
-                                quotas.append({
-                                    "name": q.get("QuotaName", ""),
-                                    "value": q.get("Value", 0),
-                                    "code": q.get("QuotaCode", ""),
-                                })
-                except Exception:
-                    pass
+                            name = q.get("QuotaName", "")
+                            ok, model = self._is_target_quota(name)
+                            if not ok:
+                                continue
+                            n_low = name.lower()
+                            if "token" not in n_low and "request" not in n_low:
+                                continue
+                            quotas.append({
+                                "name": name,
+                                "value": q.get("Value", 0),
+                                "code": q.get("QuotaCode", ""),
+                                "unit": q.get("Unit", "None"),
+                                "model": model,
+                            })
+                    return True
+                except Exception as e:
+                    logger.warning(f"Bedrock quotas via {api_method} failed: {e}")
+                    return False
+
+            # 先用账号实际配额 (可能没权限), 失败再退默认配额
+            if not _scan("list_service_quotas"):
+                _scan("list_aws_default_service_quotas")
             return quotas
 
         # 并行执行模型 + 配额查询

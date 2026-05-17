@@ -1020,37 +1020,63 @@ function renderAiResults(data) {
         html += `<div style="padding:10px 12px;background:rgba(239,68,68,0.12);border:1px solid var(--red);border-radius:8px;color:var(--red);font-size:13px;margin-bottom:10px">⚠️ ${data.error}</div>`;
     }
 
-    // 模型
+    // 只关注这 3 个模型 (与后端 AI_TARGET_MODELS 保持一致)
+    const TARGET_MODELS = [
+        { kw: 'claude-sonnet-4-6', display: 'Claude Sonnet 4.6' },
+        { kw: 'claude-opus-4-6',   display: 'Claude Opus 4.6' },
+        { kw: 'claude-opus-4-7',   display: 'Claude Opus 4.7' },
+    ];
+
+    // 模型: 用 target_name 字段分组, 前端只展示这 3 个
     html += `<div class="ai-section">
-        <div class="ai-section-title">🧠 Bedrock Anthropic / Claude 模型 (${data.region || _aiRegion})</div>
+        <div class="ai-section-title">🧠 Claude 模型可用性 (${data.region || _aiRegion})</div>
         <div class="ai-section-body">`;
-    if (models.length) {
-        html += `<div style="margin-bottom:6px;color:var(--text2);font-size:12px">共 <b style="color:var(--green)">${models.length}</b> 个 Claude 模型可用</div>`;
-        html += `<table class="ai-table"><thead><tr><th>模型 ID</th><th>名称</th></tr></thead><tbody>`;
-        for (const m of models) {
-            html += `<tr><td><code style="font-size:11px">${m.id}</code></td><td>${m.name}</td></tr>`;
+    html += `<table class="ai-table"><thead><tr><th>模型</th><th>状态</th><th>模型 ID</th></tr></thead><tbody>`;
+    for (const t of TARGET_MODELS) {
+        const m = models.find(x => (x.target_name || '').includes(t.display) || (x.id || '').toLowerCase().includes(t.kw));
+        if (m) {
+            html += `<tr><td><b>${t.display}</b></td><td><span style="color:var(--green)">✓ 可用</span></td><td><code style="font-size:11px">${m.id}</code></td></tr>`;
+        } else {
+            const reason = data.bedrock_enabled ? '未申请访问' : (data.error ? '区域无 Bedrock' : '未上线');
+            html += `<tr><td><b>${t.display}</b></td><td><span style="color:var(--text2)">— ${reason}</span></td><td style="color:var(--text2)">-</td></tr>`;
         }
-        html += '</tbody></table>';
-    } else {
-        html += `<span style="color:var(--text2)">该区域未检测到 Claude 模型 ${data.bedrock_enabled ? '（账号未申请模型访问）' : '（Bedrock 未开通或无权限）'}</span>`;
     }
+    html += '</tbody></table>';
     html += '</div></div>';
 
-    // 配额
+    // 配额: 按 3 个模型分组展示
     html += `<div class="ai-section">
         <div class="ai-section-title">📊 Claude 关键配额 (Tokens / Requests)</div>
         <div class="ai-section-body">`;
     if (quotas.length) {
-        html += `<table class="ai-table"><thead><tr><th>配额名称</th><th style="text-align:right">值</th></tr></thead><tbody>`;
+        // 按模型分组
+        const grouped = {};
+        for (const t of TARGET_MODELS) grouped[t.display] = [];
         for (const q of quotas) {
-            const val = q.value >= 1000000 ? (q.value / 1000000).toFixed(1) + 'M' : q.value >= 1000 ? (q.value / 1000).toFixed(1) + 'K' : q.value;
-            html += `<tr><td style="font-size:12px">${q.name}</td><td style="text-align:right;font-weight:bold;color:var(--blue)">${val}</td></tr>`;
+            const m = q.model || TARGET_MODELS.find(t => (q.name || '').toLowerCase().replace(/[\s\-_.]/g, '').includes(t.kw.replace(/-/g, '')))?.display;
+            if (m && grouped[m]) grouped[m].push(q);
         }
-        html += '</tbody></table>';
+        let any = false;
+        for (const t of TARGET_MODELS) {
+            const list = grouped[t.display] || [];
+            if (!list.length) continue;
+            any = true;
+            html += `<div style="margin-bottom:8px"><div style="font-weight:bold;margin-bottom:4px;color:var(--blue)">${t.display}</div>`;
+            html += `<table class="ai-table"><thead><tr><th>配额名称</th><th style="text-align:right">值</th></tr></thead><tbody>`;
+            for (const q of list) {
+                const val = q.value >= 1000000 ? (q.value / 1000000).toFixed(1) + 'M' : q.value >= 1000 ? (q.value / 1000).toFixed(1) + 'K' : q.value;
+                html += `<tr><td style="font-size:12px">${q.name}</td><td style="text-align:right;font-weight:bold;color:var(--blue)">${val}</td></tr>`;
+            }
+            html += '</tbody></table></div>';
+        }
+        if (!any) {
+            html += '<span style="color:var(--text2)">未检测到这 3 个模型的配额（可能区域不支持或未开通）</span>';
+        }
     } else {
-        html += '<span style="color:var(--text2)">未检测到 Bedrock 配额（可能未开通）</span>';
+        html += '<span style="color:var(--text2)">未检测到这 3 个模型的配额（可能区域不支持或未开通）</span>';
     }
     html += '</div></div>';
+
 
     area.innerHTML = html;
 }
