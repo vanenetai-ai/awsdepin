@@ -1651,78 +1651,154 @@ let _lsAccountId = null;
 let _lsBlueprintsAll = [];   // 完整蓝图列表
 let _lsBundlesAll = [];      // 完整套餐列表
 let _lsRegions = [];         // 区域列表
+let _lsInstanceData = [];    // 当前账号的全部实例（前端过滤用）
 
 async function showLightsail(accountId) {
     _lsAccountId = accountId;
     const a = accountsCache.find(x => x.id === accountId);
     const accName = a ? (a.email || a.name || ('#' + accountId)) : ('#' + accountId);
     const hint = document.getElementById('lightsail-acc-hint');
-    if (hint) hint.textContent = `账号: ${accName}  ·  默认区域: ${a?.default_region || '-'}`;
+    if (hint) hint.textContent = `账号: ${accName}  ·  默认区域: ${a?.default_region || '-'}  ·  仅展示该 AWS 账号下的 Lightsail 实例`;
 
-    // 加载区域列表 (用于过滤下拉)
-    try {
-        if (!_lsRegions.length) _lsRegions = await api('/lightsail/regions');
-        const sel = document.getElementById('ls-region-filter');
-        const def = a?.default_region || '';
-        sel.innerHTML = '<option value="">全部区域 (扫描所有)</option>' +
-            _lsRegions.map(r => `<option value="${r.code}" ${r.code === def ? 'selected' : ''}>${r.display} (${r.code})</option>`).join('');
-    } catch (e) { /* ignore */ }
-
+    // 重置 UI
+    const searchEl = document.getElementById('ls-search');
+    if (searchEl) searchEl.value = '';
+    const stateEl = document.getElementById('ls-state-filter');
+    if (stateEl) stateEl.value = '';
+    document.getElementById('ls-region-filter').innerHTML = '<option value="">全部区域 (扫描所有)</option>';
+    document.getElementById('lightsail-summary').innerHTML = '';
     document.getElementById('lightsail-list').innerHTML =
-        '<div style="text-align:center;padding:30px;color:var(--text2)">正在加载实例列表...</div>';
+        '<div style="text-align:center;padding:30px;color:var(--text2)">正在加载 Lightsail 实例...</div>';
+
     document.getElementById('lightsail-modal').classList.add('show');
     loadLightsailInstances();
 }
 
 async function loadLightsailInstances() {
     if (!_lsAccountId) return;
-    const region = document.getElementById('ls-region-filter')?.value || '';
     const body = document.getElementById('lightsail-list');
-    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在拉取 Lightsail 实例${region ? ' ('+region+')' : ' (扫描所有区域)'}...</div></div>`;
+    const summary = document.getElementById('lightsail-summary');
+    body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在并发扫描所有 Lightsail 区域（约 10-20 秒）...</div></div>`;
+    summary.innerHTML = '';
     try {
-        const url = region ? `/lightsail/instances?account_id=${_lsAccountId}&region=${region}` : `/lightsail/instances?account_id=${_lsAccountId}`;
+        // 扫描所有区域，前端做区域筛选 (与 EC2 详情一致)
+        const url = `/lightsail/instances?account_id=${_lsAccountId}&_ts=${Date.now()}`;
         const res = await api(url);
-        renderLightsailInstances(res.instances || []);
+        _lsInstanceData = res.instances || [];
+
+        // 填充区域下拉
+        const regions = [...new Set(_lsInstanceData.map(i => i.region))].sort();
+        const regSel = document.getElementById('ls-region-filter');
+        const cur = regSel.value;
+        regSel.innerHTML = '<option value="">全部区域 (' + _lsInstanceData.length + ')</option>' +
+            regions.map(r => {
+                const cnt = _lsInstanceData.filter(i => i.region === r).length;
+                return `<option value="${r}" ${r === cur ? 'selected' : ''}>${r} (${cnt})</option>`;
+            }).join('');
+
+        renderLightsailInstances();
     } catch (e) {
         body.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">获取失败: ${e.message}</div>`;
+        toast(e.message, 'error');
     }
 }
 
-function renderLightsailInstances(list) {
+function renderLightsailInstances() {
     const body = document.getElementById('lightsail-list');
+    const summary = document.getElementById('lightsail-summary');
+    if (!_lsInstanceData) return;
+
+    const region = document.getElementById('ls-region-filter')?.value || '';
+    const state = document.getElementById('ls-state-filter')?.value || '';
+    const q = (document.getElementById('ls-search')?.value || '').toLowerCase();
+
+    let list = _lsInstanceData;
+    if (region) list = list.filter(i => i.region === region);
+    if (state) list = list.filter(i => i.state === state);
+    if (q) list = list.filter(i =>
+        (i.name || '').toLowerCase().includes(q) ||
+        (i.public_ip || '').includes(q) ||
+        (i.private_ip || '').includes(q) ||
+        (i.blueprint_name || '').toLowerCase().includes(q) ||
+        (i.blueprint_id || '').toLowerCase().includes(q) ||
+        (i.bundle_id || '').toLowerCase().includes(q)
+    );
+
+    // 摘要徽章
+    const states = {};
+    for (const i of list) states[i.state] = (states[i.state] || 0) + 1;
+    const stateBadges = Object.entries(states).map(([s, c]) => {
+        const color = s === 'running' ? 'green' : (s === 'stopped' ? 'red' : (s === 'pending' ? 'yellow' : 'gray'));
+        return `<span class="badge badge-${color}">${s} ${c}</span>`;
+    }).join('');
+    summary.innerHTML = `
+        <div class="stat-card" style="padding:10px 14px;flex:0 0 auto"><div class="label">Lightsail 实例</div><div class="value blue" style="font-size:20px">${list.length}</div></div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${stateBadges}</div>
+    `;
+
     if (!list.length) {
-        body.innerHTML = '<div style="padding:30px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">该区域暂无 Lightsail 实例。点击右上角「+ 创建 Lightsail 实例」开始创建。</div>';
+        body.innerHTML = '<div style="padding:30px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">该账号下没有 Lightsail 实例。点击右上角「+ 创建 Lightsail 实例」开始开机。</div>';
         return;
     }
-    let html = `<table class="ai-table" style="width:100%">
-        <thead><tr>
-            <th>名称</th><th>区域</th><th>状态</th><th>蓝图</th><th>套餐</th>
-            <th>公网IP</th><th>规格</th><th>操作</th>
-        </tr></thead><tbody>`;
-    for (const i of list) {
-        const stateColor = i.state === 'running' ? 'green' : (i.state === 'stopped' ? 'red' : (i.state === 'pending' ? 'yellow' : 'gray'));
-        const specs = `${i.cpu || '?'}C / ${i.ram || '?'}GB`;
-        const safeName = i.name.replace(/'/g, "\\'");
-        const region = i.region;
-        html += `<tr>
-            <td><b>${i.name}</b><br><span style="font-size:11px;color:var(--text2)">${i.availability_zone || ''}</span></td>
-            <td>${region}</td>
-            <td><span class="badge badge-${stateColor}">${i.state}</span></td>
-            <td style="font-size:12px">${i.blueprint_name || i.blueprint_id || '-'}</td>
-            <td style="font-size:12px"><code>${i.bundle_id || '-'}</code></td>
-            <td><code>${i.public_ip || '-'}</code>${i.is_static_ip ? ' <span class="badge badge-blue" style="font-size:10px">静态</span>' : ''}</td>
-            <td style="font-size:12px">${specs}</td>
-            <td class="action-btns">
-                ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="lightsailAction('${safeName}','${region}','start')">▶ 启动</button>` : ''}
-                ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="lightsailAction('${safeName}','${region}','stop')">⏹ 停止</button>` : ''}
-                ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="lightsailAction('${safeName}','${region}','reboot')">🔄</button>` : ''}
-                <button class="btn btn-sm btn-secondary" title="开放常用端口" onclick="lightsailAction('${safeName}','${region}','open-ports')">🔓</button>
-                <button class="btn btn-sm btn-danger" onclick="lightsailDelete('${safeName}','${region}')">🗑</button>
-            </td>
-        </tr>`;
-    }
-    html += '</tbody></table>';
-    body.innerHTML = html;
+
+    body.innerHTML = list.map(_renderLsInstanceCard).join('');
+}
+
+function _renderLsInstanceCard(i) {
+    const stateColor = i.state === 'running' ? 'green' : (i.state === 'stopped' ? 'red' : (i.state === 'pending' ? 'yellow' : 'gray'));
+    const uptime = _humanDuration(i.created_at);
+    const createdStr = _fmtTime(i.created_at);
+    const safeName = (i.name || '').replace(/'/g, "\\'");
+    const region = i.region;
+    const ipBadge = i.is_static_ip
+        ? '<span class="badge badge-blue" style="font-size:10px;margin-left:6px">静态 IP</span>'
+        : (i.public_ip ? '<span class="badge badge-gray" style="font-size:10px;margin-left:6px">动态</span>' : '');
+    const sshUser = i.ssh_username || 'ubuntu';
+    const publicIp = i.public_ip || '-';
+    const privateIp = i.private_ip || '-';
+
+    return `
+    <div class="acc-card" style="margin-bottom:12px">
+        <div class="acc-card-header">
+            <div class="acc-card-left" style="flex-wrap:wrap">
+                <span class="acc-num">⛵</span>
+                <span class="acc-name" title="${i.name}"><b>${i.name.length > 32 ? i.name.substring(0,32)+'...' : i.name}</b></span>
+                <span class="badge badge-${stateColor}">${i.state}</span>
+                <span class="acc-flag">${region}</span>
+                <span class="acc-age" title="${createdStr}">⏱ ${uptime}</span>
+                <span class="acc-vcpu" title="规格">⚡ ${i.cpu || '?'}C / ${i.ram || '?'}GB</span>
+            </div>
+        </div>
+        <div style="padding:8px 12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:6px 14px;font-size:12px">
+            <div><span style="color:var(--text2)">实例名称</span> <code style="font-size:11px">${i.name}</code>
+                <button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${safeName}', this)" title="复制">📋</button>
+            </div>
+            <div><span style="color:var(--text2)">可用区</span> ${i.availability_zone || '-'}</div>
+            <div><span style="color:var(--text2)">公网 IP</span> <code>${publicIp}</code>${ipBadge}
+                ${publicIp !== '-' ? `<button class="btn btn-sm btn-secondary acc-copy-btn" onclick="copyToClipboard('${publicIp}', this)">📋</button>` : ''}
+            </div>
+            <div><span style="color:var(--text2)">内网 IP</span> <code>${privateIp}</code></div>
+            <div><span style="color:var(--text2)">IPv6</span> <code style="font-size:11px">${i.ipv6 || '-'}</code></div>
+            <div><span style="color:var(--text2)">SSH 用户</span> ${sshUser}</div>
+            <div style="grid-column:span 2"><span style="color:var(--text2)">蓝图</span> ${i.blueprint_name || '-'} <code style="font-size:11px;margin-left:6px">${i.blueprint_id || ''}</code></div>
+            <div><span style="color:var(--text2)">套餐</span> <code style="font-size:11px">${i.bundle_id || '-'}</code></div>
+            <div><span style="color:var(--text2)">规格</span> <b>${i.cpu || '?'} vCPU · ${i.ram || '?'} GB RAM</b></div>
+            <div><span style="color:var(--text2)">磁盘</span> ${(i.disks || []).map(d => `${d.name} (${d.size}GB)`).join(' / ') || '-'}</div>
+            <div><span style="color:var(--text2)">密钥对</span> ${i.key_pair_name || '-'}</div>
+            <div><span style="color:var(--text2)">创建时间</span> ${createdStr}</div>
+            <div><span style="color:var(--text2)">已运行</span> <b style="color:var(--green)">${uptime}</b></div>
+            <div style="grid-column:span 2"><span style="color:var(--text2)">ARN</span> <code style="font-size:10px;word-break:break-all">${i.arn || '-'}</code></div>
+        </div>
+        <div class="acc-card-footer" style="flex-wrap:wrap">
+            ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="lightsailAction('${safeName}','${region}','start')">▶ 启动</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="lightsailAction('${safeName}','${region}','stop')">⏹ 停止</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="lightsailAction('${safeName}','${region}','reboot')">🔄 重启</button>` : ''}
+            <button class="btn btn-sm btn-secondary" title="开放常用端口" onclick="lightsailAction('${safeName}','${region}','open-ports')">🔓 开放端口</button>
+            ${publicIp !== '-' ? `<button class="btn btn-sm btn-secondary" onclick="copyToClipboard('ssh ${sshUser}@${publicIp}', this)" title="复制 SSH 命令">SSH</button>` : ''}
+            <button class="btn btn-sm btn-secondary" onclick="copyToClipboard('${safeName}', this)" title="复制名称">📋 名称</button>
+            <button class="btn btn-sm btn-danger" onclick="lightsailDelete('${safeName}','${region}')">🗑 删除</button>
+        </div>
+    </div>`;
 }
 
 async function lightsailAction(name, region, action) {

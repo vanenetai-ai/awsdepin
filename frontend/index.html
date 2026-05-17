@@ -498,24 +498,32 @@
         </div>
     </div>
 
-    <!-- Lightsail 实例管理 Modal -->
+    <!-- Lightsail 实例管理 Modal (账号 → 实例详情面板) -->
     <div class="modal-overlay" id="lightsail-modal">
-        <div class="modal" style="width:880px;max-height:88vh;overflow-y:auto">
+        <div class="modal" style="width:1100px;max-width:96vw;max-height:90vh;overflow-y:auto">
             <div class="modal-header">
-                <h3>⛵ Lightsail (光帆) 实例管理</h3>
+                <h3>⛵ Lightsail (光帆) 实例详情</h3>
                 <button class="modal-close" onclick="hideModal('lightsail-modal')">&times;</button>
             </div>
             <div id="lightsail-acc-hint" style="padding:4px 0 10px;color:var(--text2);font-size:13px;border-bottom:1px solid var(--border);margin-bottom:12px"></div>
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-                <select id="ls-region-filter" style="min-width:200px" onchange="loadLightsailInstances()">
-                    <option value="">全部区域</option>
+                <select id="ls-region-filter" class="search-input" onchange="renderLightsailInstances()" style="width:auto;min-width:200px">
+                    <option value="">全部区域 (扫描所有)</option>
                 </select>
+                <select id="ls-state-filter" class="search-input" onchange="renderLightsailInstances()" style="width:auto;min-width:120px">
+                    <option value="">全部状态</option>
+                    <option value="running">运行中</option>
+                    <option value="stopped">已停止</option>
+                    <option value="pending">启动中</option>
+                </select>
+                <input type="text" id="ls-search" class="search-input" placeholder="🔍 搜索 名称/IP/蓝图" oninput="renderLightsailInstances()">
                 <button type="button" class="btn btn-secondary" onclick="loadLightsailInstances()">🔄 刷新</button>
                 <span style="flex:1"></span>
                 <button type="button" class="btn btn-primary" onclick="showLightsailLaunch()">+ 创建 Lightsail 实例</button>
             </div>
+            <div id="lightsail-summary" style="margin-bottom:10px;display:flex;gap:10px;flex-wrap:wrap"></div>
             <div id="lightsail-list">
-                <div style="text-align:center;padding:30px;color:var(--text2)">点击「刷新」查看实例</div>
+                <div style="text-align:center;padding:30px;color:var(--text2)">正在加载实例...</div>
             </div>
         </div>
     </div>
