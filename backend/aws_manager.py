@@ -335,6 +335,86 @@ class AwsManager:
                 })
         return instances
 
+    def list_instances_detailed(self, region: str, all_managed: bool = False) -> list:
+        """从 AWS API 拉取该区域所有 EC2 实例的详细信息（含 DNS / AZ / 架构 / launch_time）。
+
+        all_managed=False: 只列出本平台 ManagedBy 标签创建的实例
+        all_managed=True: 列出该账号该区域所有实例
+        """
+        ec2 = self._get_client("ec2", region)
+        kwargs = {}
+        if not all_managed:
+            kwargs["Filters"] = [{"Name": "tag:ManagedBy", "Values": ["aws-depin-manager"]}]
+
+        # 同时拉取 EIP 信息（关联到实例 ID）
+        eip_map = {}
+        try:
+            eips = ec2.describe_addresses().get("Addresses", [])
+            for a in eips:
+                iid = a.get("InstanceId")
+                if iid:
+                    eip_map[iid] = a.get("PublicIp")
+        except Exception:
+            pass
+
+        items = []
+        try:
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate(**kwargs):
+                for res in page.get("Reservations", []):
+                    for inst in res.get("Instances", []):
+                        iid = inst["InstanceId"]
+                        public_ip = inst.get("PublicIpAddress")
+                        is_static = bool(eip_map.get(iid)) and (eip_map.get(iid) == public_ip)
+                        # 标签
+                        tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                        items.append({
+                            "instance_id": iid,
+                            "name": tags.get("Name", ""),
+                            "state": inst.get("State", {}).get("Name", "unknown"),
+                            "instance_type": inst.get("InstanceType"),
+                            "region": region,
+                            "availability_zone": inst.get("Placement", {}).get("AvailabilityZone"),
+                            "public_ip": public_ip,
+                            "private_ip": inst.get("PrivateIpAddress"),
+                            "public_dns": inst.get("PublicDnsName") or "",
+                            "private_dns": inst.get("PrivateDnsName") or "",
+                            "image_id": inst.get("ImageId"),
+                            "platform": inst.get("Platform") or inst.get("PlatformDetails") or "Linux/UNIX",
+                            "architecture": inst.get("Architecture", ""),
+                            "vpc_id": inst.get("VpcId"),
+                            "subnet_id": inst.get("SubnetId"),
+                            "key_name": inst.get("KeyName"),
+                            "is_static_ip": is_static,
+                            "elastic_ip": eip_map.get(iid),
+                            "launch_time": inst.get("LaunchTime").isoformat() if inst.get("LaunchTime") else None,
+                            "tags": tags,
+                            "managed": tags.get("ManagedBy") == "aws-depin-manager",
+                            "cpu_options": inst.get("CpuOptions", {}),
+                            "monitoring": inst.get("Monitoring", {}).get("State", "disabled"),
+                        })
+        except Exception as e:
+            logger.warning(f"list_instances_detailed {region} failed: {e}")
+            raise
+        return items
+
+    def list_instances_detailed_all_regions(self, regions: list = None, all_managed: bool = False) -> dict:
+        """并发扫描多个区域的实例详情；返回 {region: [items]}"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if not regions:
+            regions = list(REGION_DISPLAY.keys())
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(len(regions), 16)) as pool:
+            futs = {pool.submit(self.list_instances_detailed, r, all_managed): r for r in regions}
+            for fut in as_completed(futs):
+                r = futs[fut]
+                try:
+                    out[r] = fut.result()
+                except Exception as e:
+                    logger.warning(f"detailed scan {r} failed: {e}")
+                    out[r] = []
+        return out
+
     # ==================== 账号信息检测 ====================
 
     def _get_credential_report(self) -> list:
@@ -815,21 +895,35 @@ class AwsManager:
 
     # ==================== AI 配额检测 ====================
 
-    def detect_ai_info(self) -> dict:
-        """检测 Bedrock AI 配额、Anthropic 模型、Kiro/SSO 订阅 - 无超时，等真实数据"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        result = {"bedrock_models": [], "bedrock_quotas": [], "sso_instances": 0, "licenses": []}
+    def detect_ai_info(self, region: str = "us-east-1") -> dict:
+        """简化版 AI 检测: 只查指定区域 (默认 us-east-1) 的 Bedrock Anthropic 模型 + Claude 配额。
 
-        def _detect_bedrock_models():
-            """只获取 global Claude 模型 (us-east-1)"""
+        返回:
+        {
+            "region": "us-east-1",
+            "bedrock_models": [...],
+            "bedrock_quotas": [...],
+            "bedrock_enabled": bool,    # Bedrock 是否可访问
+            "error": Optional[str],
+        }
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        result = {
+            "region": region,
+            "bedrock_models": [],
+            "bedrock_quotas": [],
+            "bedrock_enabled": False,
+            "error": None,
+        }
+
+        def _detect_models():
             models = []
             try:
-                bedrock = self._get_client("bedrock", "us-east-1")
+                bedrock = self._get_client("bedrock", region)
                 resp = bedrock.list_foundation_models()
                 for m in resp.get("modelSummaries", []):
                     mid = m.get("modelId", "").lower()
                     provider = m.get("providerName", "").lower()
-                    # 只取 anthropic claude 模型
                     if "anthropic" in provider and "claude" in mid:
                         models.append({
                             "id": m.get("modelId", ""),
@@ -838,15 +932,20 @@ class AwsManager:
                             "input": m.get("inputModalities", []),
                             "output": m.get("outputModalities", []),
                         })
+                result["bedrock_enabled"] = True
             except Exception as e:
+                msg = str(e)
+                if "AccessDenied" in msg or "not authorized" in msg or "UnrecognizedClient" in msg:
+                    result["error"] = f"无 Bedrock 访问权限或区域 {region} 未开通"
+                else:
+                    result["error"] = f"Bedrock 查询失败: {msg[:120]}"
                 logger.warning(f"Bedrock models error: {e}")
             return models
 
-        def _detect_bedrock_quotas():
-            """获取 Bedrock 配额 - 只取 Anthropic/Claude 相关"""
+        def _detect_quotas():
             quotas = []
             try:
-                sq = self._get_client("service-quotas", "us-east-1")
+                sq = self._get_client("service-quotas", region)
                 paginator = sq.get_paginator("list_service_quotas")
                 for page in paginator.paginate(ServiceCode="bedrock"):
                     for q in page.get("Quotas", []):
@@ -859,9 +958,9 @@ class AwsManager:
                             })
             except Exception as e:
                 logger.warning(f"Bedrock quotas error: {e}")
-                # fallback: 尝试默认配额
+                # fallback: 默认配额
                 try:
-                    sq = self._get_client("service-quotas", "us-east-1")
+                    sq = self._get_client("service-quotas", region)
                     paginator = sq.get_paginator("list_aws_default_service_quotas")
                     for page in paginator.paginate(ServiceCode="bedrock"):
                         for q in page.get("Quotas", []):
@@ -876,38 +975,11 @@ class AwsManager:
                     pass
             return quotas
 
-        def _detect_sso():
-            """检测 IAM Identity Center (Kiro 订阅)"""
-            try:
-                sso = self._get_client("sso-admin", "us-east-1")
-                resp = sso.list_instances()
-                return len(resp.get("Instances", []))
-            except Exception:
-                return 0
-
-        def _detect_licenses():
-            """检测 License Manager 许可证"""
-            licenses = []
-            try:
-                lm = self._get_client("license-manager", "us-east-1")
-                resp = lm.list_received_licenses(MaxResults=10)
-                for lic in resp.get("Licenses", []):
-                    licenses.append({
-                        "name": lic.get("LicenseName", ""),
-                        "product": lic.get("ProductName", ""),
-                        "status": lic.get("Status", ""),
-                    })
-            except Exception:
-                pass
-            return licenses
-
-        # 并行执行 - 无超时，等每个任务完成
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # 并行执行模型 + 配额查询
+        with ThreadPoolExecutor(max_workers=2) as pool:
             tasks = {
-                pool.submit(_detect_bedrock_models): "models",
-                pool.submit(_detect_bedrock_quotas): "quotas",
-                pool.submit(_detect_sso): "sso",
-                pool.submit(_detect_licenses): "licenses",
+                pool.submit(_detect_models): "models",
+                pool.submit(_detect_quotas): "quotas",
             }
             for future in as_completed(tasks):
                 key = tasks[future]
@@ -917,13 +989,195 @@ class AwsManager:
                         result["bedrock_models"] = val
                     elif key == "quotas":
                         result["bedrock_quotas"] = val
-                    elif key == "sso":
-                        result["sso_instances"] = val
-                    elif key == "licenses":
-                        result["licenses"] = val
                 except Exception as e:
                     logger.warning(f"AI detection {key} failed: {e}")
 
+        return result
+
+    # ==================== Claude 对话 ====================
+
+    def invoke_claude(self, prompt: str = "你好", model_id: str = None, region: str = "us-east-1", max_tokens: int = 256) -> dict:
+        """通过 Bedrock 调用 Claude 模型进行对话测试。
+
+        返回:
+        {
+            "ok": bool,
+            "model_id": str,
+            "region": str,
+            "prompt": str,
+            "reply": str,
+            "input_tokens": int,
+            "output_tokens": int,
+            "error": Optional[str],
+        }
+        """
+        import json as _json
+        result = {
+            "ok": False,
+            "model_id": model_id or "",
+            "region": region,
+            "prompt": prompt,
+            "reply": "",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "error": None,
+        }
+
+        # 自动挑选可用 Claude 模型
+        if not model_id:
+            try:
+                bedrock = self._get_client("bedrock", region)
+                resp = bedrock.list_foundation_models()
+                # 优先用 inference profile 兼容的较新版本
+                preferred_keywords = [
+                    "claude-3-5-sonnet", "claude-3-5-haiku",
+                    "claude-3-haiku", "claude-3-sonnet",
+                    "claude-instant",
+                ]
+                ids = []
+                for m in resp.get("modelSummaries", []):
+                    mid = m.get("modelId", "")
+                    provider = m.get("providerName", "").lower()
+                    if "anthropic" in provider and "claude" in mid.lower():
+                        # 仅保留支持 ON_DEMAND 的模型
+                        inference = m.get("inferenceTypesSupported", []) or []
+                        if not inference or "ON_DEMAND" in inference:
+                            ids.append(mid)
+                # 按偏好排序
+                def _rank(mid):
+                    low = mid.lower()
+                    for i, kw in enumerate(preferred_keywords):
+                        if kw in low:
+                            return i
+                    return 99
+                ids.sort(key=_rank)
+                if not ids:
+                    result["error"] = f"区域 {region} 没有可用的 Claude 模型 (Anthropic provider)"
+                    return result
+                model_id = ids[0]
+                result["model_id"] = model_id
+            except Exception as e:
+                result["error"] = f"列出模型失败: {str(e)[:200]}"
+                return result
+
+        try:
+            runtime = self._get_client("bedrock-runtime", region)
+            body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            resp = runtime.invoke_model(
+                modelId=model_id,
+                body=_json.dumps(body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            payload = _json.loads(resp["body"].read())
+            # Claude 3 messages API 返回结构
+            content_parts = payload.get("content", []) or []
+            text_parts = [c.get("text", "") for c in content_parts if c.get("type") == "text"]
+            reply = "".join(text_parts).strip() or _json.dumps(payload)[:500]
+            usage = payload.get("usage", {}) or {}
+            result.update({
+                "ok": True,
+                "reply": reply,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+            })
+        except Exception as e:
+            msg = str(e)
+            if "AccessDenied" in msg or "not authorized" in msg:
+                result["error"] = f"无权限调用模型 {model_id}: 请在 AWS 控制台 Bedrock → Model access 申请开启该模型"
+            elif "ValidationException" in msg and "on-demand throughput" in msg.lower():
+                result["error"] = f"模型 {model_id} 不支持按需调用，请改用 inference profile 或其它模型"
+            elif "AccessDeniedException" in msg:
+                result["error"] = f"调用被拒绝: {msg[:200]}"
+            else:
+                result["error"] = f"调用失败: {msg[:300]}"
+        return result
+
+    # ==================== Free Credit / 促销额度 ====================
+
+    def get_credit_summary(self) -> dict:
+        """通过 Cost Explorer 查询本年的 Credit 抵扣情况。
+
+        AWS 不开放官方 API 查询 promotional credit 余额（仅 Billing Console 可见），
+        但 Cost Explorer 提供 RECORD_TYPE=Credit 维度，可以查到当年已被使用/抵扣的额度。
+        我们将这部分作为"已知 Credit 抵扣总额"返回，前端会展示为"AWS Credit"。
+
+        返回:
+        {
+            "year": 2026,
+            "currency": "USD",
+            "credits_used_ytd": 123.45,        # 本年已抵扣
+            "credits_used_last_30d": 12.34,    # 近 30 天已抵扣
+            "monthly": [{"month":"2026-01","amount":10.0}, ...],
+            "error": null
+        }
+        """
+        from datetime import date, timedelta
+        result = {
+            "year": date.today().year,
+            "currency": "USD",
+            "credits_used_ytd": 0.0,
+            "credits_used_last_30d": 0.0,
+            "monthly": [],
+            "error": None,
+        }
+        try:
+            ce = self._get_client("ce", "us-east-1")
+            today = date.today()
+            year_start = date(today.year, 1, 1)
+            # YTD by-month
+            try:
+                resp = ce.get_cost_and_usage(
+                    TimePeriod={"Start": str(year_start), "End": str(today)},
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
+                )
+                total = 0.0
+                currency = "USD"
+                monthly = []
+                for r in resp.get("ResultsByTime", []):
+                    start = r.get("TimePeriod", {}).get("Start", "")
+                    amt_obj = r.get("Total", {}).get("UnblendedCost", {})
+                    amt = abs(float(amt_obj.get("Amount", 0) or 0))  # Credit 是负值，用绝对值
+                    currency = amt_obj.get("Unit") or currency
+                    total += amt
+                    monthly.append({"month": start[:7], "amount": round(amt, 2)})
+                result["currency"] = currency
+                result["credits_used_ytd"] = round(total, 2)
+                result["monthly"] = monthly
+            except Exception as e:
+                msg = str(e)
+                if "AccessDenied" in msg or "not authorized" in msg:
+                    result["error"] = "无 Cost Explorer 权限 (ce:GetCostAndUsage)"
+                elif "DataUnavailable" in msg or "has not yet been activated" in msg:
+                    result["error"] = "Cost Explorer 未启用，请在 Billing Console 启用"
+                else:
+                    result["error"] = f"查询失败: {msg[:160]}"
+
+            # 近 30 天
+            try:
+                d_start = today - timedelta(days=30)
+                resp30 = ce.get_cost_and_usage(
+                    TimePeriod={"Start": str(d_start), "End": str(today)},
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
+                )
+                total30 = 0.0
+                for r in resp30.get("ResultsByTime", []):
+                    amt = abs(float(r.get("Total", {}).get("UnblendedCost", {}).get("Amount", 0) or 0))
+                    total30 += amt
+                result["credits_used_last_30d"] = round(total30, 2)
+            except Exception:
+                pass
+
+        except Exception as e:
+            result["error"] = f"查询异常: {str(e)[:160]}"
         return result
 
     # ==================== 账单查询 ====================

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AWS DePIN 管理平台</title>
-    <link rel="stylesheet" href="style.css?v=20260509b">
+    <link rel="stylesheet" href="style.css?v=20260515a">
 </head>
 <body>
     <nav class="sidebar">
@@ -43,7 +43,22 @@
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                     <input type="text" id="account-search" class="search-input" placeholder="🔍 搜索账号/邮箱/分组..." oninput="filterAccounts()">
                     <select id="account-group-filter" class="search-input" onchange="filterAccounts()" style="width:auto;min-width:100px"><option value="">全部分组</option></select>
+                    <select id="account-vcpu-filter" class="search-input" onchange="filterAccounts()" style="width:auto;min-width:140px" title="按 vCPU 配额范围筛选">
+                        <option value="">全部 vCPU</option>
+                        <option value="unknown">未检测</option>
+                        <option value="0">0 (已封号/限制)</option>
+                        <option value="1-5">1-5 vCPU (默认配额)</option>
+                        <option value="6-15">6-15 vCPU</option>
+                        <option value="16-31">16-31 vCPU</option>
+                        <option value="32-63">32-63 vCPU</option>
+                        <option value="64-127">64-127 vCPU</option>
+                        <option value="128-255">128-255 vCPU</option>
+                        <option value="256-511">256-511 vCPU</option>
+                        <option value="512+">512+ vCPU</option>
+                    </select>
+                    <button class="btn btn-secondary" id="vcpu-view-btn" onclick="toggleVcpuGroupView()" title="切换 vCPU 分组视图">📊 vCPU 分组</button>
                     <button class="btn btn-secondary" onclick="detectAllAccounts()">🔍 检测全部</button>
+                    <button class="btn btn-secondary" onclick="loadAllCredits()" title="查询所有账号的 AWS Credit 抵扣额度">💎 查 Credit</button>
                     <button class="btn btn-secondary" onclick="toggleSelectAll()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>
                     <button class="btn btn-primary" onclick="showModal('account-modal')">+ 添加账号</button>
@@ -452,6 +467,150 @@
         </div>
     </div>
 
+    <!-- 账号 EC2 实例详情面板 Modal -->
+    <div class="modal-overlay" id="acct-instances-modal">
+        <div class="modal" style="width:1100px;max-width:96vw;max-height:90vh;overflow-y:auto">
+            <div class="modal-header">
+                <h3>🖥 账号 EC2 实例详情</h3>
+                <button class="modal-close" onclick="hideModal('acct-instances-modal')">&times;</button>
+            </div>
+            <div id="acct-instances-hint" style="padding:4px 0 10px;color:var(--text2);font-size:13px;border-bottom:1px solid var(--border);margin-bottom:12px"></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+                <select id="acct-inst-region-filter" class="search-input" onchange="renderAcctInstances()" style="width:auto;min-width:200px"><option value="">全部区域</option></select>
+                <select id="acct-inst-state-filter" class="search-input" onchange="renderAcctInstances()" style="width:auto;min-width:120px">
+                    <option value="">全部状态</option>
+                    <option value="running">运行中</option>
+                    <option value="stopped">已停止</option>
+                    <option value="pending">启动中</option>
+                    <option value="terminated">已终止</option>
+                </select>
+                <input type="text" id="acct-inst-search" class="search-input" placeholder="🔍 搜索 ID / IP / 名称" oninput="renderAcctInstances()">
+                <span style="flex:1"></span>
+                <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:4px">
+                    <input type="checkbox" id="acct-inst-managed-only" onchange="loadAccountInstancesDetail()"> 仅本平台创建
+                </label>
+                <button type="button" class="btn btn-secondary" onclick="loadAccountInstancesDetail()">🔄 刷新</button>
+            </div>
+            <div id="acct-instances-summary" style="margin-bottom:10px;display:flex;gap:10px;flex-wrap:wrap"></div>
+            <div id="acct-instances-list">
+                <div style="text-align:center;padding:30px;color:var(--text2)">点击「刷新」加载实例</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Lightsail 实例管理 Modal (账号 → 实例详情面板) -->
+    <div class="modal-overlay" id="lightsail-modal">
+        <div class="modal" style="width:1100px;max-width:96vw;max-height:90vh;overflow-y:auto">
+            <div class="modal-header">
+                <h3>⛵ Lightsail (光帆) 实例详情</h3>
+                <button class="modal-close" onclick="hideModal('lightsail-modal')">&times;</button>
+            </div>
+            <div id="lightsail-acc-hint" style="padding:4px 0 10px;color:var(--text2);font-size:13px;border-bottom:1px solid var(--border);margin-bottom:12px"></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+                <select id="ls-region-filter" class="search-input" onchange="renderLightsailInstances()" style="width:auto;min-width:200px">
+                    <option value="">全部区域 (扫描所有)</option>
+                </select>
+                <select id="ls-state-filter" class="search-input" onchange="renderLightsailInstances()" style="width:auto;min-width:120px">
+                    <option value="">全部状态</option>
+                    <option value="running">运行中</option>
+                    <option value="stopped">已停止</option>
+                    <option value="pending">启动中</option>
+                </select>
+                <input type="text" id="ls-search" class="search-input" placeholder="🔍 搜索 名称/IP/蓝图" oninput="renderLightsailInstances()">
+                <button type="button" class="btn btn-secondary" onclick="loadLightsailInstances()">🔄 刷新</button>
+                <span style="flex:1"></span>
+                <button type="button" class="btn btn-primary" onclick="showLightsailLaunch()">+ 创建 Lightsail 实例</button>
+            </div>
+            <div id="lightsail-summary" style="margin-bottom:10px;display:flex;gap:10px;flex-wrap:wrap"></div>
+            <div id="lightsail-list">
+                <div style="text-align:center;padding:30px;color:var(--text2)">正在加载实例...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Lightsail 创建实例 Modal -->
+    <div class="modal-overlay" id="lightsail-launch-modal">
+        <div class="modal" style="width:780px;max-height:90vh;overflow-y:auto">
+            <div class="modal-header">
+                <h3>⛵ 创建 Lightsail 实例 (开机)</h3>
+                <button class="modal-close" onclick="hideModal('lightsail-launch-modal')">&times;</button>
+            </div>
+            <form onsubmit="lightsailLaunch(event)">
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>实例名称前缀</label>
+                        <input type="text" id="ls-name" required placeholder="例: my-lightsail" pattern="[A-Za-z0-9_\-]+" title="仅支持字母/数字/_/-">
+                    </div>
+                    <div class="form-group" style="flex:0 0 120px">
+                        <label>数量</label>
+                        <input type="number" id="ls-count" value="1" min="1" max="20">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>区域</label>
+                        <select id="ls-region" onchange="onLightsailRegionChange()"></select>
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label>可用区</label>
+                        <select id="ls-az">
+                            <option value="">自动 (使用第一个)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>蓝图分类</label>
+                    <select id="ls-blueprint-category" onchange="filterLightsailBlueprints()">
+                        <option value="">全部分类</option>
+                        <option value="Linux/Unix">🐧 Linux / Unix 系统</option>
+                        <option value="Windows">🪟 Windows 系统</option>
+                        <option value="应用 + OS">📦 应用 + 系统 (WordPress / LAMP / Node.js ...)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>蓝图 (Blueprint - 操作系统/应用镜像)</label>
+                    <select id="ls-blueprint" required>
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>套餐分类</label>
+                    <select id="ls-bundle-category" onchange="filterLightsailBundles()">
+                        <option value="">全部分类</option>
+                        <option value="标准型 Linux">🐧 标准型 Linux</option>
+                        <option value="标准型 Windows">🪟 标准型 Windows</option>
+                        <option value="计算优化">⚡ 计算优化</option>
+                        <option value="内存优化">🧠 内存优化</option>
+                        <option value="通用型">🎯 通用型</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>套餐 (Bundle - 实例规格)</label>
+                    <select id="ls-bundle" required>
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>启动脚本 (User Data, 可选)</label>
+                    <textarea id="ls-userdata" rows="4" placeholder="#!/bin/bash&#10;# 创建实例后自动执行 (仅 Linux 系统支持)"></textarea>
+                </div>
+
+                <div class="form-group" style="display:flex;align-items:center;gap:8px">
+                    <input type="checkbox" id="ls-open-ports" checked>
+                    <label for="ls-open-ports" style="margin:0;cursor:pointer">自动开放常用端口 (22/80/443/3000-9999)</label>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-block">⛵ 创建实例</button>
+            </form>
+        </div>
+    </div>
+
     <!-- Edit Account Modal -->
     <div class="modal-overlay" id="edit-account-modal">
         <div class="modal">
@@ -481,6 +640,6 @@
         <div class="loading-text" id="loading-text">处理中，请稍候...</div>
     </div>
 
-    <script src="app.js?v=20260509b"></script>
+    <script src="app.js?v=20260518b"></script>
 </body>
 </html>
