@@ -1018,6 +1018,30 @@ class AwsManager:
             "email_ses",
             "email_sns",
         ]
+        # 诊断: 记录每个 API 的命中状态 (用于前端定位为啥拿不到邮箱)
+        diagnosis = {}
+        for k in ordered_keys:
+            v = results.get(k)
+            if v is None:
+                # 任务报错或返回 None
+                err_match = next((e for e in info.get("_errors", []) if e.startswith(f"{k}:")), None)
+                if err_match:
+                    err_text = err_match[len(k) + 2:]
+                    if "AccessDenied" in err_text or "not authorized" in err_text:
+                        diagnosis[k] = "denied"  # 没权限 (root 没开 IAM billing access 等)
+                    elif "AWSOrganizationsNotInUse" in err_text:
+                        diagnosis[k] = "not_in_org"
+                    elif "ResourceNotFound" in err_text:
+                        diagnosis[k] = "not_found"  # 该 alt contact 没配置
+                    else:
+                        diagnosis[k] = "error"
+                else:
+                    diagnosis[k] = "empty"  # API 通了但没数据
+            elif isinstance(v, str) and "@" in v:
+                diagnosis[k] = "hit"
+            else:
+                diagnosis[k] = "no_email"  # 比如 email_contact 拿到的是 FullName
+
         # 先找一个真正包含 @ 的邮箱
         email = None
         all_emails = []
@@ -1036,6 +1060,7 @@ class AwsManager:
         if not email:
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
         info["email"] = email
+        info["email_diagnosis"] = diagnosis
         if all_emails:
             info["email_sources"] = [k for k, _ in all_emails]
             info["all_emails"] = list({v for _, v in all_emails})
