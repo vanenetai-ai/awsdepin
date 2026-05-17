@@ -412,6 +412,26 @@ async def get_account_vcpus(account_id: int, user: User = Depends(get_current_us
     return result
 
 
+@app.get("/api/accounts/{account_id}/credits")
+async def get_account_credits(
+    account_id: int,
+    _ts: Optional[int] = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """查询账号 AWS Credit (本年已抵扣 + 近 30 天)"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor,
+        lambda: AwsManager(account, db).get_credit_summary(),
+    )
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
 @app.get("/api/accounts/{account_id}/billing")
 async def get_account_billing(
     account_id: int,

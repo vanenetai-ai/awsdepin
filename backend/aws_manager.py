@@ -1097,6 +1097,89 @@ class AwsManager:
                 result["error"] = f"调用失败: {msg[:300]}"
         return result
 
+    # ==================== Free Credit / 促销额度 ====================
+
+    def get_credit_summary(self) -> dict:
+        """通过 Cost Explorer 查询本年的 Credit 抵扣情况。
+
+        AWS 不开放官方 API 查询 promotional credit 余额（仅 Billing Console 可见），
+        但 Cost Explorer 提供 RECORD_TYPE=Credit 维度，可以查到当年已被使用/抵扣的额度。
+        我们将这部分作为"已知 Credit 抵扣总额"返回，前端会展示为"AWS Credit"。
+
+        返回:
+        {
+            "year": 2026,
+            "currency": "USD",
+            "credits_used_ytd": 123.45,        # 本年已抵扣
+            "credits_used_last_30d": 12.34,    # 近 30 天已抵扣
+            "monthly": [{"month":"2026-01","amount":10.0}, ...],
+            "error": null
+        }
+        """
+        from datetime import date, timedelta
+        result = {
+            "year": date.today().year,
+            "currency": "USD",
+            "credits_used_ytd": 0.0,
+            "credits_used_last_30d": 0.0,
+            "monthly": [],
+            "error": None,
+        }
+        try:
+            ce = self._get_client("ce", "us-east-1")
+            today = date.today()
+            year_start = date(today.year, 1, 1)
+            # YTD by-month
+            try:
+                resp = ce.get_cost_and_usage(
+                    TimePeriod={"Start": str(year_start), "End": str(today)},
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
+                )
+                total = 0.0
+                currency = "USD"
+                monthly = []
+                for r in resp.get("ResultsByTime", []):
+                    start = r.get("TimePeriod", {}).get("Start", "")
+                    amt_obj = r.get("Total", {}).get("UnblendedCost", {})
+                    amt = abs(float(amt_obj.get("Amount", 0) or 0))  # Credit 是负值，用绝对值
+                    currency = amt_obj.get("Unit") or currency
+                    total += amt
+                    monthly.append({"month": start[:7], "amount": round(amt, 2)})
+                result["currency"] = currency
+                result["credits_used_ytd"] = round(total, 2)
+                result["monthly"] = monthly
+            except Exception as e:
+                msg = str(e)
+                if "AccessDenied" in msg or "not authorized" in msg:
+                    result["error"] = "无 Cost Explorer 权限 (ce:GetCostAndUsage)"
+                elif "DataUnavailable" in msg or "has not yet been activated" in msg:
+                    result["error"] = "Cost Explorer 未启用，请在 Billing Console 启用"
+                else:
+                    result["error"] = f"查询失败: {msg[:160]}"
+
+            # 近 30 天
+            try:
+                d_start = today - timedelta(days=30)
+                resp30 = ce.get_cost_and_usage(
+                    TimePeriod={"Start": str(d_start), "End": str(today)},
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
+                )
+                total30 = 0.0
+                for r in resp30.get("ResultsByTime", []):
+                    amt = abs(float(r.get("Total", {}).get("UnblendedCost", {}).get("Amount", 0) or 0))
+                    total30 += amt
+                result["credits_used_last_30d"] = round(total30, 2)
+            except Exception:
+                pass
+
+        except Exception as e:
+            result["error"] = f"查询异常: {str(e)[:160]}"
+        return result
+
     # ==================== 账单查询 ====================
     def get_billing(self, year: int, month: int, granularity: str = "DAILY") -> dict:
         """

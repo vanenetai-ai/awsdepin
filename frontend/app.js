@@ -252,6 +252,23 @@ function _renderAccountCardHtml(a) {
     const vcpuUsage = a.total_usage || 0;
     const vcpuText = a.max_on_demand ? `${vcpuUsage}/${a.max_on_demand} vCPUs` : '';
     const checked = selectedAccounts.has(a.id) ? 'checked' : '';
+
+    // Credit 徽章 (从前端缓存读取，未查询过显示问号)
+    const cred = _creditCache[a.id];
+    let credBadge = '';
+    if (cred) {
+        if (cred.error) {
+            credBadge = `<span class="acc-credit error" onclick="loadCredit(${a.id})" title="${cred.error}">💎 Credit 错误</span>`;
+        } else {
+            const ytd = cred.credits_used_ytd || 0;
+            const cur = cred.currency || 'USD';
+            const sign = cur === 'USD' ? '$' : (cur === 'CNY' ? '¥' : '');
+            credBadge = `<span class="acc-credit" onclick="loadCredit(${a.id})" title="本年已抵扣 Credit (点击刷新)">💎 ${sign}${ytd.toFixed(2)} ${cur}</span>`;
+        }
+    } else {
+        credBadge = `<span class="acc-credit unknown" onclick="loadCredit(${a.id})" title="点击查询 AWS Credit 抵扣额度">💎 Credit ?</span>`;
+    }
+
     return `
         <div class="acc-card" data-id="${a.id}">
             <div class="acc-card-header">
@@ -261,7 +278,8 @@ function _renderAccountCardHtml(a) {
                     <span class="acc-name" title="${displayName}">${displayName.length > 22 ? displayName.substring(0,22)+'...' : displayName}</span>
                     ${flag ? `<span class="acc-flag">${flag}</span>` : ''}
                     ${age ? `<span class="acc-age">${age}</span>` : ''}
-                    ${vcpuText ? `<span class="acc-vcpu" onclick="showVcpuDetail(${a.id})" title="点击查看详情">⚡ ${vcpuText}</span>` : ''}
+                    ${vcpuText ? `<span class="acc-vcpu" onclick="showVcpuDetail(${a.id})" title="点击查看 vCPU 详情">⚡ ${vcpuText}</span>` : ''}
+                    ${credBadge}
                     <span class="acc-instances ${(a.instance_count||0) > 0 ? 'has' : ''}" onclick="viewAccountInstances(${a.id})" title="查看该账号的实例">🖥 ${a.instance_count || 0} 实例</span>
                 </div>
                 <div class="acc-card-actions">
@@ -296,18 +314,35 @@ function _renderAccountCardHtml(a) {
                 </div>
             </div>
             <div class="acc-card-footer">
-                <button class="btn btn-sm btn-secondary" onclick="editAccountInline(${a.id})">✏️</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteAccount(${a.id})">🗑</button>
-                <button class="btn btn-sm btn-secondary" onclick="detectAccount(${a.id})">🔍 检测</button>
-                <button class="btn btn-sm btn-secondary" onclick="detectAI(${a.id})">🤖 AI</button>
-                <button class="btn btn-sm btn-secondary" onclick="showVcpuDetail(${a.id})">⚡ vCPU</button>
-                <button class="btn btn-sm btn-secondary" onclick="showBilling(${a.id})">💰 账单</button>
+                <button class="btn btn-sm btn-primary acc-main-btn" onclick="viewAccountInstances(${a.id})">🖥 EC2 实例</button>
+                <button class="btn btn-sm btn-primary acc-main-btn" onclick="showLightsail(${a.id})">⛵ Lightsail 实例</button>
                 <span class="acc-footer-spacer"></span>
-                <button class="btn btn-sm btn-secondary" onclick="viewAccountInstances(${a.id})">EC2 实例</button>
-                <button class="btn btn-sm btn-secondary" onclick="showLightsail(${a.id})">⛵ Lightsail 实例</button>
+                <div class="acc-menu-wrap" id="acc-menu-wrap-${a.id}">
+                    <button class="btn btn-sm btn-secondary acc-menu-btn" onclick="toggleAccMenu(${a.id}, event)" title="更多操作">⋯</button>
+                    <div class="acc-menu-popup" id="acc-menu-${a.id}">
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});editAccountInline(${a.id})">✏️ 编辑账号</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});detectAccount(${a.id})">🔍 检测账号信息</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});loadCredit(${a.id})">💎 刷新 Credit 余额</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showVcpuDetail(${a.id})">⚡ vCPU 配额</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showBilling(${a.id})">💰 账单费用</div>
+                        <div class="acc-menu-divider"></div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});enableAllRegions(${a.id})">🌐 启用全部地区</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showFreeTier(${a.id})">🎁 免费套餐</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});openIamLogin(${a.id})">👤 IAM 登录链接</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});resetSecretKey(${a.id})">🔑 重置密钥</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showMfa(${a.id})">🔒 MFA 验证</div>
+                        <div class="acc-menu-divider"></div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});detectAI(${a.id})">🤖 Bedrock / Claude</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});copyKiroSubscription(${a.id})">✨ Kiro 订阅信息</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});copyClaudePlatform(${a.id})">🧠 Claude Platform 配置</div>
+                        <div class="acc-menu-divider"></div>
+                        <div class="acc-menu-item danger" onclick="hideAccMenu(${a.id});deleteAccount(${a.id})">🗑 删除账号</div>
+                    </div>
+                </div>
             </div>
         </div>`;
 }
+
 
 function renderAccountCards(list) {
     const grid = document.getElementById('accounts-grid');
@@ -319,6 +354,153 @@ function toggleCardExpand(id) {
     const el = document.getElementById('acc-expand-' + id);
     if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
+
+// ==================== 账号卡片三点下拉菜单 ====================
+function toggleAccMenu(id, ev) {
+    if (ev) ev.stopPropagation();
+    // 关闭其它已打开的菜单
+    document.querySelectorAll('.acc-menu-popup.show').forEach(p => {
+        if (p.id !== `acc-menu-${id}`) p.classList.remove('show');
+    });
+    const m = document.getElementById('acc-menu-' + id);
+    if (m) m.classList.toggle('show');
+}
+
+function hideAccMenu(id) {
+    const m = document.getElementById('acc-menu-' + id);
+    if (m) m.classList.remove('show');
+}
+
+// 全局点击关闭菜单
+document.addEventListener('click', () => {
+    document.querySelectorAll('.acc-menu-popup.show').forEach(p => p.classList.remove('show'));
+});
+
+// ==================== AWS Credit (本年已抵扣) ====================
+const _creditCache = {};   // {accountId: {credits_used_ytd, currency, error}}
+let _creditLoading = new Set();
+
+async function loadCredit(accountId) {
+    if (_creditLoading.has(accountId)) return;
+    _creditLoading.add(accountId);
+    // 立即更新 UI 占位为加载中
+    const card = document.querySelector(`.acc-card[data-id="${accountId}"]`);
+    if (card) {
+        const el = card.querySelector('.acc-credit');
+        if (el) { el.classList.add('loading'); el.innerHTML = '💎 查询中...'; }
+    }
+    try {
+        const res = await api(`/accounts/${accountId}/credits?_ts=${Date.now()}`);
+        _creditCache[accountId] = res;
+        if (!res.error) {
+            toast(`Credit 查询完成: ${res.currency} ${res.credits_used_ytd?.toFixed(2) || 0}`);
+        } else {
+            toast(`⚠️ ${res.error}`, 'warning');
+        }
+    } catch (e) {
+        _creditCache[accountId] = { error: e.message };
+        toast(e.message, 'error');
+    } finally {
+        _creditLoading.delete(accountId);
+        // 局部更新该卡片的 credit 徽章
+        updateCreditBadge(accountId);
+    }
+}
+
+function updateCreditBadge(accountId) {
+    const card = document.querySelector(`.acc-card[data-id="${accountId}"]`);
+    if (!card) return;
+    const el = card.querySelector('.acc-credit');
+    if (!el) return;
+    const cred = _creditCache[accountId];
+    el.classList.remove('loading', 'error', 'unknown');
+    if (!cred) {
+        el.classList.add('unknown');
+        el.innerHTML = '💎 Credit ?';
+        return;
+    }
+    if (cred.error) {
+        el.classList.add('error');
+        el.title = cred.error;
+        el.innerHTML = '💎 Credit 错误';
+        return;
+    }
+    const ytd = cred.credits_used_ytd || 0;
+    const cur = cred.currency || 'USD';
+    const sign = cur === 'USD' ? '$' : (cur === 'CNY' ? '¥' : '');
+    el.title = `本年 (${cred.year}) 已抵扣 Credit · 近30天 ${sign}${(cred.credits_used_last_30d||0).toFixed(2)} · 点击刷新`;
+    el.innerHTML = `💎 ${sign}${ytd.toFixed(2)} ${cur}`;
+}
+
+async function loadAllCredits() {
+    if (!accountsCache.length) return;
+    const targets = accountsCache.filter(a => !_creditCache[a.id]);
+    if (!targets.length) { toast('所有账号 Credit 已查询完成'); return; }
+    showLoading(`正在并发查询 ${targets.length} 个账号的 Credit...`);
+    try {
+        await Promise.all(targets.map(a => loadCredit(a.id)));
+        toast(`Credit 查询完成 (${targets.length} 个账号)`);
+    } catch (e) { toast(e.message, 'error'); }
+    finally { hideLoading(); }
+}
+
+// ==================== 菜单中的占位/快捷功能 ====================
+function enableAllRegions(id) {
+    const a = accountsCache.find(x => x.id === id);
+    if (!a) return;
+    const url = `https://${a.aws_account_id ? a.aws_account_id + '.signin.aws.amazon.com/console' : 'console.aws.amazon.com'}/billing/home?#/account`;
+    copyToClipboard(a.access_key_id || '', null);
+    toast('已复制 Access Key，请在 AWS 控制台 Account → AWS Regions 启用 opt-in 区域', 'info');
+    window.open('https://console.aws.amazon.com/billing/home?#/account', '_blank');
+}
+
+function showFreeTier(id) {
+    // AWS 免费套餐控制台
+    window.open('https://console.aws.amazon.com/billing/home#/freetier', '_blank');
+    toast('已打开 AWS 免费套餐控制台 (需在新标签登录该账号)', 'info');
+}
+
+function openIamLogin(id) {
+    const a = accountsCache.find(x => x.id === id);
+    if (!a) return;
+    if (!a.aws_account_id) { toast('账号 AWS Account ID 未知，请先点「检测账号信息」', 'error'); return; }
+    const url = `https://${a.aws_account_id}.signin.aws.amazon.com/console`;
+    copyToClipboard(`${a.aws_account_id}\n${a.access_key_id}\n${a.secret_access_key || ''}`, null);
+    toast(`已复制账号 ID + AK/SK，IAM 登录页已打开`, 'info');
+    window.open(url, '_blank');
+}
+
+function resetSecretKey(id) {
+    if (!confirm('重置 Secret Key 需要在 AWS 控制台 IAM → 用户 → 安全凭证 中创建新的 Access Key 并替换。\n\n现在打开 IAM 控制台？')) return;
+    window.open('https://console.aws.amazon.com/iam/home#/users', '_blank');
+}
+
+function showMfa(id) {
+    if (!confirm('MFA 配置请在 AWS 控制台 IAM → 用户 → 安全凭证 启用。\n\n现在打开？')) return;
+    window.open('https://console.aws.amazon.com/iam/home#/security_credentials', '_blank');
+}
+
+function copyKiroSubscription(id) {
+    const a = accountsCache.find(x => x.id === id);
+    if (!a) return;
+    const cfg = {
+        provider: 'aws-bedrock',
+        access_key_id: a.access_key_id || '',
+        secret_access_key: a.secret_access_key || '',
+        region: a.default_region || 'us-east-1',
+    };
+    copyToClipboard(JSON.stringify(cfg, null, 2), null);
+    toast('已复制 Kiro 订阅配置 (JSON)，可直接粘贴到 Kiro 设置', 'success');
+}
+
+function copyClaudePlatform(id) {
+    const a = accountsCache.find(x => x.id === id);
+    if (!a) return;
+    const env = `# Claude Platform / claude-code env\nexport AWS_ACCESS_KEY_ID="${a.access_key_id || ''}"\nexport AWS_SECRET_ACCESS_KEY="${a.secret_access_key || ''}"\nexport AWS_REGION="${a.default_region || 'us-east-1'}"\nexport CLAUDE_CODE_USE_BEDROCK=1\nexport ANTHROPIC_MODEL="anthropic.claude-3-5-sonnet-20241022-v2:0"`;
+    copyToClipboard(env, null);
+    toast('已复制 Claude Platform / claude-code 环境变量', 'success');
+}
+
 
 // ==================== 账号 EC2 实例详情面板 ====================
 let _acctInstAccountId = null;
