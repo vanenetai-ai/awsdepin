@@ -761,7 +761,63 @@ select[multiple] option:checked {
     color: var(--red);
     border-color: rgba(239,68,68,0.4);
 }
+.acc-credit.good {   /* 有可用 Credit 余额 → 绿色 */
+    background: rgba(34,197,94,0.14);
+    color: #22c55e;
+    border-color: rgba(34,197,94,0.4);
+}
+.acc-credit.good:hover { background: rgba(34,197,94,0.22); }
+.acc-credit.used {   /* 已用完 → 灰偏黄 */
+    background: rgba(234,179,8,0.08);
+    color: #ca8a04;
+    border-color: rgba(234,179,8,0.3);
+    font-weight: 500;
+}
+.acc-credit.none {   /* 无 Credit → 灰色 */
+    background: var(--bg3);
+    color: var(--text2);
+    border-color: var(--border);
+    font-weight: 400;
+}
 .acc-credit.loading { opacity: 0.6; cursor: wait; }
+
+/* 账号状态徽章 (失效/禁用) */
+.acc-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 2px 9px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    user-select: none;
+}
+.acc-status.bad {
+    background: rgba(239,68,68,0.18);
+    color: var(--red);
+    border: 1px solid rgba(239,68,68,0.55);
+    animation: acc-status-pulse 2.4s infinite;
+}
+@keyframes acc-status-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.45); }
+    50% { box-shadow: 0 0 0 4px rgba(239,68,68,0); }
+}
+
+/* vCPU 徽章 - 失效/禁用时变红 */
+.acc-vcpu.bad {
+    background: rgba(239,68,68,0.12);
+    color: var(--red);
+    border: 1px solid rgba(239,68,68,0.4);
+    cursor: help;
+}
+.acc-vcpu.bad:hover { background: rgba(239,68,68,0.22); }
+.acc-vcpu.warn {  /* vCPU=0 但 STS 通过 (不一定禁用) */
+    background: rgba(234,179,8,0.12);
+    color: var(--yellow);
+    border: 1px solid rgba(234,179,8,0.4);
+}
+
 
 /* ===== 简化的卡片底部 (只保留 EC2 / Lightsail / 三点菜单) ===== */
 .acc-card-footer .acc-main-btn {

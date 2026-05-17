@@ -57,6 +57,10 @@ class AwsAccount(Base):
     max_on_demand = Column(Integer, default=0)    # 单区域最高 On-Demand vCPU 限制
     total_usage = Column(Integer, default=0)      # 总 vCPU 使用量
     vcpu_data = Column(JSON)              # 各区域 vCPU 详情 JSON
+    # 账号状态: active(正常) / invalid_credentials(AK SK 失效) / disabled(被 AWS 封禁/限制) / unknown(未检测)
+    account_status = Column(String(30), default="unknown", index=True)
+    status_reason = Column(Text, default="")    # 状态原因 (失效/禁用的具体错误信息)
+    status_checked_at = Column(DateTime)        # 上次状态检测时间
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

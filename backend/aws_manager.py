@@ -123,13 +123,59 @@ class AwsManager:
         return resource
 
     def verify_credentials(self) -> dict:
-        """验证 AWS 凭证是否有效"""
+        """验证 AWS 凭证是否有效，并识别账号状态。
+
+        返回字段:
+            valid: True/False
+            account_id, arn (valid=True 时)
+            error (valid=False 时)
+            status: active / invalid_credentials / disabled / unknown
+        """
         try:
             sts = self._get_client("sts")
             identity = sts.get_caller_identity()
-            return {"valid": True, "account_id": identity["Account"], "arn": identity["Arn"]}
+            return {
+                "valid": True,
+                "account_id": identity["Account"],
+                "arn": identity["Arn"],
+                "status": "active",
+            }
         except Exception as e:
-            return {"valid": False, "error": str(e)}
+            err = str(e)
+            status = self._classify_credential_error(err)
+            return {"valid": False, "error": err, "status": status}
+
+    @staticmethod
+    def _classify_credential_error(err: str) -> str:
+        """根据 AWS 报错文本判断账号状态"""
+        s = (err or "").lower()
+        # AK/SK 失效
+        invalid_markers = [
+            "invalidclienttokenid",
+            "signaturedoesnotmatch",
+            "the security token included in the request is invalid",
+            "the aws access key id needs a subscription",
+            "auth failure",
+            "authfailure",
+            "invalidaccesskeyid",
+            "tokenrefreshrequired",
+            "the request signature we calculated does not match",
+        ]
+        for m in invalid_markers:
+            if m in s:
+                return "invalid_credentials"
+        # 账号被禁用 / 暂停
+        disabled_markers = [
+            "account is suspended",
+            "account is closed",
+            "is disabled",
+            "is not authorized to perform: sts:getcalleridentity",
+            "your account has been suspended",
+        ]
+        for m in disabled_markers:
+            if m in s:
+                return "disabled"
+        return "unknown"
 
     def list_regions(self) -> list:
         ec2 = self._get_client("ec2", "us-east-1")
@@ -702,8 +748,19 @@ class AwsManager:
             if "proxy" in err_str.lower() or "407" in err_str or "ProxyConnectionError" in err_str:
                 info["_errors"].append(f"代理连接失败: {err_str[:150]}")
                 info["_proxy_error"] = True
+                # 代理错误不是账号问题，状态保持 unknown
             else:
                 info["_errors"].append(f"AWS 连接失败: {err_str[:150]}")
+                # AK/SK 失效或账号被禁用 → 写入数据库
+                status = self._classify_credential_error(err_str)
+                self.account.account_status = status if status != "unknown" else "invalid_credentials"
+                self.account.status_reason = err_str[:300]
+                self.account.status_checked_at = datetime.utcnow()
+                try:
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+            info["account_status"] = self.account.account_status
             return info
 
         account_id = info["account_id"]
@@ -885,6 +942,24 @@ class AwsManager:
         self.account.total_usage = info["total_usage"]
         if info["vcpu_data"]:
             self.account.vcpu_data = info["vcpu_data"]
+
+        # 判断账号状态: STS 通过 && 至少一个区域 vCPU > 0 → active；
+        # 否则 (所有区域 limit=0 通常意味着账号被禁/限制) → disabled
+        if isinstance(vcpu_result, dict) and vcpu_result.get("regions"):
+            max_limit = max((d.get("on_demand_limit", 0) for d in vcpu_result["regions"].values()), default=0)
+            if max_limit <= 0:
+                self.account.account_status = "disabled"
+                self.account.status_reason = "所有区域 vCPU 配额为 0，账号可能被 AWS 限制或禁用"
+            else:
+                self.account.account_status = "active"
+                self.account.status_reason = ""
+        else:
+            # vCPU 检测失败但 STS 成功 → 暂定为 active
+            if self.account.account_status not in ("invalid_credentials", "disabled"):
+                self.account.account_status = "active"
+                self.account.status_reason = ""
+        self.account.status_checked_at = datetime.utcnow()
+        info["account_status"] = self.account.account_status
 
         try:
             self.db.commit()
@@ -1100,36 +1175,120 @@ class AwsManager:
     # ==================== Free Credit / 促销额度 ====================
 
     def get_credit_summary(self) -> dict:
-        """通过 Cost Explorer 查询本年的 Credit 抵扣情况。
+        """查询账号 Credit / 免费套餐额度。
 
-        AWS 不开放官方 API 查询 promotional credit 余额（仅 Billing Console 可见），
-        但 Cost Explorer 提供 RECORD_TYPE=Credit 维度，可以查到当年已被使用/抵扣的额度。
-        我们将这部分作为"已知 Credit 抵扣总额"返回，前端会展示为"AWS Credit"。
+        AWS 在 us-east-1 提供独立的 freetier (FreeTier API), 跟 Cost Explorer 完全无关，
+        权限是 freetier:GetFreeTierUsage / freetier:ListAccountActivities, 不需要 ce:* 权限。
+        优先调用 freetier，拿不到再回退到 Cost Explorer 的 RECORD_TYPE=Credit (兼容老账号)。
 
         返回:
         {
-            "year": 2026,
             "currency": "USD",
-            "credits_used_ytd": 123.45,        # 本年已抵扣
-            "credits_used_last_30d": 12.34,    # 近 30 天已抵扣
-            "monthly": [{"month":"2026-01","amount":10.0}, ...],
-            "error": null
+            "balance": 100.0,            # 当前可用 Credit 余额 (优先 freetier，否则 0)
+            "total": 100.0,              # 历史总额 (赠送 + 已用)
+            "used": 0.0,                 # 已抵扣
+            "expires_at": "2027-05-15",  # 过期时间 (如果有)
+            "credits": [                  # 详细 credit 列表
+                {"name": "AWS Free Tier", "balance": 100.0, "total": 100.0, "expires_at": "..."}
+            ],
+            "source": "freetier" | "cost_explorer" | "none",
+            "error": null,
         }
         """
-        from datetime import date, timedelta
         result = {
-            "year": date.today().year,
             "currency": "USD",
-            "credits_used_ytd": 0.0,
-            "credits_used_last_30d": 0.0,
-            "monthly": [],
+            "balance": 0.0,
+            "total": 0.0,
+            "used": 0.0,
+            "expires_at": None,
+            "credits": [],
+            "source": "none",
             "error": None,
         }
+
+        # 1) 优先尝试 freetier API (us-east-1 全局服务)
+        try:
+            ft = self._get_client("freetier", "us-east-1")
+            try:
+                # ListAccountActivities: 列出账号的 Free Tier / Credit 活动
+                paginator = None
+                try:
+                    paginator = ft.get_paginator("list_account_activities")
+                except Exception:
+                    pass
+                activities = []
+                if paginator:
+                    for page in paginator.paginate(filterCategories=["FREE_TIER", "CREDITS"]):
+                        activities.extend(page.get("activities", []))
+                else:
+                    resp = ft.list_account_activities(filterCategories=["FREE_TIER", "CREDITS"])
+                    activities = resp.get("activities", [])
+                if activities:
+                    total_balance, total_amount, total_used = 0.0, 0.0, 0.0
+                    expires_min = None
+                    credits_list = []
+                    for a in activities:
+                        # 不同 SDK 字段名可能是 camelCase
+                        name = a.get("title") or a.get("activityName") or a.get("name") or "AWS Credit"
+                        # 余额
+                        bal = a.get("currentBalanceAmount") or a.get("balance") or {}
+                        if isinstance(bal, dict):
+                            bal_val = float(bal.get("amount", 0) or 0)
+                            cur = bal.get("currencyCode") or "USD"
+                        else:
+                            bal_val = float(bal or 0); cur = "USD"
+                        # 总额
+                        amt = a.get("creditedAmount") or a.get("amount") or {}
+                        if isinstance(amt, dict):
+                            amt_val = float(amt.get("amount", 0) or 0)
+                        else:
+                            amt_val = float(amt or 0)
+                        used_val = max(amt_val - bal_val, 0)
+                        exp = a.get("expirationDate") or a.get("expiresAt")
+                        exp_str = str(exp)[:10] if exp else None
+                        if exp_str and (expires_min is None or exp_str < expires_min):
+                            expires_min = exp_str
+                        total_balance += bal_val
+                        total_amount += amt_val
+                        total_used += used_val
+                        result["currency"] = cur or result["currency"]
+                        credits_list.append({
+                            "name": name,
+                            "balance": round(bal_val, 2),
+                            "total": round(amt_val, 2),
+                            "used": round(used_val, 2),
+                            "expires_at": exp_str,
+                            "status": a.get("status") or "ACTIVE",
+                        })
+                    result.update({
+                        "balance": round(total_balance, 2),
+                        "total": round(total_amount, 2),
+                        "used": round(total_used, 2),
+                        "expires_at": expires_min,
+                        "credits": credits_list,
+                        "source": "freetier",
+                    })
+                    return result
+                else:
+                    # 没有任何活动 → 该账号没有 Credit
+                    result["source"] = "freetier"
+                    return result
+            except Exception as e:
+                msg = str(e)
+                if "AccessDenied" in msg or "not authorized" in msg or "UnrecognizedClient" in msg:
+                    # 没权限就不报错（很多账号根本没分配 freetier 权限），回退到 cost explorer
+                    logger.info(f"freetier API not accessible, fallback to CE: {msg[:120]}")
+                else:
+                    logger.warning(f"freetier API failed: {e}")
+        except Exception as e:
+            logger.debug(f"freetier client init failed: {e}")
+
+        # 2) 回退: Cost Explorer 的 Credit 抵扣 (老兼容)
+        from datetime import date, timedelta
         try:
             ce = self._get_client("ce", "us-east-1")
             today = date.today()
             year_start = date(today.year, 1, 1)
-            # YTD by-month
             try:
                 resp = ce.get_cost_and_usage(
                     TimePeriod={"Start": str(year_start), "End": str(today)},
@@ -1137,47 +1296,32 @@ class AwsManager:
                     Metrics=["UnblendedCost"],
                     Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
                 )
-                total = 0.0
+                total_used = 0.0
                 currency = "USD"
-                monthly = []
                 for r in resp.get("ResultsByTime", []):
-                    start = r.get("TimePeriod", {}).get("Start", "")
                     amt_obj = r.get("Total", {}).get("UnblendedCost", {})
-                    amt = abs(float(amt_obj.get("Amount", 0) or 0))  # Credit 是负值，用绝对值
+                    amt = abs(float(amt_obj.get("Amount", 0) or 0))
                     currency = amt_obj.get("Unit") or currency
-                    total += amt
-                    monthly.append({"month": start[:7], "amount": round(amt, 2)})
-                result["currency"] = currency
-                result["credits_used_ytd"] = round(total, 2)
-                result["monthly"] = monthly
+                    total_used += amt
+                result.update({
+                    "currency": currency,
+                    "used": round(total_used, 2),
+                    "balance": 0.0,    # Cost Explorer 只能查已抵扣，不能查余额
+                    "total": round(total_used, 2),  # 至少证明历史上有过 credit
+                    "source": "cost_explorer",
+                })
+                return result
             except Exception as e:
                 msg = str(e)
                 if "AccessDenied" in msg or "not authorized" in msg:
-                    result["error"] = "无 Cost Explorer 权限 (ce:GetCostAndUsage)"
+                    # freetier 也没权限，cost explorer 也没权限 → 报无权限
+                    result["error"] = "无权限查询 Credit (需要 freetier:GetFreeTierUsage 或 ce:GetCostAndUsage 之一)"
                 elif "DataUnavailable" in msg or "has not yet been activated" in msg:
-                    result["error"] = "Cost Explorer 未启用，请在 Billing Console 启用"
+                    result["error"] = "Cost Explorer 未启用 且 freetier API 不可用"
                 else:
-                    result["error"] = f"查询失败: {msg[:160]}"
-
-            # 近 30 天
-            try:
-                d_start = today - timedelta(days=30)
-                resp30 = ce.get_cost_and_usage(
-                    TimePeriod={"Start": str(d_start), "End": str(today)},
-                    Granularity="MONTHLY",
-                    Metrics=["UnblendedCost"],
-                    Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
-                )
-                total30 = 0.0
-                for r in resp30.get("ResultsByTime", []):
-                    amt = abs(float(r.get("Total", {}).get("UnblendedCost", {}).get("Amount", 0) or 0))
-                    total30 += amt
-                result["credits_used_last_30d"] = round(total30, 2)
-            except Exception:
-                pass
-
+                    result["error"] = f"Credit 查询失败: {msg[:160]}"
         except Exception as e:
-            result["error"] = f"查询异常: {str(e)[:160]}"
+            result["error"] = f"Credit 查询异常: {str(e)[:160]}"
         return result
 
     # ==================== 账单查询 ====================

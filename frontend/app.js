@@ -250,23 +250,49 @@ function _renderAccountCardHtml(a) {
     const age = timeAgo(a.register_time || a.added_at);
     const flag = a.country_flag || '';
     const vcpuUsage = a.total_usage || 0;
-    const vcpuText = a.max_on_demand ? `${vcpuUsage}/${a.max_on_demand} vCPUs` : '';
+    const status = a.account_status || 'unknown';
+    const isBad = (status === 'invalid_credentials' || status === 'disabled');
+    // vCPU 文本：账号失效或被禁用 → 直接显示状态文字而非数字
+    let vcpuText;
+    if (status === 'invalid_credentials') vcpuText = 'AK/SK 失效';
+    else if (status === 'disabled') vcpuText = '账号被禁用';
+    else if (a.max_on_demand) vcpuText = `${vcpuUsage}/${a.max_on_demand} vCPUs`;
+    else vcpuText = '';
+    const vcpuClass = isBad ? 'acc-vcpu bad' : (a.max_on_demand === 0 ? 'acc-vcpu warn' : 'acc-vcpu');
+    const vcpuTitle = isBad ? (a.status_reason || status) : '点击查看 vCPU 详情';
     const checked = selectedAccounts.has(a.id) ? 'checked' : '';
+
+    // 状态徽章 (失效/禁用时显示)
+    let statusBadge = '';
+    if (status === 'invalid_credentials') {
+        statusBadge = `<span class="acc-status bad" title="${(a.status_reason||'AK/SK 失效').replace(/"/g,'&quot;')}">❌ AK/SK 失效</span>`;
+    } else if (status === 'disabled') {
+        statusBadge = `<span class="acc-status bad" title="${(a.status_reason||'账号被 AWS 禁用').replace(/"/g,'&quot;')}">🚫 账号已禁用</span>`;
+    }
 
     // Credit 徽章 (从前端缓存读取，未查询过显示问号)
     const cred = _creditCache[a.id];
     let credBadge = '';
     if (cred) {
         if (cred.error) {
-            credBadge = `<span class="acc-credit error" onclick="loadCredit(${a.id})" title="${cred.error}">💎 Credit 错误</span>`;
+            credBadge = `<span class="acc-credit error" onclick="showCreditDetail(${a.id})" title="${cred.error}">💎 Credit 错误</span>`;
         } else {
-            const ytd = cred.credits_used_ytd || 0;
+            // 优先显示余额 (balance)，没有则显示已用 (used)
             const cur = cred.currency || 'USD';
             const sign = cur === 'USD' ? '$' : (cur === 'CNY' ? '¥' : '');
-            credBadge = `<span class="acc-credit" onclick="loadCredit(${a.id})" title="本年已抵扣 Credit (点击刷新)">💎 ${sign}${ytd.toFixed(2)} ${cur}</span>`;
+            const balance = cred.balance || 0;
+            const used = cred.used || 0;
+            const total = cred.total || 0;
+            if (balance > 0) {
+                credBadge = `<span class="acc-credit good" onclick="showCreditDetail(${a.id})" title="可用 Credit 余额 ${sign}${balance.toFixed(2)} (点击查看详情)">💎 ${sign}${balance.toFixed(2)} ${cur}</span>`;
+            } else if (total > 0) {
+                credBadge = `<span class="acc-credit used" onclick="showCreditDetail(${a.id})" title="历史 Credit 已用完 (点击查看详情)">💎 已用完 (${sign}${used.toFixed(2)})</span>`;
+            } else {
+                credBadge = `<span class="acc-credit none" onclick="showCreditDetail(${a.id})" title="该账号没有 Credit 余额 (点击查看详情)">💎 无 Credit</span>`;
+            }
         }
     } else {
-        credBadge = `<span class="acc-credit unknown" onclick="loadCredit(${a.id})" title="点击查询 AWS Credit 抵扣额度">💎 Credit ?</span>`;
+        credBadge = `<span class="acc-credit unknown" onclick="loadCredit(${a.id})" title="点击查询 AWS Credit 余额">💎 Credit ?</span>`;
     }
 
     return `
@@ -278,7 +304,8 @@ function _renderAccountCardHtml(a) {
                     <span class="acc-name" title="${displayName}">${displayName.length > 22 ? displayName.substring(0,22)+'...' : displayName}</span>
                     ${flag ? `<span class="acc-flag">${flag}</span>` : ''}
                     ${age ? `<span class="acc-age">${age}</span>` : ''}
-                    ${vcpuText ? `<span class="acc-vcpu" onclick="showVcpuDetail(${a.id})" title="点击查看 vCPU 详情">⚡ ${vcpuText}</span>` : ''}
+                    ${statusBadge}
+                    ${vcpuText ? `<span class="${vcpuClass}" onclick="showVcpuDetail(${a.id})" title="${vcpuTitle.replace(/"/g,'&quot;')}">⚡ ${vcpuText}</span>` : ''}
                     ${credBadge}
                     <span class="acc-instances ${(a.instance_count||0) > 0 ? 'has' : ''}" onclick="viewAccountInstances(${a.id})" title="查看该账号的实例">🖥 ${a.instance_count || 0} 实例</span>
                 </div>
@@ -425,14 +452,13 @@ window.addEventListener('resize', () => {
     document.querySelectorAll('.acc-menu-popup.show').forEach(p => p.classList.remove('show'));
 });
 
-// ==================== AWS Credit (本年已抵扣) ====================
-const _creditCache = {};   // {accountId: {credits_used_ytd, currency, error}}
+// ==================== AWS Credit (FreeTier API: 余额/总额/已用/过期) ====================
+const _creditCache = {};   // {accountId: {balance, used, total, currency, expires_at, credits[], source, error}}
 let _creditLoading = new Set();
 
 async function loadCredit(accountId) {
     if (_creditLoading.has(accountId)) return;
     _creditLoading.add(accountId);
-    // 立即更新 UI 占位为加载中
     const card = document.querySelector(`.acc-card[data-id="${accountId}"]`);
     if (card) {
         const el = card.querySelector('.acc-credit');
@@ -442,7 +468,15 @@ async function loadCredit(accountId) {
         const res = await api(`/accounts/${accountId}/credits?_ts=${Date.now()}`);
         _creditCache[accountId] = res;
         if (!res.error) {
-            toast(`Credit 查询完成: ${res.currency} ${res.credits_used_ytd?.toFixed(2) || 0}`);
+            const sign = (res.currency || 'USD') === 'USD' ? '$' : '';
+            const bal = res.balance || 0;
+            if (bal > 0) {
+                toast(`💎 Credit 余额: ${sign}${bal.toFixed(2)} ${res.currency || 'USD'}`);
+            } else if ((res.total || 0) > 0) {
+                toast(`💎 Credit 已用完 (历史 ${sign}${(res.used || 0).toFixed(2)})`, 'info');
+            } else {
+                toast('💎 该账号没有 Credit', 'info');
+            }
         } else {
             toast(`⚠️ ${res.error}`, 'warning');
         }
@@ -451,7 +485,6 @@ async function loadCredit(accountId) {
         toast(e.message, 'error');
     } finally {
         _creditLoading.delete(accountId);
-        // 局部更新该卡片的 credit 徽章
         updateCreditBadge(accountId);
     }
 }
@@ -462,23 +495,123 @@ function updateCreditBadge(accountId) {
     const el = card.querySelector('.acc-credit');
     if (!el) return;
     const cred = _creditCache[accountId];
-    el.classList.remove('loading', 'error', 'unknown');
+    el.classList.remove('loading', 'error', 'unknown', 'good', 'used', 'none');
     if (!cred) {
         el.classList.add('unknown');
         el.innerHTML = '💎 Credit ?';
+        el.onclick = () => loadCredit(accountId);
         return;
     }
     if (cred.error) {
         el.classList.add('error');
         el.title = cred.error;
         el.innerHTML = '💎 Credit 错误';
+        el.onclick = () => showCreditDetail(accountId);
         return;
     }
-    const ytd = cred.credits_used_ytd || 0;
     const cur = cred.currency || 'USD';
     const sign = cur === 'USD' ? '$' : (cur === 'CNY' ? '¥' : '');
-    el.title = `本年 (${cred.year}) 已抵扣 Credit · 近30天 ${sign}${(cred.credits_used_last_30d||0).toFixed(2)} · 点击刷新`;
-    el.innerHTML = `💎 ${sign}${ytd.toFixed(2)} ${cur}`;
+    const balance = cred.balance || 0;
+    const used = cred.used || 0;
+    const total = cred.total || 0;
+    if (balance > 0) {
+        el.classList.add('good');
+        el.title = `可用 Credit 余额 ${sign}${balance.toFixed(2)}${cred.expires_at ? ' · 到期 ' + cred.expires_at : ''} · 点击查看详情`;
+        el.innerHTML = `💎 ${sign}${balance.toFixed(2)} ${cur}`;
+    } else if (total > 0) {
+        el.classList.add('used');
+        el.title = `历史 Credit 已用完 (${sign}${used.toFixed(2)})`;
+        el.innerHTML = `💎 已用完 (${sign}${used.toFixed(2)})`;
+    } else {
+        el.classList.add('none');
+        el.title = '该账号没有 Credit 余额';
+        el.innerHTML = '💎 无 Credit';
+    }
+    el.onclick = () => showCreditDetail(accountId);
+}
+
+// 点击徽章弹出 Credit 详情对话框
+async function showCreditDetail(accountId) {
+    let cred = _creditCache[accountId];
+    if (!cred) {
+        await loadCredit(accountId);
+        cred = _creditCache[accountId];
+    }
+    if (!cred) return;
+    const a = accountsCache.find(x => x.id === accountId);
+    const accName = a ? (a.email || a.name || ('#' + accountId)) : ('#' + accountId);
+
+    const cur = cred.currency || 'USD';
+    const sign = cur === 'USD' ? '$' : '';
+    let html = `
+        <div style="padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:12px;color:var(--text2);font-size:13px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <span>账号: <b style="color:var(--text)">${accName}</b></span>
+            <button class="btn btn-sm btn-secondary" onclick="loadCredit(${accountId}).then(()=>showCreditDetail(${accountId}))">🔄 刷新</button>
+        </div>
+    `;
+    if (cred.error) {
+        html += `<div style="padding:14px;background:rgba(239,68,68,0.1);border:1px solid var(--red);border-radius:8px;color:var(--red);font-size:13px;line-height:1.6">
+            <b>⚠️ 查询失败</b><br>${cred.error}
+        </div>`;
+    } else {
+        const balance = cred.balance || 0;
+        const used = cred.used || 0;
+        const total = cred.total || 0;
+        const pct = total > 0 ? Math.min((used / total) * 100, 100) : 0;
+        html += `
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px">
+                <div class="stat-card" style="padding:14px"><div class="label">可用余额</div><div class="value ${balance>0?'green':''}" style="font-size:24px">${sign}${balance.toFixed(2)} ${cur}</div></div>
+                <div class="stat-card" style="padding:14px"><div class="label">已使用</div><div class="value yellow" style="font-size:22px">${sign}${used.toFixed(2)}</div></div>
+                <div class="stat-card" style="padding:14px"><div class="label">总额度</div><div class="value blue" style="font-size:22px">${sign}${total.toFixed(2)}</div></div>
+                <div class="stat-card" style="padding:14px"><div class="label">最近到期</div><div class="value" style="font-size:14px;color:var(--text2)">${cred.expires_at || '-'}</div></div>
+            </div>
+            <div style="margin-bottom:14px">
+                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text2);margin-bottom:4px"><span>使用进度</span><span>${pct.toFixed(1)}%</span></div>
+                <div style="background:var(--bg3);border-radius:6px;height:14px;overflow:hidden"><div style="background:linear-gradient(90deg,var(--green),var(--yellow));height:100%;width:${pct.toFixed(1)}%"></div></div>
+            </div>
+            <div style="font-size:12px;color:var(--text2);margin-bottom:6px">数据源: <code>${cred.source || 'unknown'}</code> ${cred.source === 'freetier' ? '(AWS FreeTier API · 独立项，与账单无关)' : (cred.source === 'cost_explorer' ? '(Cost Explorer 历史抵扣)' : '')}</div>
+        `;
+        const credits = cred.credits || [];
+        if (credits.length) {
+            html += `<div class="ai-section"><div class="ai-section-title">📋 Credit 明细 (${credits.length})</div><div class="ai-section-body">
+                <table class="ai-table"><thead><tr><th>名称</th><th style="text-align:right">余额</th><th style="text-align:right">总额</th><th style="text-align:right">已用</th><th>到期</th><th>状态</th></tr></thead><tbody>`;
+            for (const c of credits) {
+                html += `<tr>
+                    <td>${c.name || '-'}</td>
+                    <td style="text-align:right;color:var(--green);font-weight:600">${sign}${(c.balance||0).toFixed(2)}</td>
+                    <td style="text-align:right">${sign}${(c.total||0).toFixed(2)}</td>
+                    <td style="text-align:right;color:var(--yellow)">${sign}${(c.used||0).toFixed(2)}</td>
+                    <td>${c.expires_at || '-'}</td>
+                    <td><span class="badge badge-${c.status === 'ACTIVE' ? 'green' : 'gray'}">${c.status || '-'}</span></td>
+                </tr>`;
+            }
+            html += '</tbody></table></div></div>';
+        } else if (!cred.error) {
+            html += `<div style="padding:20px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">该账号没有 Credit 活动 (没有 Free Tier 也没有 Promotional Credit)</div>`;
+        }
+    }
+    showCreditModal(html);
+}
+
+function showCreditModal(html) {
+    let modal = document.getElementById('credit-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'credit-modal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content" style="max-width:720px;width:92%">
+                <div class="modal-header">
+                    <h3>💎 AWS Credit 详情</h3>
+                    <button class="modal-close" onclick="hideModal('credit-modal')">×</button>
+                </div>
+                <div class="modal-body" id="credit-modal-body"></div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    }
+    document.getElementById('credit-modal-body').innerHTML = html;
+    modal.classList.add('show');
 }
 
 async function loadAllCredits() {

@@ -196,6 +196,9 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
                 "max_on_demand": getattr(a, 'max_on_demand', 0) or 0,
                 "total_usage": getattr(a, 'total_usage', 0) or 0,
                 "vcpu_data": getattr(a, 'vcpu_data', None),
+                "account_status": getattr(a, 'account_status', 'unknown') or 'unknown',
+                "status_reason": getattr(a, 'status_reason', '') or '',
+                "status_checked_at": str(a.status_checked_at) if getattr(a, 'status_checked_at', None) else None,
             })
         except Exception as e:
             logger.error(f"Error serializing account {a.id}: {e}")
