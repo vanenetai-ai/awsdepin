@@ -807,12 +807,16 @@ async function loadAccountInstancesDetail() {
     if (!_acctInstAccountId) return;
     const body = document.getElementById('acct-instances-list');
     const summary = document.getElementById('acct-instances-summary');
-    const managedOnly = document.getElementById('acct-inst-managed-only')?.checked ? '0' : '1';
+    // 修复: 复选框「仅本平台创建」逻辑
+    //   不勾 (默认) → 显示账号下所有 EC2 实例 → all_managed=true
+    //   勾选        → 只显示带 ManagedBy 标签的本平台实例 → all_managed=false
+    const onlyManaged = !!document.getElementById('acct-inst-managed-only')?.checked;
     body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在并发扫描所有区域 EC2 实例（约 10-30 秒）...</div></div>`;
     summary.innerHTML = '';
     try {
-        const url = `/accounts/${_acctInstAccountId}/ec2-detail?all_managed=${managedOnly === '1' ? 'false' : 'true'}&_ts=${Date.now()}`;
+        const url = `/accounts/${_acctInstAccountId}/ec2-detail?all_managed=${onlyManaged ? 'false' : 'true'}&_ts=${Date.now()}`;
         const res = await api(url);
+
         _acctInstData = res.instances || [];
 
         // 填充区域下拉
