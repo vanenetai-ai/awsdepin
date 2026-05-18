@@ -627,14 +627,110 @@ async function loadAllCredits() {
 }
 
 // ==================== 菜单中的占位/快捷功能 ====================
-function enableAllRegions(id) {
+async function enableAllRegions(id) {
     const a = accountsCache.find(x => x.id === id);
     if (!a) return;
-    const url = `https://${a.aws_account_id ? a.aws_account_id + '.signin.aws.amazon.com/console' : 'console.aws.amazon.com'}/billing/home?#/account`;
-    copyToClipboard(a.access_key_id || '', null);
-    toast('已复制 Access Key，请在 AWS 控制台 Account → AWS Regions 启用 opt-in 区域', 'info');
-    window.open('https://console.aws.amazon.com/billing/home?#/account', '_blank');
+    if (!confirm(`将通过该账号的 AK/SK 直接启用所有 opt-in 区域 (调用 AWS account:EnableRegion API)。\n\n包括: 香港 / 中东 / 非洲 / 雅加达 / 墨尔本 / 苏黎世 / 海德拉巴 / 西班牙 / 特拉维夫 / 加拿大西部 等\n\n继续？`)) return;
+
+    showLoading('正在启用所有 opt-in 区域 (并发, 约 5-10 秒)...');
+    try {
+        const res = await api(`/accounts/${id}/enable-all-regions`, { method: 'POST' });
+        if (res.error) {
+            toast(`⚠️ ${res.error}`, 'error');
+            return;
+        }
+        const total = res.total || 0;
+        const ok = res.newly_enabled || 0;
+        const already = res.already_enabled || 0;
+        const failed = (res.failed || []).length;
+
+        // 弹一个详细结果对话框
+        showEnableRegionsResult(a, res);
+
+        if (failed > 0) {
+            toast(`完成: ${ok} 个新启用, ${already} 个已启用, ${failed} 个失败`, 'warning');
+        } else {
+            toast(`✅ 完成: ${ok} 个新启用, ${already} 个已启用 (总 ${total})`);
+        }
+        // 刷新账号列表 (vCPU 配额会变)
+        setTimeout(loadAccounts, 1000);
+    } catch (e) {
+        if ((e.message || '').includes('AccessDenied') || (e.message || '').includes('not authorized')) {
+            // 兜底: 没权限就退回到打开控制台
+            if (confirm(`API 调用失败 (无 account:EnableRegion 权限)。\n\n是否打开 AWS 控制台手动启用？\n\n错误: ${e.message}`)) {
+                copyToClipboard(a.access_key_id || '', null);
+                window.open('https://console.aws.amazon.com/billing/home?#/account', '_blank');
+                toast('已复制 Access Key，请到控制台 Account → AWS Regions 手动启用', 'info');
+            }
+        } else {
+            toast(`启用失败: ${e.message}`, 'error');
+        }
+    } finally {
+        hideLoading();
+    }
 }
+
+function showEnableRegionsResult(account, res) {
+    const accName = account.email || account.name || ('#' + account.id);
+    const STATUS_MAP = {
+        'enabled':              { color: 'green', icon: '✅', text: '已启用 (开通中, 约 5-15 分钟生效)' },
+        'enabling_in_progress': { color: 'yellow', icon: '⏳', text: '正在开通中' },
+        'already_enabled':      { color: 'blue', icon: '☑️', text: '本来就已启用' },
+        'failed':               { color: 'red', icon: '❌', text: '失败' },
+        'skipped':              { color: 'gray', icon: '—', text: '跳过' },
+    };
+
+    const sorted = [...(res.regions || [])].sort((a, b) => {
+        const order = { 'enabled': 0, 'enabling_in_progress': 1, 'already_enabled': 2, 'failed': 3, 'skipped': 4 };
+        return (order[a.status] || 99) - (order[b.status] || 99);
+    });
+
+    let html = `
+        <div style="padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:12px;font-size:13px;color:var(--text2)">
+            账号: <b style="color:var(--text)">${accName}</b>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px">
+            <div class="stat-card" style="padding:12px"><div class="label">总 opt-in 区域</div><div class="value blue" style="font-size:22px">${res.total || 0}</div></div>
+            <div class="stat-card" style="padding:12px"><div class="label">新启用</div><div class="value green" style="font-size:22px">${res.newly_enabled || 0}</div></div>
+            <div class="stat-card" style="padding:12px"><div class="label">已启用</div><div class="value" style="font-size:22px;color:var(--text2)">${res.already_enabled || 0}</div></div>
+            <div class="stat-card" style="padding:12px"><div class="label">失败</div><div class="value ${(res.failed||[]).length>0?'yellow':''}" style="font-size:22px">${(res.failed || []).length}</div></div>
+        </div>
+        <table class="ai-table">
+            <thead><tr><th>区域</th><th>状态</th><th>之前</th><th>之后</th></tr></thead>
+            <tbody>
+    `;
+    for (const r of sorted) {
+        const s = STATUS_MAP[r.status] || { color: 'gray', icon: '?', text: r.status };
+        html += `<tr>
+            <td><code style="font-size:12px">${r.region}</code></td>
+            <td><span class="badge badge-${s.color}">${s.icon} ${s.text}</span>${r.error ? ` <span style="color:var(--red);font-size:11px" title="${r.error.replace(/"/g,'&quot;')}">⚠</span>` : ''}</td>
+            <td style="font-size:11px;color:var(--text2)">${r.before || '-'}</td>
+            <td style="font-size:11px;color:var(--text2)">${r.after || '-'}</td>
+        </tr>`;
+    }
+    html += '</tbody></table>';
+    if ((res.failed || []).length > 0) {
+        html += `<div style="margin-top:10px;padding:10px 12px;background:rgba(245,158,11,0.1);border:1px solid var(--yellow);border-radius:8px;font-size:12px;color:var(--text2);line-height:1.6">
+            <b>⚠ 失败原因</b>
+            <ul style="margin:6px 0 0 18px;padding:0">${(res.failed || []).map(f => `<li><code>${f.region}</code>: ${f.error}</li>`).join('')}</ul>
+        </div>`;
+    }
+    html += `<div style="margin-top:10px;padding:10px 12px;background:rgba(59,130,246,0.1);border:1px solid var(--blue);border-radius:8px;font-size:12px;color:var(--text2);line-height:1.6">
+        <b>💡 提示</b>: 新启用的区域 AWS 后台需要 <b>5-15 分钟</b> 才会真正生效。生效后再点账号卡片的「⚡ vCPU」或「实例」会看到这些新区域。
+    </div>`;
+
+    // 用 credit-modal 容器复用一下样式
+    showCreditModal(html);
+    // 改下标题
+    setTimeout(() => {
+        const m = document.getElementById('credit-modal');
+        if (m) {
+            const h = m.querySelector('.modal-header h3');
+            if (h) h.textContent = '🌐 启用 AWS opt-in 区域 - 结果';
+        }
+    }, 30);
+}
+
 
 function showFreeTier(id) {
     // AWS 免费套餐控制台
@@ -1423,35 +1519,54 @@ function renderBilling(data, year, month) {
     }
 
     const period = data.period || {};
-    const total = data.total || 0;
+    const total = data.total || 0;          // 实付 (NetUnblendedCost) - 与 AWS 控制台一致
+    const grossTotal = data.gross_total || 0; // 毛额 (UnblendedCost)
+    const creditsUsed = data.credits_used || 0;  // 本期 Credit 抵扣
+    const refunds = data.refunds || 0;       // 退款
     const currency = data.currency || 'USD';
     const services = data.by_service || [];
     const regions = data.by_region || [];
+    const recordTypes = data.by_record_type || [];
     const daily = data.daily || [];
 
-    // 汇总头
+    // 汇总头 - 显示实付 / 毛额 / Credit 抵扣三栏
     let html = `
         <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
-            <div class="stat-card" style="flex:1;min-width:160px;padding:14px">
-                <div class="label">${year} 年 ${month} 月 总消费</div>
-                <div class="value ${total>0?'yellow':''}" style="font-size:22px">${fmtMoney(total, currency)}</div>
+            <div class="stat-card" style="flex:1;min-width:170px;padding:14px;border:2px solid var(--primary)">
+                <div class="label">${year} 年 ${month} 月 实付 (账单)</div>
+                <div class="value ${total>0.01?'yellow':'green'}" style="font-size:24px">${fmtMoney(total, currency)}</div>
+                <div style="font-size:10px;color:var(--text2);margin-top:2px">NetUnblendedCost · 与 AWS 账单一致</div>
             </div>
             <div class="stat-card" style="flex:1;min-width:160px;padding:14px">
+                <div class="label">毛额 (折扣前)</div>
+                <div class="value" style="font-size:20px;color:var(--text2)">${fmtMoney(grossTotal, currency)}</div>
+                <div style="font-size:10px;color:var(--text2);margin-top:2px">UnblendedCost · list 价</div>
+            </div>
+            <div class="stat-card" style="flex:1;min-width:160px;padding:14px">
+                <div class="label">Credit 抵扣</div>
+                <div class="value ${creditsUsed>0.01?'green':''}" style="font-size:20px">−${fmtMoney(creditsUsed, currency)}</div>
+                <div style="font-size:10px;color:var(--text2);margin-top:2px">本期 Free Tier / Promotional</div>
+            </div>
+            ${refunds > 0.01 ? `<div class="stat-card" style="flex:1;min-width:140px;padding:14px">
+                <div class="label">退款</div>
+                <div class="value blue" style="font-size:20px">−${fmtMoney(refunds, currency)}</div>
+            </div>` : ''}
+            <div class="stat-card" style="flex:1;min-width:140px;padding:14px">
                 <div class="label">时间区间</div>
-                <div class="value" style="font-size:14px;font-weight:600;color:var(--text2)">${period.start || '-'} ~ ${period.end || '-'}</div>
+                <div class="value" style="font-size:13px;font-weight:600;color:var(--text2)">${period.start || '-'} ~ ${period.end || '-'}</div>
             </div>
-            <div class="stat-card" style="flex:1;min-width:120px;padding:14px">
-                <div class="label">服务项数</div>
-                <div class="value blue" style="font-size:22px">${services.length}</div>
-            </div>
+        </div>
+        <div style="padding:8px 12px;background:rgba(59,130,246,0.08);border:1px solid var(--blue);border-radius:6px;margin-bottom:14px;font-size:12px;color:var(--text2);line-height:1.6">
+            💡 <b>实付 = 毛额 − Credit 抵扣 − 退款</b>。 ${total > 0.01 ? `本期实际从信用卡扣 <b style="color:var(--yellow)">${fmtMoney(total, currency)}</b>` : `本期 Credit 完全覆盖, 实际<b style="color:var(--green)">不扣款</b>`}
         </div>`;
 
     // 无消费
-    if (total <= 0 && !services.length) {
+    if (Math.abs(total) < 0.01 && Math.abs(grossTotal) < 0.01 && !services.length) {
         html += `<div style="padding:20px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">✅ 该月无账单消费</div>`;
         body.innerHTML = html;
         return;
     }
+
 
     // 按服务
     if (services.length) {

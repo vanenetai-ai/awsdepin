@@ -338,7 +338,32 @@ async def list_regions(account_id: int, user: User = Depends(get_current_user), 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, lambda: AwsManager(account, db).list_regions())
 
+
+@app.post("/api/accounts/{account_id}/enable-all-regions")
+async def enable_all_regions(
+    account_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """通过 AK/SK 直接启用账号下所有 opt-in 区域 (调 account:EnableRegion API)。
+
+    需要凭证有 account:EnableRegion 权限 (AdministratorAccess / 根用户默认有)。
+    返回每个区域的启用结果。
+    """
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).enable_all_regions())
+    except Exception as e:
+        raise HTTPException(400, f"启用区域失败: {str(e)[:300]}")
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
 @app.post("/api/accounts/{account_id}/detect")
+
 async def detect_account(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """检测账号信息: 邮箱、注册时间、国家、ARN"""
     account = _get_user_account(db, user, account_id)

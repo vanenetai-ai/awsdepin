@@ -178,9 +178,118 @@ class AwsManager:
         return "unknown"
 
     def list_regions(self) -> list:
+        """列出已启用的区域 (含 opt-in 已开启的)"""
         ec2 = self._get_client("ec2", "us-east-1")
-        resp = ec2.describe_regions()
+        resp = ec2.describe_regions(AllRegions=False)
         return [r["RegionName"] for r in resp["Regions"]]
+
+    def list_all_regions(self) -> list:
+        """列出所有 AWS 区域 (含未启用的 opt-in)。用于全量扫描。"""
+        try:
+            ec2 = self._get_client("ec2", "us-east-1")
+            resp = ec2.describe_regions(AllRegions=True)
+            return [(r["RegionName"], r.get("OptInStatus", "opt-in-not-required")) for r in resp["Regions"]]
+        except Exception as e:
+            logger.warning(f"list_all_regions failed: {e}")
+            return [(r, "opt-in-not-required") for r in REGION_DISPLAY.keys()]
+
+    def list_enabled_regions(self) -> list:
+        """只列出已启用 (opted-in 或默认开启) 的区域 - 用于扫描实例时避免 opt-in 未开启的报错"""
+        try:
+            ec2 = self._get_client("ec2", "us-east-1")
+            resp = ec2.describe_regions(AllRegions=True)
+            enabled = []
+            for r in resp["Regions"]:
+                status = r.get("OptInStatus", "opt-in-not-required")
+                if status in ("opt-in-not-required", "opted-in"):
+                    enabled.append(r["RegionName"])
+            return enabled
+        except Exception as e:
+            logger.warning(f"list_enabled_regions failed: {e}")
+            return list(REGION_DISPLAY.keys())
+
+    def enable_all_regions(self) -> dict:
+        """通过 account API 启用所有 opt-in 区域。
+        要求账号有 account:EnableRegion 权限 (root / AdminAccess 默认有)。
+
+        返回:
+        {
+            "total": 18,            # 总 opt-in 区域数
+            "already_enabled": 3,
+            "newly_enabled": 5,
+            "failed": [{region, error}],
+            "regions": [{region, status, before, after}]
+        }
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        result = {
+            "total": 0,
+            "already_enabled": 0,
+            "newly_enabled": 0,
+            "failed": [],
+            "regions": [],
+        }
+        # 1) 列出全部区域 (含 opt-in 状态)
+        try:
+            ec2 = self._get_client("ec2", "us-east-1")
+            resp = ec2.describe_regions(AllRegions=True)
+            all_regions = resp["Regions"]
+        except Exception as e:
+            return {"error": f"无法列出区域: {str(e)[:200]}", **result}
+
+        # 2) 取出所有 opt-in 区域 (status != opt-in-not-required 的都是要 opt-in 的)
+        opt_in_regions = [
+            (r["RegionName"], r.get("OptInStatus"))
+            for r in all_regions
+            if r.get("OptInStatus") in ("not-opted-in", "opted-in", "enabling", "disabling")
+        ]
+        result["total"] = len(opt_in_regions)
+
+        # 3) 已启用的直接计数, 未启用的并行调 enable_region
+        try:
+            account_client = self._get_client("account", "us-east-1")
+        except Exception as e:
+            return {"error": f"无法初始化 account client: {str(e)[:200]}", **result}
+
+        def _enable_one(region: str, current_status: str):
+            entry = {"region": region, "before": current_status, "after": current_status, "status": "skipped"}
+            if current_status == "opted-in":
+                entry["status"] = "already_enabled"
+                return entry
+            if current_status == "enabling":
+                entry["status"] = "enabling_in_progress"
+                entry["after"] = "enabling"
+                return entry
+            try:
+                account_client.enable_region(RegionName=region)
+                entry["status"] = "enabled"
+                entry["after"] = "enabling"
+            except Exception as e:
+                msg = str(e)
+                if "already" in msg.lower() and "enabled" in msg.lower():
+                    entry["status"] = "already_enabled"
+                    entry["after"] = "opted-in"
+                else:
+                    entry["status"] = "failed"
+                    entry["error"] = msg[:200]
+                    result["failed"].append({"region": region, "error": msg[:200]})
+            return entry
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(_enable_one, r, s): r for r, s in opt_in_regions}
+            for fut in as_completed(futs):
+                try:
+                    e = fut.result()
+                    result["regions"].append(e)
+                    if e["status"] == "already_enabled":
+                        result["already_enabled"] += 1
+                    elif e["status"] in ("enabled", "enabling_in_progress"):
+                        result["newly_enabled"] += 1
+                except Exception as ex:
+                    logger.warning(f"enable region future failed: {ex}")
+
+        return result
+
 
     def _ensure_security_group(self, region: str) -> str:
         ec2 = self._get_client("ec2", region)
@@ -445,12 +554,23 @@ class AwsManager:
         return items
 
     def list_instances_detailed_all_regions(self, regions: list = None, all_managed: bool = False) -> dict:
-        """并发扫描多个区域的实例详情；返回 {region: [items]}"""
+        """并发扫描所有已启用区域的实例详情；返回 {region: [items]}
+
+        默认行为变更: 不再只扫 REGION_DISPLAY 里的 17 个常用区域,
+        而是先调 describe_regions(AllRegions=True) 拿到所有 opted-in 区域 (含 hk/me/af/eu-south/jakarta/melbourne 等 opt-in),
+        覆盖账号实际能跑实例的所有地方。这样就不会"实例没全部检测出来"。
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         if not regions:
-            regions = list(REGION_DISPLAY.keys())
+            try:
+                regions = self.list_enabled_regions()
+                if not regions:
+                    regions = list(REGION_DISPLAY.keys())
+            except Exception as e:
+                logger.warning(f"list_enabled_regions failed, fallback to REGION_DISPLAY: {e}")
+                regions = list(REGION_DISPLAY.keys())
         out = {}
-        with ThreadPoolExecutor(max_workers=min(len(regions), 16)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(regions) or 1, 32)) as pool:
             futs = {pool.submit(self.list_instances_detailed, r, all_managed): r for r in regions}
             for fut in as_completed(futs):
                 r = futs[fut]
@@ -460,6 +580,7 @@ class AwsManager:
                     logger.warning(f"detailed scan {r} failed: {e}")
                     out[r] = []
         return out
+
 
     # ==================== 账号信息检测 ====================
 
@@ -1521,35 +1642,45 @@ class AwsManager:
     # ==================== 账单查询 ====================
     def get_billing(self, year: int, month: int, granularity: str = "DAILY") -> dict:
         """
-        查询指定年月的账单明细。
+        查询指定年月的账单明细，与 AWS 控制台 Billing 页面口径一致。
+
+        重点修复:
+        - 之前用 UnblendedCost 是「list 价 (含 Credit/折扣前)」，AWS 控制台显示的是
+          NetUnblendedCost (扣除 Credit / 退款 / 企业折扣后的真实付费金额)。
+        - 现在两个都查并返回:
+            total          = NetUnblendedCost  (实付, 与 AWS 控制台账单一致)
+            gross_total    = UnblendedCost     (毛额, 显示折扣前 list 价)
+            credits_used   = total_credits     (本期 Credit 抵扣金额)
+            refunds        = total_refunds     (本期退款)
+        - 每日走势, 按服务/按区域/按 RecordType 都改用 NetUnblendedCost
 
         返回结构:
         {
-            "period": {"start": "2026-05-01", "end": "2026-06-01"},
-            "total": 123.45,
+            "period": {"start": "...", "end": "..."},
+            "total": 12.34,           # NetUnblendedCost - 实付
+            "gross_total": 25.00,     # UnblendedCost - 毛额
+            "credits_used": 12.66,    # 本期 Credit 抵扣
+            "refunds": 0.0,
             "currency": "USD",
-            "by_service": [{"service": "Amazon Elastic Compute Cloud - Compute", "amount": 50.12}],
-            "by_region": [{"region": "us-east-1", "amount": 30.45}],
-            "daily": [{"date": "2026-05-01", "amount": 4.12}],   # granularity=DAILY 时有
-            "monthly_total": 123.45,
+            "by_service":     [...],  # 实付分服务 (NetUnblendedCost)
+            "by_region":      [...],
+            "by_record_type": [{"type":"Usage","amount":...},{"type":"Credit","amount":-12.66}],
+            "daily":          [{"date":..., "amount":..., "gross":...}],
+            "monthly_total":  12.34,
             "error": null
         }
         """
         from calendar import monthrange
         from datetime import date, timedelta
 
-        # Cost Explorer 是全局服务，端点固定在 us-east-1
         try:
-            # 参数校验
             if not (2000 <= year <= 2100):
                 return {"error": "年份无效", "total": 0, "by_service": [], "by_region": [], "daily": []}
             if not (1 <= month <= 12):
                 return {"error": "月份无效", "total": 0, "by_service": [], "by_region": [], "daily": []}
 
-            # 账单 API 的 End 是 exclusive，取下个月 1 号
             start_date = date(year, month, 1)
             last_day = monthrange(year, month)[1]
-            # End 不能超过 "今天"，否则 CE 会报错
             today = date.today()
             end_date = date(year, month, last_day) + timedelta(days=1)
             if end_date > today:
@@ -1562,90 +1693,141 @@ class AwsManager:
                 }
 
             period = {"Start": str(start_date), "End": str(end_date)}
-
             ce = self._get_client("ce", "us-east-1")
 
             result = {
                 "period": {"start": str(start_date), "end": str(end_date)},
                 "total": 0.0,
+                "gross_total": 0.0,
+                "credits_used": 0.0,
+                "refunds": 0.0,
                 "currency": "USD",
                 "by_service": [],
                 "by_region": [],
+                "by_record_type": [],
                 "daily": [],
                 "monthly_total": 0.0,
                 "error": None,
             }
 
-            # 1) 按服务分组（MONTHLY，一次返回整月汇总）
+            # 同时查 NetUnblendedCost (实付) 和 UnblendedCost (毛额)
+            METRICS = ["NetUnblendedCost", "UnblendedCost"]
+
+            def _amt(grp_or_total, key):
+                """兼容字段：若 NetUnblendedCost 不可用 (老账号), 退回 UnblendedCost"""
+                m = grp_or_total.get(key, {})
+                if not m or m.get("Amount") is None:
+                    m = grp_or_total.get("UnblendedCost", {})
+                return float(m.get("Amount", 0) or 0), (m.get("Unit") or "USD")
+
+            # 1) 按服务分组 (NetUnblendedCost - 实付)
             try:
                 resp = ce.get_cost_and_usage(
                     TimePeriod=period,
                     Granularity="MONTHLY",
-                    Metrics=["UnblendedCost"],
+                    Metrics=METRICS,
                     GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
                 )
-                svc_total = 0.0
+                svc_total_net, svc_total_gross = 0.0, 0.0
                 currency = "USD"
                 svc_agg = {}
                 for r in resp.get("ResultsByTime", []):
                     for g in r.get("Groups", []):
                         svc = g["Keys"][0] if g.get("Keys") else "-"
-                        amt_obj = g["Metrics"].get("UnblendedCost", {})
-                        amt = float(amt_obj.get("Amount", 0) or 0)
-                        currency = amt_obj.get("Unit") or currency
-                        svc_agg[svc] = svc_agg.get(svc, 0.0) + amt
-                        svc_total += amt
+                        net, cur = _amt(g["Metrics"], "NetUnblendedCost")
+                        gross, _ = _amt(g["Metrics"], "UnblendedCost")
+                        currency = cur or currency
+                        prev = svc_agg.get(svc, {"net": 0.0, "gross": 0.0})
+                        prev["net"] += net
+                        prev["gross"] += gross
+                        svc_agg[svc] = prev
+                        svc_total_net += net
+                        svc_total_gross += gross
                 result["currency"] = currency
-                result["monthly_total"] = round(svc_total, 4)
-                result["total"] = round(svc_total, 4)
+                result["total"] = round(svc_total_net, 4)
+                result["gross_total"] = round(svc_total_gross, 4)
+                result["monthly_total"] = round(svc_total_net, 4)
                 result["by_service"] = sorted(
-                    [{"service": k, "amount": round(v, 4)} for k, v in svc_agg.items() if v > 0],
+                    [{"service": k, "amount": round(v["net"], 4), "gross": round(v["gross"], 4)}
+                     for k, v in svc_agg.items() if abs(v["net"]) > 0.0001 or abs(v["gross"]) > 0.0001],
                     key=lambda x: x["amount"], reverse=True,
                 )
             except Exception as e:
                 msg = str(e)
                 if "AccessDenied" in msg or "not authorized" in msg:
-                    result["error"] = "凭证无 Cost Explorer 权限 (ce:GetCostAndUsage)，请在 IAM 授予 AWSBillingReadOnlyAccess 或类似权限。"
+                    result["error"] = "凭证无 Cost Explorer 权限 (ce:GetCostAndUsage)，请在 IAM 授予 AWSBillingReadOnlyAccess。"
                 elif "DataUnavailable" in msg or "has not yet been activated" in msg:
-                    result["error"] = "该账号尚未启用 Cost Explorer。请先登录 AWS 控制台 Billing → Cost Explorer 点击 'Enable Cost Explorer'，约 24h 后可查询。"
+                    result["error"] = "该账号尚未启用 Cost Explorer。请在 AWS 控制台 Billing → Cost Explorer 点 'Enable Cost Explorer'，约 24h 后可查询。"
                 else:
                     result["error"] = f"账单查询失败: {msg[:200]}"
                 return result
 
-            # 2) 按区域分组（MONTHLY）
+            # 2) 按区域分组 (NetUnblendedCost)
             try:
                 resp = ce.get_cost_and_usage(
                     TimePeriod=period,
                     Granularity="MONTHLY",
-                    Metrics=["UnblendedCost"],
+                    Metrics=METRICS,
                     GroupBy=[{"Type": "DIMENSION", "Key": "REGION"}],
                 )
                 reg_agg = {}
                 for r in resp.get("ResultsByTime", []):
                     for g in r.get("Groups", []):
                         reg = g["Keys"][0] if g.get("Keys") else "-"
-                        amt = float(g["Metrics"].get("UnblendedCost", {}).get("Amount", 0) or 0)
-                        reg_agg[reg or "-"] = reg_agg.get(reg or "-", 0.0) + amt
+                        net, _ = _amt(g["Metrics"], "NetUnblendedCost")
+                        reg_agg[reg or "-"] = reg_agg.get(reg or "-", 0.0) + net
                 result["by_region"] = sorted(
-                    [{"region": k, "amount": round(v, 4)} for k, v in reg_agg.items() if v > 0],
+                    [{"region": k, "amount": round(v, 4)} for k, v in reg_agg.items() if abs(v) > 0.0001],
                     key=lambda x: x["amount"], reverse=True,
                 )
             except Exception as e:
                 logger.warning(f"billing by region failed: {e}")
 
-            # 3) 每日走势
+            # 3) 按 RecordType 分组: 看 Usage / Credit / Refund / Tax 等
+            #    注意: Credit / Refund 在 UnblendedCost 里是负数 (= 抵扣金额)
+            try:
+                resp = ce.get_cost_and_usage(
+                    TimePeriod=period,
+                    Granularity="MONTHLY",
+                    Metrics=METRICS,
+                    GroupBy=[{"Type": "DIMENSION", "Key": "RECORD_TYPE"}],
+                )
+                rt_agg = {}
+                credits_used = 0.0
+                refunds = 0.0
+                for r in resp.get("ResultsByTime", []):
+                    for g in r.get("Groups", []):
+                        rt = g["Keys"][0] if g.get("Keys") else "-"
+                        # RecordType 用 UnblendedCost 才能看到 Credit 的负数
+                        gross, _ = _amt(g["Metrics"], "UnblendedCost")
+                        rt_agg[rt] = rt_agg.get(rt, 0.0) + gross
+                        if rt == "Credit":
+                            credits_used += abs(gross)
+                        elif rt == "Refund":
+                            refunds += abs(gross)
+                result["by_record_type"] = sorted(
+                    [{"type": k, "amount": round(v, 4)} for k, v in rt_agg.items() if abs(v) > 0.0001],
+                    key=lambda x: abs(x["amount"]), reverse=True,
+                )
+                result["credits_used"] = round(credits_used, 4)
+                result["refunds"] = round(refunds, 4)
+            except Exception as e:
+                logger.warning(f"billing by record_type failed: {e}")
+
+            # 4) 每日走势 (实付 + 毛额)
             if granularity.upper() == "DAILY":
                 try:
                     resp = ce.get_cost_and_usage(
                         TimePeriod=period,
                         Granularity="DAILY",
-                        Metrics=["UnblendedCost"],
+                        Metrics=METRICS,
                     )
                     daily = []
                     for r in resp.get("ResultsByTime", []):
                         d = r.get("TimePeriod", {}).get("Start", "")
-                        amt = float(r.get("Total", {}).get("UnblendedCost", {}).get("Amount", 0) or 0)
-                        daily.append({"date": d, "amount": round(amt, 4)})
+                        net, _ = _amt(r.get("Total", {}), "NetUnblendedCost")
+                        gross, _ = _amt(r.get("Total", {}), "UnblendedCost")
+                        daily.append({"date": d, "amount": round(net, 4), "gross": round(gross, 4)})
                     result["daily"] = daily
                 except Exception as e:
                     logger.warning(f"billing daily failed: {e}")
@@ -1656,6 +1838,7 @@ class AwsManager:
                 "error": f"账单查询异常: {str(e)[:200]}",
                 "total": 0, "by_service": [], "by_region": [], "daily": [],
             }
+
 
 
 
