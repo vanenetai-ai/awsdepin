@@ -1831,6 +1831,19 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             # 同时查 NetUnblendedCost (实付) 和 UnblendedCost (毛额)
             METRICS = ["NetUnblendedCost", "UnblendedCost"]
 
+            # ⚠️ 关键 Filter: AWS 控制台 "Charges by service" 页面排除 Credit/Refund/BundledDiscount
+            # 等抵扣类记录, 只显示原始用量 (pre-tax service charges)。
+            # 不加这个 Filter, 按 SERVICE 分组时同一服务的 Usage(+) 和 Credit(-) 会被加在一起求和,
+            # 导致看到的金额比控制台小很多 (例如 Kiro 643.82 - 361.29 credits = 282.53)。
+            EXCLUDE_CREDIT_FILTER = {
+                "Not": {
+                    "Dimensions": {
+                        "Key": "RECORD_TYPE",
+                        "Values": ["Credit", "Refund", "Bundled Discount"],
+                    }
+                }
+            }
+
             def _amt(grp_or_total, key):
                 """兼容字段：若 NetUnblendedCost 不可用 (老账号), 退回 UnblendedCost"""
                 m = grp_or_total.get(key, {})
@@ -1838,15 +1851,19 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                     m = grp_or_total.get("UnblendedCost", {})
                 return float(m.get("Amount", 0) or 0), (m.get("Unit") or "USD")
 
-            # 1) 按服务分组 (NetUnblendedCost - 实付)
+            # 1) 按服务分组 (UnblendedCost 毛额, 与 AWS 控制台 "Charges by service" 一致)
+            #    每个 Service 同时返回:
+            #      amount = UnblendedCost (毛额) - 与控制台一致
+            #      net    = NetUnblendedCost (实付, 已扣 Credit)
             try:
                 resp = ce.get_cost_and_usage(
                     TimePeriod=period,
                     Granularity="MONTHLY",
                     Metrics=METRICS,
                     GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+                    Filter=EXCLUDE_CREDIT_FILTER,
                 )
-                svc_total_net, svc_total_gross = 0.0, 0.0
+                svc_total_net_usage, svc_total_gross_usage = 0.0, 0.0
                 currency = "USD"
                 svc_agg = {}
                 for r in resp.get("ResultsByTime", []):
@@ -1859,14 +1876,12 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                         prev["net"] += net
                         prev["gross"] += gross
                         svc_agg[svc] = prev
-                        svc_total_net += net
-                        svc_total_gross += gross
+                        svc_total_net_usage += net
+                        svc_total_gross_usage += gross
                 result["currency"] = currency
-                result["total"] = round(svc_total_net, 4)
-                result["gross_total"] = round(svc_total_gross, 4)
-                result["monthly_total"] = round(svc_total_net, 4)
+                # by_service.amount 用 UnblendedCost 毛额 (对齐 AWS 控制台 "Charges by service")
                 result["by_service"] = sorted(
-                    [{"service": k, "amount": round(v["net"], 4), "gross": round(v["gross"], 4)}
+                    [{"service": k, "amount": round(v["gross"], 4), "net": round(v["net"], 4)}
                      for k, v in svc_agg.items() if abs(v["net"]) > 0.0001 or abs(v["gross"]) > 0.0001],
                     key=lambda x: x["amount"], reverse=True,
                 )
@@ -1880,20 +1895,45 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                     result["error"] = f"账单查询失败: {msg[:200]}"
                 return result
 
-            # 2) 按区域分组 (NetUnblendedCost)
+            # 1.5) 全月汇总 (不加 Filter, 包含 Credit/Refund) - 这才是真实"实付"和"毛额"
+            #      total       = NetUnblendedCost (实付, 与 AWS Bill 账单一致)
+            #      gross_total = UnblendedCost - Credit/Refund 抵扣 = pre-tax service charges
+            #      因为 by_service 已经排除 Credit/Refund, 所以 gross_total 直接用上面累计的就行
+            try:
+                resp_total = ce.get_cost_and_usage(
+                    TimePeriod=period,
+                    Granularity="MONTHLY",
+                    Metrics=METRICS,
+                )
+                month_net_total = 0.0
+                for r in resp_total.get("ResultsByTime", []):
+                    n, _ = _amt(r.get("Total", {}), "NetUnblendedCost")
+                    month_net_total += n
+                result["total"] = round(month_net_total, 4)
+                # gross_total 用排除 Credit/Refund 后的 by_service 总和 (= 控制台 "pre-tax service charges")
+                result["gross_total"] = round(svc_total_gross_usage, 4)
+                result["monthly_total"] = round(month_net_total, 4)
+            except Exception as e:
+                logger.warning(f"billing total failed: {e}")
+                result["total"] = round(svc_total_net_usage, 4)
+                result["gross_total"] = round(svc_total_gross_usage, 4)
+                result["monthly_total"] = round(svc_total_net_usage, 4)
+
+            # 2) 按区域分组 (UnblendedCost 毛额, 同样排除 Credit/Refund)
             try:
                 resp = ce.get_cost_and_usage(
                     TimePeriod=period,
                     Granularity="MONTHLY",
                     Metrics=METRICS,
                     GroupBy=[{"Type": "DIMENSION", "Key": "REGION"}],
+                    Filter=EXCLUDE_CREDIT_FILTER,
                 )
                 reg_agg = {}
                 for r in resp.get("ResultsByTime", []):
                     for g in r.get("Groups", []):
                         reg = g["Keys"][0] if g.get("Keys") else "-"
-                        net, _ = _amt(g["Metrics"], "NetUnblendedCost")
-                        reg_agg[reg or "-"] = reg_agg.get(reg or "-", 0.0) + net
+                        gross, _ = _amt(g["Metrics"], "UnblendedCost")
+                        reg_agg[reg or "-"] = reg_agg.get(reg or "-", 0.0) + gross
                 result["by_region"] = sorted(
                     [{"region": k, "amount": round(v, 4)} for k, v in reg_agg.items() if abs(v) > 0.0001],
                     key=lambda x: x["amount"], reverse=True,

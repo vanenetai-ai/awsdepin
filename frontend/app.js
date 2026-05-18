@@ -1847,20 +1847,39 @@ function renderBilling(data, year, month) {
     }
 
 
-    // 按服务
+    // 按服务 (与 AWS 控制台 "Charges by service" 完全一致)
+    // amount = UnblendedCost (毛额, 控制台显示的金额, "pre-tax service charges")
+    // net    = NetUnblendedCost (实付, 已扣 Credit; 与 amount 不一样说明该服务被 Credit 抵扣了)
     if (services.length) {
+        const svcGross = services.reduce((a, b) => a + (b.amount || 0), 0);
+        // 占比分母: 用毛额合计 (与 amount 同口径), 避免 Credit 抵扣后出现 >100% 或 <0% 的怪百分比
+        const denominator = svcGross > 0.01 ? svcGross : (grossTotal > 0.01 ? grossTotal : total);
+        // 是否有任何服务被 Credit 抵扣 (amount != net)
+        const hasCredit = services.some(s => Math.abs((s.amount || 0) - (s.net || 0)) > 0.01);
         html += `<div class="ai-section">
-            <div class="ai-section-title">📦 按服务消费 (Top ${services.length})</div>
+            <div class="ai-section-title">📦 按服务消费 (与 AWS 控制台一致, Top ${services.length})</div>
             <div class="ai-section-body">
-                <table class="ai-table"><thead><tr><th>服务</th><th style="text-align:right">金额</th><th style="width:100px">占比</th></tr></thead><tbody>`;
+                <div style="font-size:11px;color:var(--text2);margin-bottom:6px">
+                    💡 金额 = AWS 控制台 "Charges by service" 显示值 (毛额, 不含 Credit 抵扣 / 退款)。
+                    ${hasCredit ? '"实付" 列显示扣完 Credit 后真实付费。' : ''}
+                </div>
+                <table class="ai-table"><thead><tr>
+                    <th>服务</th>
+                    <th style="text-align:right">金额 (与控制台一致)</th>
+                    ${hasCredit ? '<th style="text-align:right">实付 (扣 Credit 后)</th>' : ''}
+                    <th style="width:100px">占比</th>
+                </tr></thead><tbody>`;
         for (const s of services) {
-            const pct = total > 0 ? (s.amount / total * 100) : 0;
+            const pct = denominator > 0 ? (s.amount / denominator * 100) : 0;
+            const net = (s.net !== undefined ? s.net : s.amount) || 0;
+            const credited = Math.abs((s.amount || 0) - net) > 0.01;
             html += `<tr>
                 <td>${s.service}</td>
                 <td style="text-align:right;font-weight:600;color:var(--yellow)">${fmtMoney(s.amount, currency)}</td>
+                ${hasCredit ? `<td style="text-align:right;font-weight:600;color:${credited ? 'var(--green)' : 'var(--text2)'}">${fmtMoney(net, currency)}${credited && net < s.amount - 0.01 ? ' <span style="font-size:10px">↓Credit</span>' : ''}</td>` : ''}
                 <td>
                     <div style="background:var(--bg3);border-radius:6px;height:14px;position:relative;overflow:hidden">
-                        <div style="background:var(--primary);height:100%;width:${pct.toFixed(1)}%"></div>
+                        <div style="background:var(--primary);height:100%;width:${Math.max(0, Math.min(100, pct)).toFixed(1)}%"></div>
                     </div>
                     <span style="font-size:11px;color:var(--text2)">${pct.toFixed(1)}%</span>
                 </td>
