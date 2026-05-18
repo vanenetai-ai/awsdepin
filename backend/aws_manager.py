@@ -1022,15 +1022,19 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
 
         account_id = info["account_id"]
 
-        # === 邮箱/账号信息探测策略 (精简版, 比之前快 3-5 倍) ===
-        # 移除的低命中率/超慢任务: SES (扫4区域)、SNS (扫2区域)、Budgets (三层嵌套)、
-        #                          AlternateContact OPERATIONS/SECURITY (99% = BILLING)。
-        # 保留的 4 个邮箱来源 (按权威度排序):
-        #   1) account:GetPrimaryEmail   - root 真实主邮箱 (最权威)
-        #   2) account:GetAlternateContact[BILLING] - 备用联系邮箱 (账号买卖常驻邮箱)
-        #   3) organizations:DescribeAccount/Organization - 组织内账号邮箱
-        #   4) account:GetContactInformation 联系信息里的邮箱字段 (兜底)
-        # 同时 contact 任务 1 次 API 调用就拿 3 样: country / 邮箱兜底 / FullName
+        # ============ 邮箱探测策略 ============
+        # ⚠️  实测结论 (2026-05): AWS **没有任何公开 SDK API** 能从凭证拿到 root 邮箱.
+        #     - account:GetPrimaryEmail        → root 凭证强制 AccessDenied (即便有 policy)
+        #     - account:GetContactInformation  → 返回 FullName/Country/Phone, EmailAddress 字段固定为空
+        #     - account:GetAccountInformation  → 仅返回 metadata, 无邮箱字段
+        #     - account:GetAlternateContact    → 仅当用户在控制台手动设了备用联系人才有
+        #     - organizations:DescribeAccount  → 仅当账号在组织里, 且能拿到的是 master email
+        #     - invoicing:* / taxsettings:*    → 当前 SDK 无邮箱字段, 部分 API 在 boto3 里压根不存在
+        #     - S3 / IAM 标签 / SES / SNS      → 全部不靠谱, 99% 拿不到
+        # 因此现在只保留两个最有价值的探测:
+        #   1) AlternateContact[BILLING]  - 唯一能 API 拿到邮箱的字段, 但前提账号设过
+        #   2) Organizations              - 极少数情况能拿到 master email
+        # 其它一律不再尝试. contact_info 只用来拿 country.
         REGION_TO_COUNTRY = {
             "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
             "eu-west-1": "IE", "eu-west-2": "GB", "eu-west-3": "FR", "eu-central-1": "DE",
@@ -1039,72 +1043,50 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             "ap-south-1": "IN", "sa-east-1": "BR", "ca-central-1": "CA",
         }
 
-        def _task_primary_email():
-            acct = self._make_detect_client("account", "us-east-1")
-            resp = acct.get_primary_email(AccountId=account_id)
-            email = resp.get("PrimaryEmail", "")
-            return email if email and "@" in email else None
-
         def _task_alt_billing():
-            """备用联系人(BILLING) - 账号买卖时原主常把邮箱留在这里"""
+            """AlternateContact[BILLING] - 唯一能 API 拿到邮箱的官方字段
+            (前提: 用户在控制台 My Account → Alternate Contacts 手动设过)"""
             acct = self._make_detect_client("account", "us-east-1")
             try:
                 resp = acct.get_alternate_contact(AlternateContactType="BILLING")
-            except Exception as e:
-                msg = str(e)
-                if "ResourceNotFoundException" in msg:
-                    return None
-                if "AccessDeniedException" in msg or "linked account" in msg.lower():
-                    try:
-                        resp = acct.get_alternate_contact(
-                            AccountId=account_id, AlternateContactType="BILLING"
-                        )
-                    except Exception:
-                        return None
-                else:
-                    return None
-            ac = resp.get("AlternateContact", {}) if isinstance(resp, dict) else {}
-            email = ac.get("EmailAddress", "")
-            if email and "@" in email:
-                return email
-            return ac.get("Name") or None
+                ac = resp.get("AlternateContact", {}) if isinstance(resp, dict) else {}
+                email = ac.get("EmailAddress", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                return None
+            return None
 
         def _task_org_email():
-            """组织 (Organizations) 里的账号邮箱"""
+            """组织 (Organizations) 主账号邮箱 - 仅当账号在组织里"""
             org = self._make_detect_client("organizations")
-            for fn in ("describe_account", "describe_organization"):
-                try:
-                    if fn == "describe_account":
-                        resp = org.describe_account(AccountId=account_id)
-                        email = resp.get("Account", {}).get("Email", "")
-                    else:
-                        resp = org.describe_organization()
-                        email = resp.get("Organization", {}).get("MasterAccountEmail", "")
-                    if email and "@" in email:
-                        return email
-                except Exception:
-                    continue
+            try:
+                resp = org.describe_organization()
+                email = resp.get("Organization", {}).get("MasterAccountEmail", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                pass
+            try:
+                resp = org.describe_account(AccountId=account_id)
+                email = resp.get("Account", {}).get("Email", "")
+                if email and "@" in email:
+                    return email
+            except Exception:
+                pass
             return None
 
         def _task_contact_info():
-            """1 次 API 调用同时拿: country, 邮箱兜底, FullName 兜底"""
+            """只用来拿 country / FullName 显示 (邮箱字段实测固定为空)"""
             try:
                 acct = self._make_detect_client("account", "us-east-1")
                 contact = acct.get_contact_information()
                 ci = contact.get("ContactInformation", {}) or {}
-                email = ci.get("EmailAddress", "")
                 name = ci.get("FullName", "")
                 country = ci.get("CountryCode", "") or REGION_TO_COUNTRY.get(self.account.default_region, "US")
-                return {
-                    "email": email if email and "@" in email else None,
-                    "name": name or None,
-                    "country": country,
-                }
+                return {"name": name or None, "country": country}
             except Exception:
-                return {
-                    "email": None, "name": None,
-                    "country": REGION_TO_COUNTRY.get(self.account.default_region, "US"),
-                }
+                return {"name": None, "country": REGION_TO_COUNTRY.get(self.account.default_region, "US")}
 
         def _task_creation_time():
             """IAM credential report - 拿 root 创建日期 (= 账号注册时间)"""
@@ -1137,213 +1119,10 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             except Exception:
                 return None
 
-        def _task_invoice_email():
-            """发票邮箱 - 多个 invoicing API 综合 (AWSBillingReadOnlyAccess 涵盖)
-
-            调用顺序 (任一命中就返回):
-            1) invoicing:GetInvoiceEmailDeliveryPreferences
-               → AWS 真正发月度账单邮件去的邮箱地址列表 (几乎 100% = root 邮箱).
-                  这是最权威的邮箱来源, 比 GetPrimaryEmail 更稳, 因为很多账号
-                  GetPrimaryEmail 返回 AccessDenied 但这个 API 能跑.
-            2) invoicing:BatchGetInvoiceProfile
-               → 发票收件人邮箱 (新版组织发票功能)
-            3) invoicing:ListInvoiceSummaries
-               → 历史发票里的 BillingPeriod 收件邮箱
-            """
-            try:
-                inv = self._make_detect_client("invoicing", "us-east-1")
-            except Exception as e:
-                logger.debug(f"invoicing client init failed: {e}")
-                return None
-
-            # ---- 1) GetInvoiceEmailDeliveryPreferences (权威度最高) ----
-            try:
-                resp = inv.get_invoice_email_delivery_preferences()
-                # 响应字段在不同版本里可能是: Subscribers / Emails / EmailAddresses
-                for k in ("Subscribers", "Emails", "EmailAddresses", "DeliveryEmails"):
-                    arr = resp.get(k)
-                    if isinstance(arr, list):
-                        for item in arr:
-                            v = item if isinstance(item, str) else (
-                                item.get("Email") or item.get("EmailAddress")
-                                or item.get("Address") if isinstance(item, dict) else None
-                            )
-                            if v and "@" in v and "amazonaws" not in v.lower():
-                                return v
-                # 也可能直接顶层就是字段
-                for k in ("Email", "EmailAddress", "PrimaryEmail"):
-                    v = resp.get(k)
-                    if v and "@" in v and "amazonaws" not in v.lower():
-                        return v
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                # 这个 API 比较新, 老 boto3 / 部分区域可能没有方法本身; 不算硬错
-                if "has no attribute" in low or "operation: " in low and "is not" in low:
-                    pass
-                elif "accessdenied" in low or "not authorized" in low:
-                    raise
-                # ResourceNotFound / ValidationException 都视为"该账号没启用 e-invoice", 继续下一招
-
-            # ---- 2) BatchGetInvoiceProfile ----
-            try:
-                resp = inv.batch_get_invoice_profile(AccountIds=[account_id])
-                for prof in (resp.get("Profiles", []) or []):
-                    if not isinstance(prof, dict):
-                        continue
-                    # 常见字段: ReceiverEmail / Email / EmailAddress / IssuerEmail
-                    for k in ("ReceiverEmail", "Email", "EmailAddress", "IssuerEmail",
-                              "BillingContactEmail", "ContactEmail"):
-                        v = prof.get(k)
-                        if v and "@" in v and "amazonaws" not in v.lower():
-                            return v
-                    # 嵌套的 ReceiverAddress / IssuerAddress
-                    for nest_k in ("ReceiverAddress", "IssuerAddress", "BillingContact"):
-                        nest = prof.get(nest_k) or {}
-                        if isinstance(nest, dict):
-                            for k in ("Email", "EmailAddress"):
-                                v = nest.get(k)
-                                if v and "@" in v and "amazonaws" not in v.lower():
-                                    return v
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if "accessdenied" in low or "not authorized" in low:
-                    raise
-                if "validationexception" in low or "resourcenotfoundexception" in low:
-                    pass   # 继续下一招
-
-            # ---- 3) ListInvoiceSummaries (历史发票) ----
-            try:
-                from datetime import datetime as _dt, timedelta as _td
-                end = _dt.utcnow()
-                start = end - _td(days=180)
-                resp = inv.list_invoice_summaries(
-                    Selector={"ResourceType": "ACCOUNT", "Value": account_id},
-                    Filter={
-                        "TimeInterval": {
-                            "StartDate": start,
-                            "EndDate": end,
-                        }
-                    },
-                    MaxResults=20,
-                )
-                for s in (resp.get("InvoiceSummaries", []) or []):
-                    if not isinstance(s, dict):
-                        continue
-                    for k in ("BillTo", "EmailAddress", "Email"):
-                        v = s.get(k)
-                        if isinstance(v, str) and "@" in v and "amazonaws" not in v.lower():
-                            return v
-                        if isinstance(v, dict):
-                            for kk in ("Email", "EmailAddress"):
-                                vv = v.get(kk)
-                                if vv and "@" in vv and "amazonaws" not in vv.lower():
-                                    return vv
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if "accessdenied" in low or "not authorized" in low:
-                    raise
-
-            return None
-
-        def _task_tax_email():
-            """税务联系人邮箱 - 综合多个 taxsettings API (AWSBillingReadOnlyAccess 涵盖)
-
-            欧盟 / 巴西 / 印度 / 沙特等区域账号通常会在税务联系人填 root 邮箱,
-            是 GetPrimaryEmail / AlternateContact 都拿不到时的关键备选.
-
-            调用顺序 (任一命中就返回):
-            1) taxsettings:ListTaxRegistrations
-               → 列出账号下所有税务注册 (一个账号可能有多个国家的税务注册),
-                  每个里面都可能有 PointOfContact 邮箱.
-            2) taxsettings:GetTaxRegistration
-               → 单个 (默认) 税务注册详情, AdditionalTaxInformation.*.PointOfContact 里的邮箱.
-            """
-            try:
-                tx = self._make_detect_client("taxsettings", "us-east-1")
-            except Exception as e:
-                logger.debug(f"taxsettings client init failed: {e}")
-                return None
-
-            def _scan_tax_obj(tr: dict):
-                """从单个 TaxRegistration 对象里挖邮箱"""
-                if not isinstance(tr, dict):
-                    return None
-                # 顶层字段 (老版本 SDK)
-                for k in ("EmailAddress", "ContactEmail", "Email"):
-                    v = tr.get(k)
-                    if isinstance(v, str) and "@" in v and "amazonaws" not in v.lower():
-                        return v
-                # 嵌套: AdditionalTaxInformation.{Country}.PointOfContact.EmailAddress
-                ati = tr.get("AdditionalTaxInformation", {}) or {}
-                if isinstance(ati, dict):
-                    for sub in ati.values():
-                        if isinstance(sub, dict):
-                            poc = sub.get("PointOfContact", {}) or {}
-                            em = poc.get("EmailAddress")
-                            if em and "@" in em and "amazonaws" not in em.lower():
-                                return em
-                            # 部分国家 (印度) 嵌得更深: PointsOfContact 数组
-                            for poc_key in ("PointsOfContact", "Contacts"):
-                                arr = sub.get(poc_key)
-                                if isinstance(arr, list):
-                                    for it in arr:
-                                        if isinstance(it, dict):
-                                            em = it.get("EmailAddress") or it.get("Email")
-                                            if em and "@" in em and "amazonaws" not in em.lower():
-                                                return em
-                # 顶层 PointOfContact (新版本 SDK)
-                poc = tr.get("PointOfContact", {}) or {}
-                if isinstance(poc, dict):
-                    em = poc.get("EmailAddress")
-                    if em and "@" in em and "amazonaws" not in em.lower():
-                        return em
-                return None
-
-            # ---- 1) ListTaxRegistrations (覆盖多注册场景) ----
-            try:
-                next_token = None
-                for _ in range(5):    # 最多 5 页, 防止账号税务注册超多
-                    kwargs = {"MaxResults": 50}
-                    if next_token:
-                        kwargs["NextToken"] = next_token
-                    resp = tx.list_tax_registrations(**kwargs)
-                    for tr_summary in (resp.get("TaxRegistrations", []) or []):
-                        em = _scan_tax_obj(tr_summary)
-                        if em:
-                            return em
-                    next_token = resp.get("NextToken")
-                    if not next_token:
-                        break
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if "accessdenied" in low or "not authorized" in low:
-                    raise
-                # ResourceNotFound / has no attribute (老 boto3 没这个 API) → 继续下一招
-
-            # ---- 2) GetTaxRegistration (默认注册) ----
-            try:
-                resp = tx.get_tax_registration()
-            except Exception as e:
-                msg = str(e)
-                low = msg.lower()
-                if "accessdenied" in low or "not authorized" in low:
-                    raise
-                if "resourcenotfoundexception" in low or "tax registration not found" in low:
-                    return None
-                raise
-            return _scan_tax_obj(resp.get("TaxRegistration", {}) or {})
-
-        # 并行执行所有检测任务 (5 → 7 个, 多两个邮箱来源)
+        # 并行执行检测任务 - 邮箱只剩 2 个最有价值的来源
         task_map = {
-            "email_primary":     _task_primary_email,
             "email_alt_billing": _task_alt_billing,
             "email_org":         _task_org_email,
-            "email_invoice":     _task_invoice_email,
-            "email_tax":         _task_tax_email,
             "contact_info":      _task_contact_info,
             "creation_time":     _task_creation_time,
         }
