@@ -1138,43 +1138,193 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                 return None
 
         def _task_invoice_email():
-            """发票接收人邮箱 - AWSBillingReadOnlyAccess 涵盖
-            invoicing:BatchGetInvoiceProfile 返回 AccountId → InvoiceProfile.ReceiverEmail,
-            通常 = root 邮箱; 是绕过 account:GetPrimaryEmail 的备选邮箱来源.
+            """发票邮箱 - 多个 invoicing API 综合 (AWSBillingReadOnlyAccess 涵盖)
+
+            调用顺序 (任一命中就返回):
+            1) invoicing:GetInvoiceEmailDeliveryPreferences
+               → AWS 真正发月度账单邮件去的邮箱地址列表 (几乎 100% = root 邮箱).
+                  这是最权威的邮箱来源, 比 GetPrimaryEmail 更稳, 因为很多账号
+                  GetPrimaryEmail 返回 AccessDenied 但这个 API 能跑.
+            2) invoicing:BatchGetInvoiceProfile
+               → 发票收件人邮箱 (新版组织发票功能)
+            3) invoicing:ListInvoiceSummaries
+               → 历史发票里的 BillingPeriod 收件邮箱
             """
             try:
                 inv = self._make_detect_client("invoicing", "us-east-1")
             except Exception as e:
                 logger.debug(f"invoicing client init failed: {e}")
                 return None
+
+            # ---- 1) GetInvoiceEmailDeliveryPreferences (权威度最高) ----
+            try:
+                resp = inv.get_invoice_email_delivery_preferences()
+                # 响应字段在不同版本里可能是: Subscribers / Emails / EmailAddresses
+                for k in ("Subscribers", "Emails", "EmailAddresses", "DeliveryEmails"):
+                    arr = resp.get(k)
+                    if isinstance(arr, list):
+                        for item in arr:
+                            v = item if isinstance(item, str) else (
+                                item.get("Email") or item.get("EmailAddress")
+                                or item.get("Address") if isinstance(item, dict) else None
+                            )
+                            if v and "@" in v and "amazonaws" not in v.lower():
+                                return v
+                # 也可能直接顶层就是字段
+                for k in ("Email", "EmailAddress", "PrimaryEmail"):
+                    v = resp.get(k)
+                    if v and "@" in v and "amazonaws" not in v.lower():
+                        return v
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                # 这个 API 比较新, 老 boto3 / 部分区域可能没有方法本身; 不算硬错
+                if "has no attribute" in low or "operation: " in low and "is not" in low:
+                    pass
+                elif "accessdenied" in low or "not authorized" in low:
+                    raise
+                # ResourceNotFound / ValidationException 都视为"该账号没启用 e-invoice", 继续下一招
+
+            # ---- 2) BatchGetInvoiceProfile ----
             try:
                 resp = inv.batch_get_invoice_profile(AccountIds=[account_id])
+                for prof in (resp.get("Profiles", []) or []):
+                    if not isinstance(prof, dict):
+                        continue
+                    # 常见字段: ReceiverEmail / Email / EmailAddress / IssuerEmail
+                    for k in ("ReceiverEmail", "Email", "EmailAddress", "IssuerEmail",
+                              "BillingContactEmail", "ContactEmail"):
+                        v = prof.get(k)
+                        if v and "@" in v and "amazonaws" not in v.lower():
+                            return v
+                    # 嵌套的 ReceiverAddress / IssuerAddress
+                    for nest_k in ("ReceiverAddress", "IssuerAddress", "BillingContact"):
+                        nest = prof.get(nest_k) or {}
+                        if isinstance(nest, dict):
+                            for k in ("Email", "EmailAddress"):
+                                v = nest.get(k)
+                                if v and "@" in v and "amazonaws" not in v.lower():
+                                    return v
             except Exception as e:
                 msg = str(e)
                 low = msg.lower()
                 if "accessdenied" in low or "not authorized" in low:
-                    raise   # 让上层把错误归类为 denied
+                    raise
                 if "validationexception" in low or "resourcenotfoundexception" in low:
-                    return None
-                raise
-            for prof in (resp.get("Profiles", []) or []):
-                # ReceiverEmail / Email / EmailAddress 不同版本字段名都可能
-                for k in ("ReceiverEmail", "Email", "EmailAddress"):
-                    v = prof.get(k) if isinstance(prof, dict) else None
-                    if v and "@" in v and "amazonaws" not in v.lower():
-                        return v
+                    pass   # 继续下一招
+
+            # ---- 3) ListInvoiceSummaries (历史发票) ----
+            try:
+                from datetime import datetime as _dt, timedelta as _td
+                end = _dt.utcnow()
+                start = end - _td(days=180)
+                resp = inv.list_invoice_summaries(
+                    Selector={"ResourceType": "ACCOUNT", "Value": account_id},
+                    Filter={
+                        "TimeInterval": {
+                            "StartDate": start,
+                            "EndDate": end,
+                        }
+                    },
+                    MaxResults=20,
+                )
+                for s in (resp.get("InvoiceSummaries", []) or []):
+                    if not isinstance(s, dict):
+                        continue
+                    for k in ("BillTo", "EmailAddress", "Email"):
+                        v = s.get(k)
+                        if isinstance(v, str) and "@" in v and "amazonaws" not in v.lower():
+                            return v
+                        if isinstance(v, dict):
+                            for kk in ("Email", "EmailAddress"):
+                                vv = v.get(kk)
+                                if vv and "@" in vv and "amazonaws" not in vv.lower():
+                                    return vv
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if "accessdenied" in low or "not authorized" in low:
+                    raise
+
             return None
 
         def _task_tax_email():
-            """税务注册联系人邮箱 - AWSBillingReadOnlyAccess 涵盖
-            taxsettings:GetTaxRegistration 返回 TaxRegistration.AdditionalTaxInformation,
-            其中 PointOfContact.EmailAddress 通常 = 账号主邮箱 (尤其欧盟 / 巴西 / 印度 / 沙特账号).
+            """税务联系人邮箱 - 综合多个 taxsettings API (AWSBillingReadOnlyAccess 涵盖)
+
+            欧盟 / 巴西 / 印度 / 沙特等区域账号通常会在税务联系人填 root 邮箱,
+            是 GetPrimaryEmail / AlternateContact 都拿不到时的关键备选.
+
+            调用顺序 (任一命中就返回):
+            1) taxsettings:ListTaxRegistrations
+               → 列出账号下所有税务注册 (一个账号可能有多个国家的税务注册),
+                  每个里面都可能有 PointOfContact 邮箱.
+            2) taxsettings:GetTaxRegistration
+               → 单个 (默认) 税务注册详情, AdditionalTaxInformation.*.PointOfContact 里的邮箱.
             """
             try:
                 tx = self._make_detect_client("taxsettings", "us-east-1")
             except Exception as e:
                 logger.debug(f"taxsettings client init failed: {e}")
                 return None
+
+            def _scan_tax_obj(tr: dict):
+                """从单个 TaxRegistration 对象里挖邮箱"""
+                if not isinstance(tr, dict):
+                    return None
+                # 顶层字段 (老版本 SDK)
+                for k in ("EmailAddress", "ContactEmail", "Email"):
+                    v = tr.get(k)
+                    if isinstance(v, str) and "@" in v and "amazonaws" not in v.lower():
+                        return v
+                # 嵌套: AdditionalTaxInformation.{Country}.PointOfContact.EmailAddress
+                ati = tr.get("AdditionalTaxInformation", {}) or {}
+                if isinstance(ati, dict):
+                    for sub in ati.values():
+                        if isinstance(sub, dict):
+                            poc = sub.get("PointOfContact", {}) or {}
+                            em = poc.get("EmailAddress")
+                            if em and "@" in em and "amazonaws" not in em.lower():
+                                return em
+                            # 部分国家 (印度) 嵌得更深: PointsOfContact 数组
+                            for poc_key in ("PointsOfContact", "Contacts"):
+                                arr = sub.get(poc_key)
+                                if isinstance(arr, list):
+                                    for it in arr:
+                                        if isinstance(it, dict):
+                                            em = it.get("EmailAddress") or it.get("Email")
+                                            if em and "@" in em and "amazonaws" not in em.lower():
+                                                return em
+                # 顶层 PointOfContact (新版本 SDK)
+                poc = tr.get("PointOfContact", {}) or {}
+                if isinstance(poc, dict):
+                    em = poc.get("EmailAddress")
+                    if em and "@" in em and "amazonaws" not in em.lower():
+                        return em
+                return None
+
+            # ---- 1) ListTaxRegistrations (覆盖多注册场景) ----
+            try:
+                next_token = None
+                for _ in range(5):    # 最多 5 页, 防止账号税务注册超多
+                    kwargs = {"MaxResults": 50}
+                    if next_token:
+                        kwargs["NextToken"] = next_token
+                    resp = tx.list_tax_registrations(**kwargs)
+                    for tr_summary in (resp.get("TaxRegistrations", []) or []):
+                        em = _scan_tax_obj(tr_summary)
+                        if em:
+                            return em
+                    next_token = resp.get("NextToken")
+                    if not next_token:
+                        break
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if "accessdenied" in low or "not authorized" in low:
+                    raise
+                # ResourceNotFound / has no attribute (老 boto3 没这个 API) → 继续下一招
+
+            # ---- 2) GetTaxRegistration (默认注册) ----
             try:
                 resp = tx.get_tax_registration()
             except Exception as e:
@@ -1185,22 +1335,7 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                 if "resourcenotfoundexception" in low or "tax registration not found" in low:
                     return None
                 raise
-            tr = resp.get("TaxRegistration", {}) or {}
-            # 1) PointOfContact 嵌套在 AdditionalTaxInformation 下
-            ati = tr.get("AdditionalTaxInformation", {}) or {}
-            for sub_key in ati.keys():
-                sub = ati.get(sub_key)
-                if isinstance(sub, dict):
-                    poc = sub.get("PointOfContact", {}) or {}
-                    em = poc.get("EmailAddress")
-                    if em and "@" in em and "amazonaws" not in em.lower():
-                        return em
-            # 2) 顶层也偶尔有
-            for k in ("EmailAddress", "ContactEmail"):
-                v = tr.get(k)
-                if v and "@" in v:
-                    return v
-            return None
+            return _scan_tax_obj(resp.get("TaxRegistration", {}) or {})
 
         # 并行执行所有检测任务 (5 → 7 个, 多两个邮箱来源)
         task_map = {
