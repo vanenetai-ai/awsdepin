@@ -657,14 +657,14 @@ function showCreditModal(html) {
     if (!modal) {
         modal = document.createElement('div');
         modal.id = 'credit-modal';
-        modal.className = 'modal';
+        modal.className = 'modal-overlay';
         modal.innerHTML = `
-            <div class="modal-content" style="max-width:720px;width:92%">
+            <div class="modal" style="width:720px;max-width:92vw;max-height:86vh;overflow-y:auto">
                 <div class="modal-header">
                     <h3>💎 AWS Credit 详情</h3>
                     <button class="modal-close" onclick="hideModal('credit-modal')">×</button>
                 </div>
-                <div class="modal-body" id="credit-modal-body"></div>
+                <div id="credit-modal-body"></div>
             </div>
         `;
         document.body.appendChild(modal);
@@ -837,14 +837,14 @@ function showPermissionsModal(html) {
     if (!modal) {
         modal = document.createElement('div');
         modal.id = 'perm-modal';
-        modal.className = 'modal';
+        modal.className = 'modal-overlay';
         modal.innerHTML = `
-            <div class="modal-content" style="max-width:1000px;width:96%;max-height:92vh;display:flex;flex-direction:column">
+            <div class="modal" style="width:1000px;max-width:96vw;max-height:92vh;overflow-y:auto">
                 <div class="modal-header">
                     <h3>🔐 AWS IAM 权限诊断 + 策略生成器</h3>
                     <button class="modal-close" onclick="hideModal('perm-modal')">×</button>
                 </div>
-                <div class="modal-body" id="perm-modal-body" style="overflow-y:auto"></div>
+                <div id="perm-modal-body"></div>
             </div>
         `;
         document.body.appendChild(modal);
@@ -1595,14 +1595,14 @@ ${d.aup_acknowledged}
     if (!modal) {
         modal = document.createElement('div');
         modal.id = 'bedrock-apply-modal';
-        modal.className = 'modal';
+        modal.className = 'modal-overlay';
         modal.innerHTML = `
-            <div class="modal-content" style="max-width:900px;width:94%">
+            <div class="modal" style="width:900px;max-width:94vw;max-height:90vh;overflow-y:auto">
                 <div class="modal-header">
                     <h3>📝 Bedrock Model Access 一键申请</h3>
                     <button class="modal-close" onclick="hideModal('bedrock-apply-modal')">×</button>
                 </div>
-                <div class="modal-body" id="bedrock-apply-body"></div>
+                <div id="bedrock-apply-body"></div>
             </div>
         `;
         document.body.appendChild(modal);
