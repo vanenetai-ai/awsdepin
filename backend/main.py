@@ -488,8 +488,34 @@ async def get_account_billing(
     )
 
 
+@app.get("/api/accounts/{account_id}/permissions")
+async def diagnose_account_permissions(
+    account_id: int,
+    _ts: Optional[int] = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """诊断账号 AK/SK 拥有/缺失的权限, 并生成最小 IAM 策略 JSON.
+
+    返回每组功能的探测结果 + 一键复制粘贴的 IAM 策略, 让用户能立刻给账号补权限。
+    AWS CLI / boto3 / 本平台用的都是同一套 STS 凭证, **没有任何方法能绕过 IAM 策略**,
+    所以"邮箱拿不到 / 账单不对 / Free Tier 显示空"等问题都是 IAM 权限问题, 不是 SDK 问题.
+    """
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor,
+        lambda: AwsManager(account, db).diagnose_permissions(),
+    )
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
 @app.post("/api/accounts/batch-delete")
 def batch_delete_accounts(data: BatchDeleteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
     """批量删除账号"""
     deleted = 0
     for aid in data.ids:

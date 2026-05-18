@@ -352,8 +352,10 @@ function _renderAccountCardHtml(a) {
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});loadCredit(${a.id})">💎 刷新 Credit 余额</div>
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showVcpuDetail(${a.id})">⚡ vCPU 配额</div>
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showBilling(${a.id})">💰 账单费用</div>
+                        <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showPermissions(${a.id})">🔐 权限诊断 + IAM 策略</div>
                         <div class="acc-menu-divider"></div>
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});enableAllRegions(${a.id})">🌐 启用全部地区</div>
+
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});showFreeTier(${a.id})">🎁 免费套餐</div>
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});openIamLogin(${a.id})">👤 IAM 登录链接</div>
                         <div class="acc-menu-item" onclick="hideAccMenu(${a.id});resetSecretKey(${a.id})">🔑 重置密钥</div>
@@ -452,8 +454,13 @@ window.addEventListener('resize', () => {
     document.querySelectorAll('.acc-menu-popup.show').forEach(p => p.classList.remove('show'));
 });
 
-// ==================== AWS Credit (FreeTier API: 余额/总额/已用/过期) ====================
-const _creditCache = {};   // {accountId: {balance, used, total, currency, expires_at, credits[], source, error}}
+// ==================== AWS Credit / Free Tier 用量 ====================
+// 后端字段:
+//   used_this_year / used_last_month / used_this_month / used_total_history  (Cost Explorer Credit 抵扣)
+//   free_tier_usage[]                                                        (FreeTier API 12 个月免费额度用量)
+//   balance / balance_unavailable                                            (Promotional Credit 余额 - AWS 未公开 SDK, 始终 unavailable)
+//   warnings[] / error
+const _creditCache = {};
 let _creditLoading = new Set();
 
 async function loadCredit(accountId) {
@@ -467,18 +474,17 @@ async function loadCredit(accountId) {
     try {
         const res = await api(`/accounts/${accountId}/credits?_ts=${Date.now()}`);
         _creditCache[accountId] = res;
-        if (!res.error) {
-            const sign = (res.currency || 'USD') === 'USD' ? '$' : '';
-            const bal = res.balance || 0;
-            if (bal > 0) {
-                toast(`💎 Credit 余额: ${sign}${bal.toFixed(2)} ${res.currency || 'USD'}`);
-            } else if ((res.total || 0) > 0) {
-                toast(`💎 Credit 已用完 (历史 ${sign}${(res.used || 0).toFixed(2)})`, 'info');
-            } else {
-                toast('💎 该账号没有 Credit', 'info');
-            }
-        } else {
+        const cur = res.currency || 'USD';
+        const sign = cur === 'USD' ? '$' : '';
+        const usedThisMonth = res.used_this_month || 0;
+        const usedThisYear = res.used_this_year || 0;
+        const ftCount = res.free_tier_total_count || 0;
+        if (res.error) {
             toast(`⚠️ ${res.error}`, 'warning');
+        } else if (usedThisMonth > 0.01 || usedThisYear > 0.01 || ftCount > 0) {
+            toast(`💎 本月已抵扣 ${sign}${usedThisMonth.toFixed(2)} · 本年累计 ${sign}${usedThisYear.toFixed(2)} · Free Tier 项 ${ftCount}`);
+        } else {
+            toast('💎 该账号本期无 Credit 抵扣 / Free Tier 用量', 'info');
         }
     } catch (e) {
         _creditCache[accountId] = { error: e.message };
@@ -502,7 +508,7 @@ function updateCreditBadge(accountId) {
         el.onclick = () => loadCredit(accountId);
         return;
     }
-    if (cred.error) {
+    if (cred.error && !cred.used_this_year && !cred.free_tier_total_count) {
         el.classList.add('error');
         el.title = cred.error;
         el.innerHTML = '💎 Credit 错误';
@@ -511,21 +517,33 @@ function updateCreditBadge(accountId) {
     }
     const cur = cred.currency || 'USD';
     const sign = cur === 'USD' ? '$' : (cur === 'CNY' ? '¥' : '');
-    const balance = cred.balance || 0;
-    const used = cred.used || 0;
-    const total = cred.total || 0;
-    if (balance > 0) {
+    const usedYear = cred.used_this_year || 0;
+    const usedMonth = cred.used_this_month || 0;
+    const usedHistory = cred.used_total_history || 0;
+    const ftCount = cred.free_tier_total_count || 0;
+    // 找出 Free Tier 用量最高的一项
+    const ft = (cred.free_tier_usage || []);
+    const maxFt = ft.length ? Math.round(ft[0].usage_pct || 0) : 0;
+    if (usedMonth > 0.01) {
         el.classList.add('good');
-        el.title = `可用 Credit 余额 ${sign}${balance.toFixed(2)}${cred.expires_at ? ' · 到期 ' + cred.expires_at : ''} · 点击查看详情`;
-        el.innerHTML = `💎 ${sign}${balance.toFixed(2)} ${cur}`;
-    } else if (total > 0) {
+        el.title = `本月 Credit 抵扣 ${sign}${usedMonth.toFixed(2)} · 本年累计 ${sign}${usedYear.toFixed(2)}${ftCount ? ` · Free Tier 项 ${ftCount} (最高 ${maxFt}%)` : ''} · 点击查看详情`;
+        el.innerHTML = `💎 -${sign}${usedMonth.toFixed(2)}/月`;
+    } else if (usedYear > 0.01) {
         el.classList.add('used');
-        el.title = `历史 Credit 已用完 (${sign}${used.toFixed(2)})`;
-        el.innerHTML = `💎 已用完 (${sign}${used.toFixed(2)})`;
+        el.title = `本年累计 Credit 抵扣 ${sign}${usedYear.toFixed(2)} · 历史 ${sign}${usedHistory.toFixed(2)}${ftCount ? ` · Free Tier 项 ${ftCount}` : ''}`;
+        el.innerHTML = `💎 抵扣 ${sign}${usedYear.toFixed(2)}/年`;
+    } else if (ftCount > 0) {
+        el.classList.add('good');
+        el.title = `Free Tier 12 个月免费额度: ${ftCount} 项 (最高使用率 ${maxFt}%) · 点击查看详情`;
+        el.innerHTML = `💎 Free Tier · ${maxFt}%`;
+    } else if (usedHistory > 0.01) {
+        el.classList.add('used');
+        el.title = `历史 Credit 累计已抵扣 ${sign}${usedHistory.toFixed(2)} · 当前周期无抵扣`;
+        el.innerHTML = `💎 历史 ${sign}${usedHistory.toFixed(2)}`;
     } else {
         el.classList.add('none');
-        el.title = '该账号没有 Credit 余额';
-        el.innerHTML = '💎 无 Credit';
+        el.title = '该账号无 Credit 抵扣记录, 也无 Free Tier 用量。\n\n注意: AWS 未公开 Promotional Credit 余额查询 API, 余额请到控制台 Billing → Credits 查看。';
+        el.innerHTML = '💎 无抵扣';
     }
     el.onclick = () => showCreditDetail(accountId);
 }
@@ -543,53 +561,94 @@ async function showCreditDetail(accountId) {
 
     const cur = cred.currency || 'USD';
     const sign = cur === 'USD' ? '$' : '';
+    const usedYear = cred.used_this_year || 0;
+    const usedLastMonth = cred.used_last_month || 0;
+    const usedThisMonth = cred.used_this_month || 0;
+    const usedHistory = cred.used_total_history || 0;
+    const ft = cred.free_tier_usage || [];
+    const consoleUrl = cred.console_url || 'https://console.aws.amazon.com/billing/home#/credits';
+
     let html = `
         <div style="padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:12px;color:var(--text2);font-size:13px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
             <span>账号: <b style="color:var(--text)">${accName}</b></span>
-            <button class="btn btn-sm btn-secondary" onclick="loadCredit(${accountId}).then(()=>showCreditDetail(${accountId}))">🔄 刷新</button>
+            <span style="display:flex;gap:6px">
+                <button class="btn btn-sm btn-secondary" onclick="loadCredit(${accountId}).then(()=>showCreditDetail(${accountId}))">🔄 刷新</button>
+                <a class="btn btn-sm btn-primary" href="${consoleUrl}" target="_blank" style="text-decoration:none">🔗 控制台 Credits</a>
+            </span>
         </div>
     `;
+
+    // ⚠️ 关键说明: AWS 不公开 Credit 余额 API
+    html += `
+        <div style="padding:10px 12px;background:rgba(245,158,11,0.10);border:1px solid var(--yellow);border-radius:8px;margin-bottom:12px;font-size:12px;color:var(--text2);line-height:1.7">
+            ⚠️ <b>AWS 不公开 Promotional Credit 余额查询 API</b>。控制台 Billing → Credits 页用的是私有接口 <code>aws-portal:GetCredits</code>, 第三方调用会被拒绝。<br>
+            本面板基于以下两个公开 API 估算:
+            <ol style="margin:6px 0 0 18px;padding:0">
+                <li><b>Cost Explorer · RECORD_TYPE=Credit</b> → 查询历史已抵扣金额 (本月/上月/本年/历史累计)</li>
+                <li><b>FreeTier · GetFreeTierUsage</b> → 12 个月免费额度的用量百分比</li>
+            </ol>
+            想看 <b>剩余余额 / 到期时间</b> 请点右上角 "🔗 控制台 Credits"。
+        </div>
+    `;
+
     if (cred.error) {
         html += `<div style="padding:14px;background:rgba(239,68,68,0.1);border:1px solid var(--red);border-radius:8px;color:var(--red);font-size:13px;line-height:1.6">
             <b>⚠️ 查询失败</b><br>${cred.error}
         </div>`;
-    } else {
-        const balance = cred.balance || 0;
-        const used = cred.used || 0;
-        const total = cred.total || 0;
-        const pct = total > 0 ? Math.min((used / total) * 100, 100) : 0;
-        html += `
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px">
-                <div class="stat-card" style="padding:14px"><div class="label">可用余额</div><div class="value ${balance>0?'green':''}" style="font-size:24px">${sign}${balance.toFixed(2)} ${cur}</div></div>
-                <div class="stat-card" style="padding:14px"><div class="label">已使用</div><div class="value yellow" style="font-size:22px">${sign}${used.toFixed(2)}</div></div>
-                <div class="stat-card" style="padding:14px"><div class="label">总额度</div><div class="value blue" style="font-size:22px">${sign}${total.toFixed(2)}</div></div>
-                <div class="stat-card" style="padding:14px"><div class="label">最近到期</div><div class="value" style="font-size:14px;color:var(--text2)">${cred.expires_at || '-'}</div></div>
-            </div>
-            <div style="margin-bottom:14px">
-                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text2);margin-bottom:4px"><span>使用进度</span><span>${pct.toFixed(1)}%</span></div>
-                <div style="background:var(--bg3);border-radius:6px;height:14px;overflow:hidden"><div style="background:linear-gradient(90deg,var(--green),var(--yellow));height:100%;width:${pct.toFixed(1)}%"></div></div>
-            </div>
-            <div style="font-size:12px;color:var(--text2);margin-bottom:6px">数据源: <code>${cred.source || 'unknown'}</code> ${cred.source === 'freetier' ? '(AWS FreeTier API · 独立项，与账单无关)' : (cred.source === 'cost_explorer' ? '(Cost Explorer 历史抵扣)' : '')}</div>
-        `;
-        const credits = cred.credits || [];
-        if (credits.length) {
-            html += `<div class="ai-section"><div class="ai-section-title">📋 Credit 明细 (${credits.length})</div><div class="ai-section-body">
-                <table class="ai-table"><thead><tr><th>名称</th><th style="text-align:right">余额</th><th style="text-align:right">总额</th><th style="text-align:right">已用</th><th>到期</th><th>状态</th></tr></thead><tbody>`;
-            for (const c of credits) {
-                html += `<tr>
-                    <td>${c.name || '-'}</td>
-                    <td style="text-align:right;color:var(--green);font-weight:600">${sign}${(c.balance||0).toFixed(2)}</td>
-                    <td style="text-align:right">${sign}${(c.total||0).toFixed(2)}</td>
-                    <td style="text-align:right;color:var(--yellow)">${sign}${(c.used||0).toFixed(2)}</td>
-                    <td>${c.expires_at || '-'}</td>
-                    <td><span class="badge badge-${c.status === 'ACTIVE' ? 'green' : 'gray'}">${c.status || '-'}</span></td>
-                </tr>`;
-            }
-            html += '</tbody></table></div></div>';
-        } else if (!cred.error) {
-            html += `<div style="padding:20px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px">该账号没有 Credit 活动 (没有 Free Tier 也没有 Promotional Credit)</div>`;
-        }
     }
+    if ((cred.warnings || []).length) {
+        html += `<div style="padding:10px 12px;background:rgba(245,158,11,0.10);border:1px solid var(--yellow);border-radius:8px;margin-bottom:12px;font-size:12px;color:var(--text2);line-height:1.6">
+            <b>⚠ 部分数据缺失:</b><ul style="margin:4px 0 0 18px;padding:0">${cred.warnings.map(w => `<li>${w}</li>`).join('')}</ul>
+        </div>`;
+    }
+
+    // ============ Credit 抵扣 (Cost Explorer) ============
+    html += `
+        <div style="font-size:13px;font-weight:600;color:var(--text);margin:14px 0 8px">📊 Credit 抵扣 (Cost Explorer)</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:8px">
+            <div class="stat-card" style="padding:12px"><div class="label">本月已抵扣 (MTD)</div><div class="value ${usedThisMonth>0.01?'green':''}" style="font-size:22px">${sign}${usedThisMonth.toFixed(2)}</div></div>
+            <div class="stat-card" style="padding:12px"><div class="label">上月抵扣</div><div class="value ${usedLastMonth>0.01?'green':''}" style="font-size:22px">${sign}${usedLastMonth.toFixed(2)}</div></div>
+            <div class="stat-card" style="padding:12px"><div class="label">本年累计 (YTD)</div><div class="value yellow" style="font-size:22px">${sign}${usedYear.toFixed(2)}</div></div>
+            <div class="stat-card" style="padding:12px"><div class="label">历史累计 (≈14 个月)</div><div class="value blue" style="font-size:18px">${sign}${usedHistory.toFixed(2)}</div></div>
+        </div>
+        <div style="font-size:11px;color:var(--text2);margin-bottom:14px">数据源: <code>${cred.source || '-'}</code> · 这些金额表示 Credit 已经为账单抵扣了多少钱, 数字越大说明用 Credit 抵扣得越多</div>
+    `;
+
+    // ============ Free Tier 用量 ============
+    if (ft.length) {
+        html += `<div class="ai-section">
+            <div class="ai-section-title">🎁 Free Tier 12 个月免费额度 (${ft.length} 项)</div>
+            <div class="ai-section-body">
+                <table class="ai-table">
+                    <thead><tr><th>服务</th><th>项目</th><th>区域</th><th style="text-align:right">已用 / 限额</th><th style="width:110px">使用率</th><th style="width:90px">预测</th></tr></thead>
+                    <tbody>`;
+        for (const item of ft) {
+            const pct = Math.min(item.usage_pct || 0, 100);
+            const barColor = item.exceeds ? 'var(--red)' : (pct > 80 ? 'var(--yellow)' : 'var(--green)');
+            const fcst = item.forecasted_usage || 0;
+            const fcstPct = item.limit > 0 ? (fcst / item.limit * 100) : 0;
+            html += `<tr>
+                <td>${item.service || '-'}</td>
+                <td><code style="font-size:11px">${item.operation || ''}</code><div style="font-size:11px;color:var(--text2)">${item.description || ''}</div></td>
+                <td><code style="font-size:11px">${item.region || 'global'}</code></td>
+                <td style="text-align:right;font-weight:600">${item.actual_usage} / ${item.limit} ${item.unit || ''}</td>
+                <td>
+                    <div style="background:var(--bg3);border-radius:6px;height:14px;position:relative;overflow:hidden">
+                        <div style="background:${barColor};height:100%;width:${pct.toFixed(1)}%"></div>
+                    </div>
+                    <span style="font-size:11px;color:var(--text2)">${(item.usage_pct || 0).toFixed(1)}%${item.exceeds?' ⚠超标':''}</span>
+                </td>
+                <td style="font-size:11px;color:var(--text2)">${fcst.toFixed(0)} ${item.unit || ''}<br>(${fcstPct.toFixed(0)}%)</td>
+            </tr>`;
+        }
+        html += `</tbody></table></div></div>`;
+    } else if (!cred.error) {
+        html += `<div style="padding:18px;text-align:center;color:var(--text2);border:1px dashed var(--border);border-radius:8px;font-size:13px">
+            该账号当前周期无 Free Tier 用量记录。<br>
+            <span style="font-size:11px">(老账号超过 12 个月 / 没用 Free Tier 服务都会显示空)</span>
+        </div>`;
+    }
+
     showCreditModal(html);
 }
 
@@ -737,6 +796,222 @@ function showFreeTier(id) {
     window.open('https://console.aws.amazon.com/billing/home#/freetier', '_blank');
     toast('已打开 AWS 免费套餐控制台 (需在新标签登录该账号)', 'info');
 }
+
+// ==================== 🔐 IAM 权限诊断 + 策略生成器 ====================
+// 后端字段:
+//   account_id / iam_user
+//   groups[].{key,title,essential,actions[],status,message,probe_results[],console_enable,console_note}
+//   summary.{total_groups,ok,denied,not_enabled,partial,error,unknown}
+//   policy_minimal / policy_full   (IAM 策略 JSON, 一键复制贴到 IAM)
+//   aws_managed_alts[]             (推荐的 AWS 托管策略, 直接 attach 即可)
+//   iam_console_url / cli_command_examples
+
+const _permCache = {};
+
+async function showPermissions(accountId) {
+    const a = accountsCache.find(x => x.id === accountId);
+    const accName = a ? (a.email || a.name || ('#' + accountId)) : ('#' + accountId);
+
+    // 先弹 modal 显示加载中
+    let html = `
+        <div style="padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:12px;color:var(--text2);font-size:13px">
+            账号: <b style="color:var(--text)">${accName}</b>
+        </div>
+        <div style="text-align:center;padding:30px"><div class="spinner"></div>
+            <div style="margin-top:12px;color:var(--text2)">正在并发探测每个 AWS API 的权限 (约 5-15 秒)...</div>
+        </div>
+    `;
+    showPermissionsModal(html);
+
+    try {
+        const res = await api(`/accounts/${accountId}/permissions?_ts=${Date.now()}`);
+        _permCache[accountId] = res;
+        renderPermissions(accountId, res);
+    } catch (e) {
+        showPermissionsModal(`<div style="color:var(--red);padding:20px;text-align:center">权限诊断失败: ${e.message}</div>`);
+    }
+}
+
+function showPermissionsModal(html) {
+    let modal = document.getElementById('perm-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'perm-modal';
+        modal.className = 'modal';
+        modal.innerHTML = `
+            <div class="modal-content" style="max-width:1000px;width:96%;max-height:92vh;display:flex;flex-direction:column">
+                <div class="modal-header">
+                    <h3>🔐 AWS IAM 权限诊断 + 策略生成器</h3>
+                    <button class="modal-close" onclick="hideModal('perm-modal')">×</button>
+                </div>
+                <div class="modal-body" id="perm-modal-body" style="overflow-y:auto"></div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+    }
+    document.getElementById('perm-modal-body').innerHTML = html;
+    modal.classList.add('show');
+}
+
+function renderPermissions(accountId, res) {
+    const a = accountsCache.find(x => x.id === accountId);
+    const accName = a ? (a.email || a.name || ('#' + accountId)) : ('#' + accountId);
+    const groups = res.groups || [];
+    const summary = res.summary || {};
+    const policyMin = res.policy_minimal;
+    const policyFull = res.policy_full;
+    const managed = res.aws_managed_alts || [];
+    const cli = res.cli_command_examples || {};
+    const iamUser = res.iam_user || '';
+
+    const STATUS_STYLE = {
+        'ok':           { color: 'green',  icon: '✅', text: '通过' },
+        'denied':       { color: 'red',    icon: '❌', text: '无权限' },
+        'not_enabled':  { color: 'yellow', icon: '⚠',  text: '服务未启用' },
+        'partial':      { color: 'yellow', icon: '⚠',  text: '部分通过' },
+        'error':        { color: 'red',    icon: '⚠',  text: '错误' },
+        'invalid':      { color: 'red',    icon: '🔒', text: 'AK/SK 失效' },
+        'unknown':      { color: 'gray',   icon: '？', text: '未探测' },
+    };
+
+    // 关键事实 - 让用户先看到"为啥功能不全"的根本原因
+    let html = `
+        <div style="padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:12px;color:var(--text2);font-size:13px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <span>账号: <b style="color:var(--text)">${accName}</b>${iamUser ? ` · IAM 用户: <code>${iamUser}</code>` : ''}${res.account_id ? ` · AccountID: <code>${res.account_id}</code>` : ''}</span>
+            <button class="btn btn-sm btn-secondary" onclick="showPermissions(${accountId})">🔄 重新诊断</button>
+        </div>
+
+        <div style="padding:10px 12px;background:rgba(59,130,246,0.10);border:1px solid var(--blue);border-radius:8px;margin-bottom:12px;font-size:12px;line-height:1.7;color:var(--text2)">
+            💡 <b>关键事实</b>: AWS CLI / boto3 / 本平台 用的都是 <b>同一套 STS 凭证 + 同一套 IAM 权限</b>, 没有任何 SDK 能"绕过"权限。
+            如果"邮箱拿不到 / 账单为 0 / Free Tier 显示空 / Credit 错误", 99% 是 <b>当前 AK/SK 缺权限</b> 而不是程序 bug。
+            下面 ⬇ 列出每个功能需要的 API 权限 + 你这把 AK/SK 实际是否拥有, 缺啥就贴下面那段 IAM 策略给账号补上。
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:14px">
+            <div class="stat-card" style="padding:10px"><div class="label">总功能</div><div class="value blue" style="font-size:22px">${summary.total_groups || 0}</div></div>
+            <div class="stat-card" style="padding:10px"><div class="label">✅ 通过</div><div class="value green" style="font-size:22px">${summary.ok || 0}</div></div>
+            <div class="stat-card" style="padding:10px"><div class="label">❌ 无权限</div><div class="value ${(summary.denied||0)>0?'red':''}" style="font-size:22px">${summary.denied || 0}</div></div>
+            <div class="stat-card" style="padding:10px"><div class="label">⚠ 部分</div><div class="value yellow" style="font-size:22px">${(summary.partial||0)+(summary.not_enabled||0)}</div></div>
+            <div class="stat-card" style="padding:10px"><div class="label">⚠ 错误</div><div class="value" style="font-size:22px">${summary.error || 0}</div></div>
+        </div>
+    `;
+
+    // 每个功能组的检测结果
+    html += `<div class="ai-section">
+        <div class="ai-section-title">📋 每个功能的权限明细 (绿色=有权限, 红色=缺权限)</div>
+        <div class="ai-section-body">
+            <table class="ai-table">
+                <thead><tr><th style="width:30%">功能</th><th style="width:14%">状态</th><th>说明 / API 探测</th></tr></thead>
+                <tbody>`;
+    for (const g of groups) {
+        const s = STATUS_STYLE[g.status] || STATUS_STYLE['unknown'];
+        const probesHtml = (g.probe_results || []).map(p => {
+            const ok = p.ok ? '✅' : '❌';
+            const msg = p.error ? ` <span style="color:var(--red);font-size:11px">${escapeHtml(p.error)}</span>` : '';
+            return `<div style="font-size:11px"><code>${ok} ${p.api}</code>${msg}</div>`;
+        }).join('');
+        const actionList = (g.actions || []).slice(0, 3).join(', ') + (g.actions?.length > 3 ? ` ... +${g.actions.length-3}` : '');
+        html += `<tr>
+            <td><b>${g.title}</b>${g.essential ? ' <span class="badge badge-blue" style="font-size:10px">必装</span>' : ''}<div style="font-size:11px;color:var(--text2);margin-top:4px"><code>${actionList}</code></div></td>
+            <td><span class="badge badge-${s.color}">${s.icon} ${s.text}</span></td>
+            <td>
+                <div style="font-size:12px">${g.message || ''}</div>
+                ${probesHtml ? `<div style="margin-top:4px">${probesHtml}</div>` : ''}
+                ${g.console_enable ? `<div style="margin-top:4px"><a href="${g.console_enable}" target="_blank" style="font-size:11px">🔗 去控制台启用</a> <span style="font-size:11px;color:var(--text2)">${escapeHtml(g.console_note || '')}</span></div>` : ''}
+            </td>
+        </tr>`;
+    }
+    html += `</tbody></table></div></div>`;
+
+    // ============ 推荐 1: 直接附加 AWS 托管策略 (最简单) ============
+    if (managed.length) {
+        html += `<div class="ai-section">
+            <div class="ai-section-title">🎯 方案 A: 直接附加 AWS 托管策略 (最简单, 推荐)</div>
+            <div class="ai-section-body">
+                <div style="font-size:12px;color:var(--text2);margin-bottom:8px;line-height:1.6">
+                    AWS 已经预先准备好了一堆 <b>托管策略 (Managed Policy)</b>, 不用自己写 JSON。
+                    最省事就是 <b>给该 IAM 用户加一个 AdministratorAccess</b>, 全功能立刻可用。如果想最小权限就按下面表格挑选。
+                </div>
+                <table class="ai-table">
+                    <thead><tr><th>策略名</th><th>能解锁什么</th><th>操作</th></tr></thead>
+                    <tbody>`;
+        for (const p of managed) {
+            html += `<tr>
+                <td><code>${p.name}</code></td>
+                <td style="font-size:12px">${p.desc}</td>
+                <td>
+                    <button class="btn btn-sm btn-secondary" onclick="copyToClipboard('${p.arn}', this)" title="复制 ARN">📋 ARN</button>
+                    <button class="btn btn-sm btn-secondary" onclick="copyToClipboard('aws iam attach-user-policy --user-name ${iamUser || '<USERNAME>'} --policy-arn ${p.arn}', this)" title="复制 CLI 命令">📋 CLI</button>
+                    <a class="btn btn-sm btn-primary" href="${res.iam_console_url || 'https://console.aws.amazon.com/iam/home'}" target="_blank" style="text-decoration:none">🔗 IAM</a>
+                </td>
+            </tr>`;
+        }
+        html += `</tbody></table>
+                <div style="margin-top:8px;padding:8px 10px;background:var(--bg3);border-radius:6px;font-size:11px;color:var(--text2);line-height:1.6">
+                    <b>用法</b>: 复制 CLI 命令到本地 <code>aws configure</code> 已配好 root 的环境执行,
+                    或登录 AWS 控制台 → IAM → 用户 → ${iamUser || '<USERNAME>'} → Add permissions → Attach existing policies → 搜策略名 → Next → Add permissions
+                </div>
+            </div>
+        </div>`;
+    }
+
+    // ============ 推荐 2: 最小补缺策略 JSON ============
+    if (policyMin) {
+        const policyJson = JSON.stringify(policyMin, null, 2);
+        html += `<div class="ai-section">
+            <div class="ai-section-title">📜 方案 B: 最小补缺策略 (只补当前缺的权限)</div>
+            <div class="ai-section-body">
+                <div style="font-size:12px;color:var(--text2);margin-bottom:6px;line-height:1.6">
+                    根据上方诊断结果生成的 <b>最小权限 IAM 策略</b>。复制下面 JSON, 在 IAM → 用户 → ${iamUser || '<USERNAME>'} → Add inline policy → JSON 标签页 → 粘贴 → 命名 <code>DepinManagerPatch</code> → Create policy。
+                </div>
+                <div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">
+                    <button class="btn btn-sm btn-primary" onclick='copyToClipboard(${JSON.stringify(policyJson)}, this)'>📋 复制策略 JSON</button>
+                    <a class="btn btn-sm btn-secondary" href="${res.iam_console_url || 'https://console.aws.amazon.com/iam/home'}" target="_blank" style="text-decoration:none">🔗 IAM 用户控制台</a>
+                </div>
+                <textarea readonly style="width:100%;height:240px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font-family:Consolas,Monaco,monospace;font-size:11px;line-height:1.5;resize:vertical">${escapeHtml(policyJson)}</textarea>
+            </div>
+        </div>`;
+    } else {
+        html += `<div class="ai-section">
+            <div class="ai-section-title">📜 方案 B: 最小补缺策略</div>
+            <div class="ai-section-body">
+                <div style="padding:14px;text-align:center;color:var(--green);font-size:13px">✅ 当前 AK/SK 已拥有所有功能需要的权限, 无需补充</div>
+            </div>
+        </div>`;
+    }
+
+    // ============ 全功能策略 (折叠) ============
+    if (policyFull) {
+        const policyFullJson = JSON.stringify(policyFull, null, 2);
+        html += `<div class="ai-section">
+            <div class="ai-section-title" style="display:flex;justify-content:space-between;align-items:center">
+                <span>📜 方案 C: 一次性给全部权限 (本平台所有功能)</span>
+                <button class="btn btn-sm btn-secondary" onclick="document.getElementById('perm-full-area').style.display=document.getElementById('perm-full-area').style.display==='none'?'block':'none'">展开/收起</button>
+            </div>
+            <div class="ai-section-body" id="perm-full-area" style="display:none">
+                <div style="font-size:12px;color:var(--text2);margin-bottom:6px">如果想直接一次到位 (覆盖本平台所有功能), 就贴这一段:</div>
+                <div style="display:flex;gap:6px;margin-bottom:6px">
+                    <button class="btn btn-sm btn-primary" onclick='copyToClipboard(${JSON.stringify(policyFullJson)}, this)'>📋 复制全功能策略</button>
+                </div>
+                <textarea readonly style="width:100%;height:240px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font-family:Consolas,Monaco,monospace;font-size:11px;line-height:1.5;resize:vertical">${escapeHtml(policyFullJson)}</textarea>
+            </div>
+        </div>`;
+    }
+
+    // ============ 特殊提醒: Cost Explorer / Billing 控制台开关 ============
+    html += `<div style="padding:10px 12px;background:rgba(245,158,11,0.10);border:1px solid var(--yellow);border-radius:8px;margin-top:14px;font-size:12px;line-height:1.7;color:var(--text2)">
+        <b>⚠ 两个特别坑 (光给 IAM 权限不够, 还得开 root 控制台开关)</b>
+        <ol style="margin:6px 0 0 18px;padding:0">
+            <li><b>Cost Explorer</b> 必须先在控制台 <a href="https://console.aws.amazon.com/cost-management/home#/cost-explorer" target="_blank">Billing → Cost Explorer → Enable</a> 点一下, 等 24h 才能 API 查询账单。</li>
+            <li><b>IAM 用户访问账单数据</b> 默认是关闭的, 必须 <b>用 root 账号</b> 登录, 进 <a href="https://console.aws.amazon.com/billing/home#/account" target="_blank">My Account → IAM User and Role Access to Billing Information</a> → 勾选 Activate IAM Access → Update。这一步必须 root 操作, 子账号自己改不了。</li>
+            <li><b>account:GetPrimaryEmail / GetAccountInformation</b> 需要 IAM 策略里加 <code>account:*</code>, 否则邮箱拿不到。</li>
+        </ol>
+    </div>`;
+
+    // 总结 + 关闭按钮
+    showPermissionsModal(html);
+}
+
 
 function openIamLogin(id) {
     const a = accountsCache.find(x => x.id === id);

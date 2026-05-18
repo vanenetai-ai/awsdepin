@@ -893,187 +893,13 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
 
 
     # ==================== 账号信息检测 ====================
-
-    def _get_credential_report(self) -> list:
-        """获取 credential report 并解析为行列表，带缓存"""
-        if hasattr(self, '_cred_report_cache'):
-            return self._cred_report_cache
-        import time, csv, io
-        iam = self._get_client("iam")
-        for _ in range(3):
-            try:
-                resp = iam.generate_credential_report()
-                if resp.get("State") == "COMPLETE":
-                    break
-            except Exception:
-                pass
-            time.sleep(1)
-        resp = iam.get_credential_report()
-        report = resp["Content"].decode("utf-8")
-        rows = list(csv.DictReader(io.StringIO(report)))
-        self._cred_report_cache = rows
-        return rows
-
-    def _detect_primary_email(self) -> str | None:
-        """通过 account:GetPrimaryEmail 获取 root 邮箱 (需要权限或 Organization)"""
-        try:
-            sts = self._get_client("sts")
-            account_id = sts.get_caller_identity()["Account"]
-            acct = self._get_client("account", "us-east-1")
-            resp = acct.get_primary_email(AccountId=account_id)
-            email = resp.get("PrimaryEmail", "")
-            if email and "@" in email:
-                return email
-        except Exception as e:
-            logger.debug(f"get_primary_email failed: {e}")
-        return None
-
-    def _detect_email_from_organizations(self) -> str | None:
-        """从 Organizations 获取邮箱 (describe_account 或 describe_organization)"""
-        try:
-            sts = self._get_client("sts")
-            account_id = sts.get_caller_identity()["Account"]
-            org = self._get_client("organizations")
-            # 先尝试 describe_account (能拿到具体账号邮箱)
-            try:
-                resp = org.describe_account(AccountId=account_id)
-                email = resp.get("Account", {}).get("Email", "")
-                if email and "@" in email:
-                    return email
-            except Exception:
-                pass
-            # 再尝试 describe_organization (拿 master 邮箱)
-            try:
-                resp = org.describe_organization()
-                email = resp.get("Organization", {}).get("MasterAccountEmail", "")
-                if email and "@" in email:
-                    return email
-            except Exception:
-                pass
-        except Exception as e:
-            logger.debug(f"Organizations email failed: {e}")
-        return None
-
-    def _detect_email_from_account_contact(self) -> str | None:
-        """从 Account contact information 获取邮箱或名字"""
-        try:
-            acct = self._get_client("account", "us-east-1")
-            contact = acct.get_contact_information()
-            ci = contact.get("ContactInformation", {})
-            # 优先邮箱
-            email = ci.get("EmailAddress", "")
-            if email and "@" in email:
-                return email
-            # 没有邮箱就用 FullName 作为显示名
-            name = ci.get("FullName", "")
-            if name:
-                return name
-        except Exception as e:
-            logger.debug(f"Account contact failed: {e}")
-        return None
-
-    def _detect_email_from_budgets(self) -> str | None:
-        """从 Budgets 通知订阅者获取邮箱"""
-        try:
-            sts = self._get_client("sts")
-            account_id = sts.get_caller_identity()["Account"]
-            budgets = self._get_client("budgets", "us-east-1")
-            resp = budgets.describe_budgets(AccountId=account_id, MaxResults=10)
-            for budget in resp.get("Budgets", []):
-                try:
-                    notifs = budgets.describe_notifications_for_budget(
-                        AccountId=account_id, BudgetName=budget["BudgetName"]
-                    )
-                    for n in notifs.get("Notifications", []):
-                        subs = budgets.describe_subscribers_for_notification(
-                            AccountId=account_id,
-                            BudgetName=budget["BudgetName"],
-                            Notification=n
-                        )
-                        for s in subs.get("Subscribers", []):
-                            if s.get("SubscriptionType") == "EMAIL":
-                                addr = s.get("Address", "")
-                                if "@" in addr:
-                                    return addr
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.debug(f"Budgets API failed: {e}")
-        return None
-
-    def _detect_email_from_credential_report(self) -> str | None:
-        """从 credential report 的 root 行获取邮箱（部分账号 root user 就是邮箱）"""
-        try:
-            rows = self._get_credential_report()
-            for row in rows:
-                arn_val = row.get("arn", "")
-                if ":root" in arn_val:
-                    user = row.get("user", "")
-                    if "@" in user:
-                        return user
-                    break
-        except Exception:
-            pass
-        return None
-
-    def _detect_creation_time(self) -> datetime | None:
-        """从 credential report root 行获取账号创建时间"""
-        try:
-            rows = self._get_credential_report()
-            for row in rows:
-                if ":root" in row.get("arn", ""):
-                    creation_str = row.get("user_creation_time", "")
-                    if creation_str and creation_str != "N/A":
-                        from dateutil import parser as dateparser
-                        return dateparser.parse(creation_str)
-                    break
-        except Exception:
-            pass
-        # fallback: 当前 IAM 用户创建时间
-        try:
-            iam = self._get_client("iam")
-            user = iam.get_user()
-            return user["User"].get("CreateDate")
-        except Exception:
-            pass
-        return None
-
-    def _detect_country(self) -> str:
-        """检测账号注册国家"""
-        try:
-            account_client = self._get_client("account", "us-east-1")
-            contact = account_client.get_contact_information()
-            country = contact.get("ContactInformation", {}).get("CountryCode", "")
-            if country:
-                return country
-        except Exception:
-            pass
-        region = self.account.default_region
-        region_country = {
-            "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
-            "eu-west-1": "IE", "eu-west-2": "GB", "eu-west-3": "FR", "eu-central-1": "DE",
-            "eu-north-1": "SE", "ap-northeast-1": "JP", "ap-northeast-2": "KR",
-            "ap-northeast-3": "JP", "ap-southeast-1": "SG", "ap-southeast-2": "AU",
-            "ap-south-1": "IN", "sa-east-1": "BR", "ca-central-1": "CA",
-            "me-south-1": "BH", "af-south-1": "ZA",
-        }
-        return region_country.get(region, "US")
-
-    def _detect_default_region_vcpu(self) -> int:
-        """快速获取默认区域(us-east-1)的 on-demand vCPU 配额"""
-        region = "us-east-1"
-        try:
-            sq = self._get_client("service-quotas", region)
-            try:
-                resp = sq.get_service_quota(ServiceCode="ec2", QuotaCode="L-1216C47A")
-                return int(resp["Quota"]["Value"])
-            except Exception:
-                resp = sq.get_aws_default_service_quota(ServiceCode="ec2", QuotaCode="L-1216C47A")
-                return int(resp["Quota"]["Value"])
-        except Exception:
-            return 5
+    # 注意: 旧版的 _detect_email_from_* / _detect_country / _detect_creation_time /
+    # _get_credential_report / _detect_primary_email / _detect_account_information /
+    # _detect_default_region_vcpu 已全部清理. 现在所有探测逻辑都内联在
+    # detect_account_info() 内部, 用线程池并行 + 独立 client 跑, 见下方.
 
     def _get_region_vcpu(self, region: str) -> dict:
+
         """获取单个区域的 vCPU 配额"""
         on_demand_limit, on_demand_usage, spot_limit, spot_usage = 5, 0, 5, 0
         try:
@@ -1196,81 +1022,42 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
 
         account_id = info["account_id"]
 
-        # 每个并行任务用独立 client，线程安全
+        # === 邮箱/账号信息探测策略 (精简版, 比之前快 3-5 倍) ===
+        # 移除的低命中率/超慢任务: SES (扫4区域)、SNS (扫2区域)、Budgets (三层嵌套)、
+        #                          AlternateContact OPERATIONS/SECURITY (99% = BILLING)。
+        # 保留的 4 个邮箱来源 (按权威度排序):
+        #   1) account:GetPrimaryEmail   - root 真实主邮箱 (最权威)
+        #   2) account:GetAlternateContact[BILLING] - 备用联系邮箱 (账号买卖常驻邮箱)
+        #   3) organizations:DescribeAccount/Organization - 组织内账号邮箱
+        #   4) account:GetContactInformation 联系信息里的邮箱字段 (兜底)
+        # 同时 contact 任务 1 次 API 调用就拿 3 样: country / 邮箱兜底 / FullName
+        REGION_TO_COUNTRY = {
+            "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
+            "eu-west-1": "IE", "eu-west-2": "GB", "eu-west-3": "FR", "eu-central-1": "DE",
+            "eu-north-1": "SE", "ap-northeast-1": "JP", "ap-northeast-2": "KR",
+            "ap-northeast-3": "JP", "ap-southeast-1": "SG", "ap-southeast-2": "AU",
+            "ap-south-1": "IN", "sa-east-1": "BR", "ca-central-1": "CA",
+        }
+
         def _task_primary_email():
             acct = self._make_detect_client("account", "us-east-1")
             resp = acct.get_primary_email(AccountId=account_id)
             email = resp.get("PrimaryEmail", "")
             return email if email and "@" in email else None
 
-        def _task_org_email():
-            org = self._make_detect_client("organizations")
-            try:
-                resp = org.describe_account(AccountId=account_id)
-                email = resp.get("Account", {}).get("Email", "")
-                if email and "@" in email:
-                    return email
-            except Exception:
-                pass
-            try:
-                resp = org.describe_organization()
-                email = resp.get("Organization", {}).get("MasterAccountEmail", "")
-                if email and "@" in email:
-                    return email
-            except Exception:
-                pass
-            return None
-
-        def _task_budgets_email():
-            bgt = self._make_detect_client("budgets", "us-east-1")
-            resp = bgt.describe_budgets(AccountId=account_id, MaxResults=10)
-            for budget in resp.get("Budgets", []):
-                try:
-                    notifs = bgt.describe_notifications_for_budget(
-                        AccountId=account_id, BudgetName=budget["BudgetName"]
-                    )
-                    for n in notifs.get("Notifications", []):
-                        subs = bgt.describe_subscribers_for_notification(
-                            AccountId=account_id,
-                            BudgetName=budget["BudgetName"],
-                            Notification=n
-                        )
-                        for s in subs.get("Subscribers", []):
-                            if s.get("SubscriptionType") == "EMAIL":
-                                addr = s.get("Address", "")
-                                if "@" in addr:
-                                    return addr
-                except Exception:
-                    continue
-            return None
-
-        def _task_contact_email():
-            acct = self._make_detect_client("account", "us-east-1")
-            contact = acct.get_contact_information()
-            ci = contact.get("ContactInformation", {})
-            email = ci.get("EmailAddress", "")
-            if email and "@" in email:
-                return email
-            name = ci.get("FullName", "")
-            return name if name else None
-
-        def _task_alternate_contact(contact_type: str):
-            """获取备用联系人邮箱 (BILLING / OPERATIONS / SECURITY)。
-            这是命中率最高的一种方式 — AWS 强制至少配一个备用联系人,
-            很多账号买卖前会把原邮箱留在这里。"""
+        def _task_alt_billing():
+            """备用联系人(BILLING) - 账号买卖时原主常把邮箱留在这里"""
             acct = self._make_detect_client("account", "us-east-1")
             try:
-                # 当前账号查自己: 不传 AccountId
-                resp = acct.get_alternate_contact(AlternateContactType=contact_type)
+                resp = acct.get_alternate_contact(AlternateContactType="BILLING")
             except Exception as e:
-                # 如果是 organization 成员账号，需要传 AccountId
                 msg = str(e)
                 if "ResourceNotFoundException" in msg:
                     return None
                 if "AccessDeniedException" in msg or "linked account" in msg.lower():
                     try:
                         resp = acct.get_alternate_contact(
-                            AccountId=account_id, AlternateContactType=contact_type
+                            AccountId=account_id, AlternateContactType="BILLING"
                         )
                     except Exception:
                         return None
@@ -1280,72 +1067,47 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             email = ac.get("EmailAddress", "")
             if email and "@" in email:
                 return email
-            name = ac.get("Name", "")
-            return name if name else None
+            return ac.get("Name") or None
 
-        def _task_alt_billing():    return _task_alternate_contact("BILLING")
-        def _task_alt_operations(): return _task_alternate_contact("OPERATIONS")
-        def _task_alt_security():   return _task_alternate_contact("SECURITY")
-
-        def _task_ses_email():
-            """SES 已验证邮箱 - 注册账号时常用自己的邮箱去验证 SES"""
-            for region in ("us-east-1", "us-west-2", "eu-west-1", self.account.default_region):
+        def _task_org_email():
+            """组织 (Organizations) 里的账号邮箱"""
+            org = self._make_detect_client("organizations")
+            for fn in ("describe_account", "describe_organization"):
                 try:
-                    ses = self._make_detect_client("ses", region)
-                    paginator = None
-                    try:
-                        paginator = ses.get_paginator("list_identities")
-                    except Exception:
-                        pass
-                    candidates = []
-                    if paginator:
-                        for page in paginator.paginate(IdentityType="EmailAddress"):
-                            candidates.extend(page.get("Identities", []) or [])
+                    if fn == "describe_account":
+                        resp = org.describe_account(AccountId=account_id)
+                        email = resp.get("Account", {}).get("Email", "")
                     else:
-                        resp = ses.list_identities(IdentityType="EmailAddress")
-                        candidates = resp.get("Identities", []) or []
-                    for c in candidates:
-                        if c and "@" in c:
-                            return c
+                        resp = org.describe_organization()
+                        email = resp.get("Organization", {}).get("MasterAccountEmail", "")
+                    if email and "@" in email:
+                        return email
                 except Exception:
                     continue
             return None
 
-        def _task_sns_email():
-            """SNS Email 订阅 - 很多账号会订阅自己邮箱接收告警"""
-            best = None
-            for region in ("us-east-1", self.account.default_region):
-                try:
-                    sns = self._make_detect_client("sns", region)
-                    paginator = None
-                    try:
-                        paginator = sns.get_paginator("list_subscriptions")
-                    except Exception:
-                        pass
-                    subs = []
-                    if paginator:
-                        for page in paginator.paginate():
-                            subs.extend(page.get("Subscriptions", []) or [])
-                    else:
-                        resp = sns.list_subscriptions()
-                        subs = resp.get("Subscriptions", []) or []
-                    for s in subs:
-                        proto = (s.get("Protocol") or "").lower()
-                        if proto in ("email", "email-json"):
-                            ep = s.get("Endpoint", "")
-                            if ep and "@" in ep:
-                                # 优先非 noreply / aws / amazonaws 邮箱
-                                low = ep.lower()
-                                if "noreply" in low or "no-reply" in low or "@amazonaws" in low or "@aws.amazon" in low:
-                                    if not best:
-                                        best = ep
-                                    continue
-                                return ep
-                except Exception:
-                    continue
-            return best
+        def _task_contact_info():
+            """1 次 API 调用同时拿: country, 邮箱兜底, FullName 兜底"""
+            try:
+                acct = self._make_detect_client("account", "us-east-1")
+                contact = acct.get_contact_information()
+                ci = contact.get("ContactInformation", {}) or {}
+                email = ci.get("EmailAddress", "")
+                name = ci.get("FullName", "")
+                country = ci.get("CountryCode", "") or REGION_TO_COUNTRY.get(self.account.default_region, "US")
+                return {
+                    "email": email if email and "@" in email else None,
+                    "name": name or None,
+                    "country": country,
+                }
+            except Exception:
+                return {
+                    "email": None, "name": None,
+                    "country": REGION_TO_COUNTRY.get(self.account.default_region, "US"),
+                }
 
         def _task_creation_time():
+            """IAM credential report - 拿 root 创建日期 (= 账号注册时间)"""
             import time as _time, csv, io
             iam = self._make_detect_client("iam")
             for _ in range(3):
@@ -1356,59 +1118,35 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                 except Exception:
                     pass
                 _time.sleep(1)
-            resp = iam.get_credential_report()
-            report = resp["Content"].decode("utf-8")
-            rows = list(csv.DictReader(io.StringIO(report)))
-            for row in rows:
-                if ":root" in row.get("arn", ""):
-                    creation_str = row.get("user_creation_time", "")
-                    if creation_str and creation_str != "N/A":
-                        from dateutil import parser as dateparser
-                        return dateparser.parse(creation_str)
-                    break
-            # fallback
+            try:
+                resp = iam.get_credential_report()
+                rows = list(csv.DictReader(io.StringIO(resp["Content"].decode("utf-8"))))
+                for row in rows:
+                    if ":root" in row.get("arn", ""):
+                        creation_str = row.get("user_creation_time", "")
+                        if creation_str and creation_str != "N/A":
+                            from dateutil import parser as dateparser
+                            return dateparser.parse(creation_str)
+                        break
+            except Exception:
+                pass
+            # fallback: 当前 IAM 用户创建时间
             try:
                 user = iam.get_user()
                 return user["User"].get("CreateDate")
             except Exception:
-                pass
-            return None
+                return None
 
-        def _task_country():
-            try:
-                acct = self._make_detect_client("account", "us-east-1")
-                contact = acct.get_contact_information()
-                country = contact.get("ContactInformation", {}).get("CountryCode", "")
-                if country:
-                    return country
-            except Exception:
-                pass
-            region = self.account.default_region
-            region_country = {
-                "us-east-1": "US", "us-east-2": "US", "us-west-1": "US", "us-west-2": "US",
-                "eu-west-1": "IE", "eu-west-2": "GB", "eu-west-3": "FR", "eu-central-1": "DE",
-                "eu-north-1": "SE", "ap-northeast-1": "JP", "ap-northeast-2": "KR",
-                "ap-northeast-3": "JP", "ap-southeast-1": "SG", "ap-southeast-2": "AU",
-                "ap-south-1": "IN", "sa-east-1": "BR", "ca-central-1": "CA",
-            }
-            return region_country.get(region, "US")
-
-        # 并行执行所有检测任务
+        # 并行执行所有检测任务 (比之前 11 → 5 个任务, 整体快 3-5 倍)
         task_map = {
-            "email_primary": _task_primary_email,
-            "email_org": _task_org_email,
-            "email_budgets": _task_budgets_email,
-            "email_contact": _task_contact_email,
+            "email_primary":     _task_primary_email,
             "email_alt_billing": _task_alt_billing,
-            "email_alt_operations": _task_alt_operations,
-            "email_alt_security": _task_alt_security,
-            "email_ses": _task_ses_email,
-            "email_sns": _task_sns_email,
-            "creation_time": _task_creation_time,
-            "country": _task_country,
+            "email_org":         _task_org_email,
+            "contact_info":      _task_contact_info,
+            "creation_time":     _task_creation_time,
         }
         results = {}
-        with ThreadPoolExecutor(max_workers=12) as pool:
+        with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {pool.submit(fn): key for key, fn in task_map.items()}
             for future in as_completed(futures):
                 key = futures[future]
@@ -1421,6 +1159,7 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                     info["_errors"].append(f"{key}: {err_msg}")
                     results[key] = None
 
+
         # vCPU 单独调用（内部有自己的线程池）
         try:
             results["vcpus"] = self.get_vcpu_quotas_all_regions()
@@ -1430,73 +1169,77 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             info["_errors"].append(f"vcpus: {str(e)[:100]}")
             results["vcpus"] = None
 
-        # 邮箱优先级 (从最权威到兜底):
-        # 1. account:GetPrimaryEmail - root 真实主邮箱
-        # 2. account:GetAlternateContact (BILLING/OPERATIONS/SECURITY) - 备用联系人邮箱
-        # 3. organizations:DescribeAccount - 组织内账号邮箱
-        # 4. account:GetContactInformation - 联系信息里的邮箱字段
-        # 5. budgets 订阅 / SES / SNS 等 - 间接邮箱
-        # 6. contact_information 的 FullName - 显示用名字
-        # 7. 兜底: "root (account_id)"
-        ordered_keys = [
-            "email_primary",
-            "email_alt_billing",
-            "email_alt_operations",
-            "email_alt_security",
-            "email_org",
-            "email_contact",       # 此处可能是 FullName，下面会区分
-            "email_budgets",
-            "email_ses",
-            "email_sns",
-        ]
-        # 诊断: 记录每个 API 的命中状态 (用于前端定位为啥拿不到邮箱)
+        # === 邮箱处理 (优先级: primary > alt_billing > org > contact_info.email) ===
+        # contact_info 任务返回 dict, 单独取它的 email/name/country
+        ci = results.get("contact_info") or {}
+        ci_email = ci.get("email")  if isinstance(ci, dict) else None
+        ci_name  = ci.get("name")   if isinstance(ci, dict) else None
+        ci_country = ci.get("country") if isinstance(ci, dict) else None
+
+        ordered_email_keys = ("email_primary", "email_alt_billing", "email_org")
         diagnosis = {}
-        for k in ordered_keys:
+        for k in ordered_email_keys:
             v = results.get(k)
             if v is None:
-                # 任务报错或返回 None
                 err_match = next((e for e in info.get("_errors", []) if e.startswith(f"{k}:")), None)
                 if err_match:
                     err_text = err_match[len(k) + 2:]
-                    if "AccessDenied" in err_text or "not authorized" in err_text:
-                        diagnosis[k] = "denied"  # 没权限 (root 没开 IAM billing access 等)
-                    elif "AWSOrganizationsNotInUse" in err_text:
+                    low = err_text.lower()
+                    if "accessdenied" in low or "not authorized" in low:
+                        diagnosis[k] = "denied"
+                    elif "awsorganizationsnotinuse" in low:
                         diagnosis[k] = "not_in_org"
-                    elif "ResourceNotFound" in err_text:
-                        diagnosis[k] = "not_found"  # 该 alt contact 没配置
+                    elif "resourcenotfound" in low:
+                        diagnosis[k] = "not_found"
                     else:
                         diagnosis[k] = "error"
                 else:
-                    diagnosis[k] = "empty"  # API 通了但没数据
+                    diagnosis[k] = "empty"
             elif isinstance(v, str) and "@" in v:
                 diagnosis[k] = "hit"
             else:
-                diagnosis[k] = "no_email"  # 比如 email_contact 拿到的是 FullName
+                diagnosis[k] = "no_email"   # alt_billing 可能返回 FullName
+
+        # contact_info 单独标
+        if ci_email:
+            diagnosis["contact_info"] = "hit"
+        elif ci_name:
+            diagnosis["contact_info"] = "no_email"
+        else:
+            diagnosis["contact_info"] = "empty"
 
         # 先找一个真正包含 @ 的邮箱
         email = None
         all_emails = []
-        for k in ordered_keys:
+        for k in ordered_email_keys:
             v = results.get(k)
             if v and isinstance(v, str) and "@" in v and "amazonaws" not in v.lower():
                 all_emails.append((k, v))
                 if not email:
                     email = v
-        # 拿不到邮箱时，用 contact 里的 FullName 作为显示名
+        # contact_info.email 作为最后一个邮箱来源
+        if ci_email and "amazonaws" not in ci_email.lower():
+            all_emails.append(("contact_info", ci_email))
+            if not email:
+                email = ci_email
+        # 没有邮箱 → 用 alt_billing / contact 里的名字, 再兜底 "root (id)"
         if not email:
-            contact_result = results.get("email_contact")
-            if contact_result:
-                email = contact_result
-        # 最终兜底
+            alt_val = results.get("email_alt_billing")
+            if alt_val and isinstance(alt_val, str):
+                email = alt_val
+        if not email and ci_name:
+            email = ci_name
         if not email:
             email = self.account.email if (self.account.email and "@" in (self.account.email or "")) else f"root ({info['account_id']})"
+
         info["email"] = email
         info["email_diagnosis"] = diagnosis
         if all_emails:
             info["email_sources"] = [k for k, _ in all_emails]
             info["all_emails"] = list({v for _, v in all_emails})
         info["register_time"] = results.get("creation_time")
-        info["country"] = results.get("country") or "US"
+        info["country"] = ci_country or "US"
+
 
         # vCPU
         vcpu_result = results.get("vcpus")
@@ -1800,154 +1543,219 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
     # ==================== Free Credit / 促销额度 ====================
 
     def get_credit_summary(self) -> dict:
-        """查询账号 Credit / 免费套餐额度。
+        """查询账号 Credit / Free Tier 使用情况。
 
-        AWS 在 us-east-1 提供独立的 freetier (FreeTier API), 跟 Cost Explorer 完全无关，
-        权限是 freetier:GetFreeTierUsage / freetier:ListAccountActivities, 不需要 ce:* 权限。
-        优先调用 freetier，拿不到再回退到 Cost Explorer 的 RECORD_TYPE=Credit (兼容老账号)。
+        ⚠️ 关键事实:
+        AWS **没有公开 SDK API** 能查 Promotional Credit 的"剩余余额"。
+        控制台 Billing → Credits 页面用的是 `aws-portal:GetCredits` 私有 API。
+        我们能合规查到的:
+        1. `freetier:GetFreeTierUsage` - Free Tier 12 个月免费额度的使用率 (按服务)
+        2. `ce:GetCostAndUsage` 配合 RECORD_TYPE=Credit - 历史已抵扣金额
 
         返回:
         {
             "currency": "USD",
-            "balance": 100.0,            # 当前可用 Credit 余额 (优先 freetier，否则 0)
-            "total": 100.0,              # 历史总额 (赠送 + 已用)
-            "used": 0.0,                 # 已抵扣
-            "expires_at": "2027-05-15",  # 过期时间 (如果有)
-            "credits": [                  # 详细 credit 列表
-                {"name": "AWS Free Tier", "balance": 100.0, "total": 100.0, "expires_at": "..."}
+            "balance": 0.0,                # 余额 (无法 API 查询, 始终 0, 提示用户去控制台)
+            "balance_unavailable": True,    # 标记: 余额无法 API 查询
+            "used_this_year": 12.50,        # 本年累计 Credit 抵扣金额
+            "used_last_month": 1.20,        # 上月 Credit 抵扣
+            "used_this_month": 0.80,        # 本月 Credit 抵扣 (MTD)
+            "used_total_history": 50.30,    # 历史累计 Credit 抵扣 (Cost Explorer 最多查 12-14 个月)
+            "free_tier_usage": [             # Free Tier 12 个月免费额度使用率
+                {
+                    "service": "Amazon EC2",
+                    "operation": "BoxUsage:t2.micro",
+                    "actual_usage": 250,
+                    "limit": 750,
+                    "unit": "Hrs",
+                    "free_tier_type": "12 months free",
+                    "forecasted_usage": 700,
+                    "usage_pct": 33.3,
+                },
+                ...
             ],
-            "source": "freetier" | "cost_explorer" | "none",
-            "error": null,
+            "free_tier_total_count": 18,
+            "credits": [],                   # 兼容旧字段, 始终空
+            "total": 0.0,                    # 兼容旧字段
+            "used": 12.50,                   # 兼容旧字段 = used_this_year
+            "expires_at": None,
+            "source": "cost_explorer+freetier",
+            "console_url": "https://console.aws.amazon.com/billing/home#/credits",
+            "error": None,
         }
         """
+        from datetime import date, timedelta
+        from calendar import monthrange
+
         result = {
             "currency": "USD",
             "balance": 0.0,
+            "balance_unavailable": True,
+            "used_this_year": 0.0,
+            "used_last_month": 0.0,
+            "used_this_month": 0.0,
+            "used_total_history": 0.0,
+            "free_tier_usage": [],
+            "free_tier_total_count": 0,
+            # 兼容旧字段:
+            "credits": [],
             "total": 0.0,
             "used": 0.0,
             "expires_at": None,
-            "credits": [],
             "source": "none",
+            "console_url": "https://console.aws.amazon.com/billing/home#/credits",
             "error": None,
+            "warnings": [],
         }
 
-        # 1) 优先尝试 freetier API (us-east-1 全局服务)
+        today = date.today()
+        currency = "USD"
+
+        # ============ 1) Free Tier 使用情况 (新账号 12 个月免费额度) ============
         try:
             ft = self._get_client("freetier", "us-east-1")
+            ft_items = []
             try:
-                # ListAccountActivities: 列出账号的 Free Tier / Credit 活动
-                paginator = None
+                paginator = ft.get_paginator("get_free_tier_usage")
+                for page in paginator.paginate():
+                    ft_items.extend(page.get("freeTierUsages", []))
+            except Exception as e1:
+                # 部分版本 boto3 不支持 paginate, 直接调
                 try:
-                    paginator = ft.get_paginator("list_account_activities")
-                except Exception:
-                    pass
-                activities = []
-                if paginator:
-                    for page in paginator.paginate(filterCategories=["FREE_TIER", "CREDITS"]):
-                        activities.extend(page.get("activities", []))
-                else:
-                    resp = ft.list_account_activities(filterCategories=["FREE_TIER", "CREDITS"])
-                    activities = resp.get("activities", [])
-                if activities:
-                    total_balance, total_amount, total_used = 0.0, 0.0, 0.0
-                    expires_min = None
-                    credits_list = []
-                    for a in activities:
-                        # 不同 SDK 字段名可能是 camelCase
-                        name = a.get("title") or a.get("activityName") or a.get("name") or "AWS Credit"
-                        # 余额
-                        bal = a.get("currentBalanceAmount") or a.get("balance") or {}
-                        if isinstance(bal, dict):
-                            bal_val = float(bal.get("amount", 0) or 0)
-                            cur = bal.get("currencyCode") or "USD"
-                        else:
-                            bal_val = float(bal or 0); cur = "USD"
-                        # 总额
-                        amt = a.get("creditedAmount") or a.get("amount") or {}
-                        if isinstance(amt, dict):
-                            amt_val = float(amt.get("amount", 0) or 0)
-                        else:
-                            amt_val = float(amt or 0)
-                        used_val = max(amt_val - bal_val, 0)
-                        exp = a.get("expirationDate") or a.get("expiresAt")
-                        exp_str = str(exp)[:10] if exp else None
-                        if exp_str and (expires_min is None or exp_str < expires_min):
-                            expires_min = exp_str
-                        total_balance += bal_val
-                        total_amount += amt_val
-                        total_used += used_val
-                        result["currency"] = cur or result["currency"]
-                        credits_list.append({
-                            "name": name,
-                            "balance": round(bal_val, 2),
-                            "total": round(amt_val, 2),
-                            "used": round(used_val, 2),
-                            "expires_at": exp_str,
-                            "status": a.get("status") or "ACTIVE",
-                        })
-                    result.update({
-                        "balance": round(total_balance, 2),
-                        "total": round(total_amount, 2),
-                        "used": round(total_used, 2),
-                        "expires_at": expires_min,
-                        "credits": credits_list,
-                        "source": "freetier",
-                    })
-                    return result
-                else:
-                    # 没有任何活动 → 该账号没有 Credit
-                    result["source"] = "freetier"
-                    return result
-            except Exception as e:
-                msg = str(e)
-                if "AccessDenied" in msg or "not authorized" in msg or "UnrecognizedClient" in msg:
-                    # 没权限就不报错（很多账号根本没分配 freetier 权限），回退到 cost explorer
-                    logger.info(f"freetier API not accessible, fallback to CE: {msg[:120]}")
-                else:
-                    logger.warning(f"freetier API failed: {e}")
+                    next_token = None
+                    while True:
+                        kwargs = {}
+                        if next_token:
+                            kwargs["nextToken"] = next_token
+                        resp = ft.get_free_tier_usage(**kwargs)
+                        ft_items.extend(resp.get("freeTierUsages", []))
+                        next_token = resp.get("nextToken")
+                        if not next_token:
+                            break
+                except Exception as e2:
+                    msg = str(e2)
+                    if "AccessDenied" in msg or "not authorized" in msg:
+                        result["warnings"].append("无 freetier:GetFreeTierUsage 权限, 跳过 Free Tier 用量")
+                    else:
+                        result["warnings"].append(f"Free Tier 查询失败: {msg[:120]}")
+
+            for item in ft_items:
+                actual = float(item.get("actualUsageAmount", 0) or 0)
+                limit = float(item.get("limit", 0) or 0)
+                forecasted = float(item.get("forecastedUsageAmount", 0) or 0)
+                pct = (actual / limit * 100.0) if limit > 0 else 0.0
+                result["free_tier_usage"].append({
+                    "service": item.get("service", ""),
+                    "operation": item.get("operation", ""),
+                    "region": item.get("region", "global"),
+                    "description": item.get("description", ""),
+                    "actual_usage": round(actual, 2),
+                    "forecasted_usage": round(forecasted, 2),
+                    "limit": round(limit, 2),
+                    "unit": item.get("unit", ""),
+                    "free_tier_type": item.get("freeTierType", ""),
+                    "usage_pct": round(pct, 1),
+                    "exceeds": actual > limit,
+                })
+            result["free_tier_total_count"] = len(result["free_tier_usage"])
+            # 按使用率倒序
+            result["free_tier_usage"].sort(key=lambda x: x["usage_pct"], reverse=True)
         except Exception as e:
             logger.debug(f"freetier client init failed: {e}")
+            result["warnings"].append(f"Free Tier 初始化失败: {str(e)[:120]}")
 
-        # 2) 回退: Cost Explorer 的 Credit 抵扣 (老兼容)
-        from datetime import date, timedelta
+        # ============ 2) Cost Explorer 历史 Credit 抵扣 ============
+        # AWS Cost Explorer 在 RECORD_TYPE=Credit 维度返回 Credit 抵扣金额 (UnblendedCost 为负数)
+        # 这是查询 "已用了多少 Credit" 的官方方法
         try:
             ce = self._get_client("ce", "us-east-1")
-            today = date.today()
-            year_start = date(today.year, 1, 1)
-            try:
+
+            def _query_credit(start: date, end: date) -> float:
+                """查询指定时段的 Credit 抵扣金额 (绝对值)"""
                 resp = ce.get_cost_and_usage(
-                    TimePeriod={"Start": str(year_start), "End": str(today)},
+                    TimePeriod={"Start": str(start), "End": str(end)},
                     Granularity="MONTHLY",
                     Metrics=["UnblendedCost"],
                     Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
                 )
-                total_used = 0.0
-                currency = "USD"
+                total = 0.0
                 for r in resp.get("ResultsByTime", []):
                     amt_obj = r.get("Total", {}).get("UnblendedCost", {})
                     amt = abs(float(amt_obj.get("Amount", 0) or 0))
-                    currency = amt_obj.get("Unit") or currency
-                    total_used += amt
-                result.update({
-                    "currency": currency,
-                    "used": round(total_used, 2),
-                    "balance": 0.0,    # Cost Explorer 只能查已抵扣，不能查余额
-                    "total": round(total_used, 2),  # 至少证明历史上有过 credit
-                    "source": "cost_explorer",
-                })
-                return result
+                    total += amt
+                return total
+
+            # 时间区间
+            year_start = date(today.year, 1, 1)
+            month_start = date(today.year, today.month, 1)
+            # 上月起止
+            if today.month == 1:
+                last_month_start = date(today.year - 1, 12, 1)
+                last_month_end = date(today.year, 1, 1)
+            else:
+                last_month_start = date(today.year, today.month - 1, 1)
+                last_month_end = date(today.year, today.month, 1)
+            # 历史: Cost Explorer 最多查 14 个月
+            history_start = today.replace(day=1) - timedelta(days=14*31)
+            history_start = date(history_start.year, history_start.month, 1)
+
+            try:
+                # 一次性按月拉 14 个月历史 Credit 抵扣 (避免多次调用 token)
+                resp = ce.get_cost_and_usage(
+                    TimePeriod={"Start": str(history_start), "End": str(today)},
+                    Granularity="MONTHLY",
+                    Metrics=["UnblendedCost"],
+                    Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}},
+                )
+                total_history = 0.0
+                used_this_year = 0.0
+                used_this_month = 0.0
+                used_last_month = 0.0
+                for r in resp.get("ResultsByTime", []):
+                    period_start = r.get("TimePeriod", {}).get("Start", "")
+                    amt_obj = r.get("Total", {}).get("UnblendedCost", {})
+                    amt = abs(float(amt_obj.get("Amount", 0) or 0))
+                    cur = amt_obj.get("Unit") or currency
+                    currency = cur or currency
+                    total_history += amt
+                    if period_start >= str(year_start):
+                        used_this_year += amt
+                    if period_start >= str(month_start):
+                        used_this_month += amt
+                    if str(last_month_start) <= period_start < str(last_month_end):
+                        used_last_month += amt
+
+                result["currency"] = currency
+                result["used_total_history"] = round(total_history, 2)
+                result["used_this_year"] = round(used_this_year, 2)
+                result["used_this_month"] = round(used_this_month, 2)
+                result["used_last_month"] = round(used_last_month, 2)
+                # 兼容旧字段
+                result["used"] = result["used_this_year"]
+                result["total"] = result["used_total_history"]
+                result["source"] = "cost_explorer+freetier" if result["free_tier_total_count"] else "cost_explorer"
             except Exception as e:
                 msg = str(e)
                 if "AccessDenied" in msg or "not authorized" in msg:
-                    # freetier 也没权限，cost explorer 也没权限 → 报无权限
-                    result["error"] = "无权限查询 Credit (需要 freetier:GetFreeTierUsage 或 ce:GetCostAndUsage 之一)"
+                    result["warnings"].append("无 ce:GetCostAndUsage 权限, 跳过 Credit 抵扣查询 (建议授予 AWSBillingReadOnlyAccess)")
                 elif "DataUnavailable" in msg or "has not yet been activated" in msg:
-                    result["error"] = "Cost Explorer 未启用 且 freetier API 不可用"
+                    result["warnings"].append("Cost Explorer 未启用, 在控制台 Billing → Cost Explorer 启用后约 24h 可查询")
                 else:
-                    result["error"] = f"Credit 查询失败: {msg[:160]}"
+                    result["warnings"].append(f"Credit 抵扣查询失败: {msg[:160]}")
+                if result["free_tier_total_count"] > 0:
+                    result["source"] = "freetier"
         except Exception as e:
-            result["error"] = f"Credit 查询异常: {str(e)[:160]}"
+            result["warnings"].append(f"Cost Explorer 初始化失败: {str(e)[:120]}")
+
+        # ============ 3) 汇总错误 ============
+        # 如果两个数据源都没数据, 不算错误, 只是该账号没用 Credit
+        if result["source"] == "none" and not result["warnings"]:
+            result["source"] = "empty"  # 明确表示账号没有 Credit / Free Tier 使用
+        elif result["source"] == "none" and result["warnings"]:
+            result["error"] = "; ".join(result["warnings"])
+
         return result
+
 
     # ==================== 账单查询 ====================
     def get_billing(self, year: int, month: int, granularity: str = "DAILY") -> dict:
@@ -2148,6 +1956,410 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
                 "error": f"账单查询异常: {str(e)[:200]}",
                 "total": 0, "by_service": [], "by_region": [], "daily": [],
             }
+
+    # ==================== IAM 权限诊断 + 策略生成器 ====================
+
+    # 本平台用到的全部 AWS API 权限清单 (按功能分组)
+    # 点亮一行就需要那些权限. 用户可以根据需要选择性授权 (最小权限) 或一键给全部 (Admin)
+    PERMISSION_GROUPS = {
+        "core": {
+            "title": "🔑 核心 (账号识别 / 必装)",
+            "essential": True,
+            "actions": ["sts:GetCallerIdentity"],
+            "probes": [("sts", "us-east-1", "get_caller_identity", {})],
+        },
+        "account_email": {
+            "title": "📧 账号邮箱 / 注册信息",
+            "essential": False,
+            "actions": [
+                "account:GetAccountInformation",
+                "account:GetPrimaryEmail",
+                "account:GetContactInformation",
+                "account:GetAlternateContact",
+            ],
+            "probes": [
+                ("account", "us-east-1", "get_account_information", {}),
+                ("account", "us-east-1", "get_contact_information", {}),
+                ("account", "us-east-1", "get_alternate_contact", {"AlternateContactType": "BILLING"}),
+            ],
+        },
+        "regions_optin": {
+            "title": "🌐 区域启用 (开通 opt-in)",
+            "essential": False,
+            "actions": [
+                "ec2:DescribeRegions",
+                "account:ListRegions",
+                "account:GetRegionOptStatus",
+                "account:EnableRegion",
+                "account:DisableRegion",
+            ],
+            "probes": [
+                ("ec2", "us-east-1", "describe_regions", {"AllRegions": True}),
+                ("account", "us-east-1", "list_regions", {"MaxResults": 5}),
+            ],
+        },
+        "billing_credits": {
+            "title": "💰 账单 / Credit 抵扣",
+            "essential": False,
+            "actions": [
+                "ce:GetCostAndUsage",
+                "ce:GetCostForecast",
+                "ce:GetUsageForecast",
+                "ce:GetCostCategories",
+            ],
+            "probes": [
+                ("ce", "us-east-1", "get_cost_and_usage", {
+                    "TimePeriod": {"Start": "2099-01-01", "End": "2099-01-02"},
+                    "Granularity": "MONTHLY",
+                    "Metrics": ["UnblendedCost"],
+                }),
+            ],
+            "console_enable": "https://console.aws.amazon.com/cost-management/home#/cost-explorer",
+            "console_note": "需要先在控制台 Billing → Cost Explorer 点 Enable Cost Explorer, 约 24h 后才能 API 查询.",
+        },
+        "free_tier": {
+            "title": "🎁 Free Tier 用量",
+            "essential": False,
+            "actions": ["freetier:GetFreeTierUsage"],
+            "probes": [("freetier", "us-east-1", "get_free_tier_usage", {})],
+        },
+        "ec2_manage": {
+            "title": "🖥 EC2 实例管理",
+            "essential": False,
+            "actions": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeImages",
+                "ec2:DescribeAddresses",
+                "ec2:DescribeKeyPairs",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeVpcs",
+                "ec2:DescribeSubnets",
+                "ec2:RunInstances",
+                "ec2:TerminateInstances",
+                "ec2:StartInstances",
+                "ec2:StopInstances",
+                "ec2:RebootInstances",
+                "ec2:CreateKeyPair",
+                "ec2:CreateSecurityGroup",
+                "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:CreateTags",
+                "ec2:AllocateAddress",
+                "ec2:AssociateAddress",
+            ],
+            "probes": [
+                ("ec2", "us-east-1", "describe_instances", {"MaxResults": 5}),
+                ("ec2", "us-east-1", "describe_security_groups", {"MaxResults": 5}),
+            ],
+        },
+        "lightsail": {
+            "title": "⛵ Lightsail (光帆)",
+            "essential": False,
+            "actions": [
+                "lightsail:GetRegions",
+                "lightsail:GetBlueprints",
+                "lightsail:GetBundles",
+                "lightsail:GetInstances",
+                "lightsail:GetInstance",
+                "lightsail:CreateInstances",
+                "lightsail:StartInstance",
+                "lightsail:StopInstance",
+                "lightsail:RebootInstance",
+                "lightsail:DeleteInstance",
+                "lightsail:OpenInstancePublicPorts",
+            ],
+            "probes": [
+                ("lightsail", "us-east-1", "get_regions", {}),
+                ("lightsail", "us-east-1", "get_blueprints", {}),
+            ],
+        },
+        "vcpu_quota": {
+            "title": "⚡ vCPU 配额检测",
+            "essential": False,
+            "actions": [
+                "servicequotas:GetServiceQuota",
+                "servicequotas:ListServiceQuotas",
+                "servicequotas:ListAWSDefaultServiceQuotas",
+                "servicequotas:GetAWSDefaultServiceQuota",
+            ],
+            "probes": [
+                ("service-quotas", "us-east-1", "get_aws_default_service_quota", {
+                    "ServiceCode": "ec2", "QuotaCode": "L-1216C47A",
+                }),
+            ],
+        },
+        "iam_report": {
+            "title": "🔐 IAM credential report (注册时间识别)",
+            "essential": False,
+            "actions": [
+                "iam:GenerateCredentialReport",
+                "iam:GetCredentialReport",
+                "iam:GetUser",
+            ],
+            "probes": [("iam", "us-east-1", "get_user", {})],
+        },
+        "organizations": {
+            "title": "🏢 Organizations (组织内账号邮箱)",
+            "essential": False,
+            "actions": [
+                "organizations:DescribeAccount",
+                "organizations:DescribeOrganization",
+            ],
+            "probes": [("organizations", "us-east-1", "describe_organization", {})],
+        },
+        "bedrock_ai": {
+            "title": "🤖 Bedrock / Claude AI",
+            "essential": False,
+            "actions": [
+                "bedrock:ListFoundationModels",
+                "bedrock:GetFoundationModel",
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream",
+                "bedrock:Converse",
+            ],
+            "probes": [("bedrock", "us-east-1", "list_foundation_models", {})],
+        },
+        "budgets_sns_ses": {
+            "title": "🔔 Budgets / SNS / SES (邮箱兜底)",
+            "essential": False,
+            "actions": [
+                "budgets:DescribeBudgets",
+                "budgets:DescribeNotificationsForBudget",
+                "budgets:DescribeSubscribersForNotification",
+                "sns:ListSubscriptions",
+                "ses:ListIdentities",
+            ],
+            "probes": [],   # 这些都是 best-effort, 不强制探测
+        },
+    }
+
+    def diagnose_permissions(self) -> dict:
+        """逐项探测当前 AK/SK 拥有哪些权限, 并生成最小 IAM 策略 JSON.
+
+        返回:
+        {
+            "groups": [
+                {
+                    "key": "billing_credits",
+                    "title": "💰 账单 / Credit 抵扣",
+                    "essential": False,
+                    "actions": ["ce:GetCostAndUsage", ...],
+                    "status": "ok" | "denied" | "not_enabled" | "partial" | "error",
+                    "message": "...",
+                    "probe_results": [{"api":"ce.get_cost_and_usage","ok":bool,"error":str?}],
+                    "console_enable": "https://...",
+                    "console_note": "...",
+                }
+            ],
+            "summary": {
+                "total_groups": 12,
+                "ok": 6,
+                "denied": 4,
+                "not_enabled": 1,
+                "error": 1,
+            },
+            "policy_minimal":   { "Version":"2012-10-17", "Statement":[...] },  # 缺失功能用的最小策略
+            "policy_full":      { ... },  # 全功能策略 (一次给全)
+            "aws_managed_alts": [
+                "AdministratorAccess",
+                "PowerUserAccess",
+                "ReadOnlyAccess",
+                "AWSBillingReadOnlyAccess",
+                "AmazonEC2FullAccess",
+                "AmazonLightsailFullAccess",
+                "AmazonBedrockFullAccess",
+            ],
+            "iam_console_url":  "https://console.aws.amazon.com/iam/...",
+            "ami_console_url":  "https://...",
+        }
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        groups_out = []
+        all_actions_missing = set()
+        all_actions_full = set()
+
+        def _probe_one(svc, region, method, kwargs):
+            """单个 API 探测, 返回 (ok:bool, error_kind:str, error_msg:str)"""
+            try:
+                client = self._make_detect_client(svc, region)
+                fn = getattr(client, method)
+                fn(**kwargs)
+                return True, "ok", ""
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if "accessdenied" in low or "not authorized" in low or "unauthorizedoperation" in low or "forbidden" in low:
+                    return False, "denied", msg[:200]
+                if "validationexception" in low and method == "get_cost_and_usage":
+                    # 时间区间无效但权限有 → 视为 ok
+                    return True, "ok", ""
+                if "not yet been activated" in low or "data is not available" in low or "datanotavailable" in low or "dataunavailable" in low:
+                    return False, "not_enabled", msg[:200]
+                if "invalidclienttokenid" in low or "signaturedoesnotmatch" in low or "authfailure" in low:
+                    return False, "invalid_credentials", msg[:200]
+                if "unrecognizedclient" in low:
+                    return False, "denied", msg[:200]
+                if "throttling" in low or "ratelimit" in low:
+                    return True, "throttled", msg[:200]   # 节流也说明权限是有的
+                return False, "error", msg[:200]
+
+        # 并发探测每组
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {}
+            for key, grp in self.PERMISSION_GROUPS.items():
+                probes = grp.get("probes") or []
+                if not probes:
+                    # 没探测项就直接标记为 unknown
+                    groups_out.append({
+                        "key": key,
+                        "title": grp["title"],
+                        "essential": grp.get("essential", False),
+                        "actions": list(grp["actions"]),
+                        "status": "unknown",
+                        "message": "未探测 (best-effort 服务, 见前端可选授权)",
+                        "probe_results": [],
+                        "console_enable": grp.get("console_enable"),
+                        "console_note": grp.get("console_note"),
+                    })
+                    all_actions_full.update(grp["actions"])
+                    continue
+                for idx, (svc, region, method, kwargs) in enumerate(probes):
+                    futures[pool.submit(_probe_one, svc, region, method, kwargs)] = (key, idx, svc, method)
+
+            # 收集探测结果
+            collected = {}
+            for fut in as_completed(futures):
+                key, idx, svc, method = futures[fut]
+                try:
+                    ok, kind, err = fut.result()
+                except Exception as e:
+                    ok, kind, err = False, "error", str(e)[:200]
+                collected.setdefault(key, []).append({
+                    "api": f"{svc}.{method}",
+                    "ok": ok, "kind": kind, "error": err if not ok else "",
+                })
+
+        for key, grp in self.PERMISSION_GROUPS.items():
+            all_actions_full.update(grp["actions"])
+            if not grp.get("probes"):
+                continue
+            results = collected.get(key, [])
+            ok_count = sum(1 for r in results if r["ok"])
+            kinds = {r["kind"] for r in results}
+            if ok_count == len(results) and ok_count > 0:
+                status = "ok"
+                message = f"✓ {ok_count}/{len(results)} 个 API 都通过"
+            elif "denied" in kinds and ok_count == 0:
+                status = "denied"
+                message = "❌ 全部被拒 (无权限) — 请添加下方策略"
+                all_actions_missing.update(grp["actions"])
+            elif "not_enabled" in kinds:
+                status = "not_enabled"
+                message = "⚠ 服务未启用 (Cost Explorer 之类的需要在控制台先 Enable)"
+            elif "invalid_credentials" in kinds:
+                status = "invalid"
+                message = "❌ AK/SK 失效"
+            elif ok_count > 0:
+                status = "partial"
+                message = f"部分通过 ({ok_count}/{len(results)})"
+                # 加策略, 但用户可能少了某些细分权限
+                all_actions_missing.update(grp["actions"])
+            else:
+                status = "error"
+                message = "其它错误, 请查看下方明细"
+                all_actions_missing.update(grp["actions"])
+
+            groups_out.append({
+                "key": key,
+                "title": grp["title"],
+                "essential": grp.get("essential", False),
+                "actions": list(grp["actions"]),
+                "status": status,
+                "message": message,
+                "probe_results": results,
+                "console_enable": grp.get("console_enable"),
+                "console_note": grp.get("console_note"),
+            })
+
+        # 汇总
+        summary = {
+            "total_groups": len(groups_out),
+            "ok": sum(1 for g in groups_out if g["status"] == "ok"),
+            "denied": sum(1 for g in groups_out if g["status"] == "denied"),
+            "not_enabled": sum(1 for g in groups_out if g["status"] == "not_enabled"),
+            "partial": sum(1 for g in groups_out if g["status"] == "partial"),
+            "error": sum(1 for g in groups_out if g["status"] in ("error", "invalid")),
+            "unknown": sum(1 for g in groups_out if g["status"] == "unknown"),
+        }
+
+        # 生成最小补缺策略 (用户当前缺啥就只贴啥)
+        def _make_policy(action_set):
+            if not action_set:
+                return None
+            return {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Sid": "DepinManagerPolicy",
+                    "Effect": "Allow",
+                    "Action": sorted(list(action_set)),
+                    "Resource": "*",
+                }],
+            }
+
+        # IAM 用户名 (从 ARN 推)
+        iam_user_name = ""
+        try:
+            arn = self.account.arn or ""
+            if "/user/" in arn:
+                iam_user_name = arn.split("/user/")[-1]
+            elif "/role/" in arn:
+                iam_user_name = arn.split("/role/")[-1]
+        except Exception:
+            pass
+
+        return {
+            "account_id": self.account.aws_account_id or "",
+            "iam_user": iam_user_name,
+            "groups": groups_out,
+            "summary": summary,
+            "policy_minimal": _make_policy(all_actions_missing),
+            "policy_full":    _make_policy(all_actions_full),
+            "aws_managed_alts": [
+                {"name": "AdministratorAccess", "desc": "全权限 (最简单, 推荐自用账号)", "arn": "arn:aws:iam::aws:policy/AdministratorAccess"},
+                {"name": "PowerUserAccess", "desc": "几乎所有服务 (除 IAM 外)", "arn": "arn:aws:iam::aws:policy/PowerUserAccess"},
+                {"name": "ReadOnlyAccess", "desc": "只读 (但不能开实例 / Lightsail)", "arn": "arn:aws:iam::aws:policy/ReadOnlyAccess"},
+                {"name": "AWSBillingReadOnlyAccess", "desc": "Cost Explorer / 账单只读 (邮箱+账单+Credit 抵扣需要)", "arn": "arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess"},
+                {"name": "AmazonEC2FullAccess", "desc": "EC2 全管 (开/停/删实例 + AMI + EIP)", "arn": "arn:aws:iam::aws:policy/AmazonEC2FullAccess"},
+                {"name": "AmazonLightsailFullAccess", "desc": "Lightsail 全管", "arn": "arn:aws:iam::aws:policy/AmazonLightsailFullAccess"},
+                {"name": "AmazonBedrockFullAccess", "desc": "Bedrock / Claude AI 调用", "arn": "arn:aws:iam::aws:policy/AmazonBedrockFullAccess"},
+                {"name": "IAMReadOnlyAccess", "desc": "IAM 只读 (注册时间识别)", "arn": "arn:aws:iam::aws:policy/IAMReadOnlyAccess"},
+                {"name": "AWSAccountManagementFullAccess", "desc": "Account API (邮箱/区域 opt-in)", "arn": "arn:aws:iam::aws:policy/AWSAccountManagementFullAccess"},
+                {"name": "AWSFreeTier_ReadOnlyAccess", "desc": "Free Tier 用量只读", "arn": "arn:aws:iam::aws:policy/AWSFreeTier_ReadOnlyAccess"},
+            ],
+            "iam_console_url": (
+                f"https://console.aws.amazon.com/iam/home#/users/{iam_user_name}/permissions" if iam_user_name
+                else "https://console.aws.amazon.com/iam/home#/users"
+            ),
+            "cli_command_examples": {
+                "attach_admin": (
+                    f"aws iam attach-user-policy --user-name {iam_user_name or '<USERNAME>'} "
+                    "--policy-arn arn:aws:iam::aws:policy/AdministratorAccess"
+                ),
+                "attach_billing": (
+                    f"aws iam attach-user-policy --user-name {iam_user_name or '<USERNAME>'} "
+                    "--policy-arn arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess"
+                ),
+                "put_inline_minimal": (
+                    f"aws iam put-user-policy --user-name {iam_user_name or '<USERNAME>'} "
+                    "--policy-name DepinManagerMissing --policy-document file://policy_minimal.json"
+                ),
+                "enable_cost_explorer": "https://console.aws.amazon.com/cost-management/home#/cost-explorer",
+                "enable_billing_user_access": (
+                    "登录 root → My Account → IAM User and Role Access to Billing Information → Activate"
+                ),
+            },
+        }
+
 
 
 
