@@ -352,6 +352,127 @@ class AwsManager:
             pass
         return key_name, private_key
 
+    # ==================== AMI 查询 (按区域动态拉取) ====================
+
+    # AMI 名称模式 → owner / 描述
+    AMI_TEMPLATES = {
+        # Ubuntu (Canonical = 099720109477)
+        "ubuntu-22.04":     {"owners": ["099720109477"], "name_pattern": "ubuntu/images/hvm-ssd*/ubuntu-jammy-22.04-amd64-server-*",  "arch": "x86_64", "label": "Ubuntu 22.04 LTS"},
+        "ubuntu-24.04":     {"owners": ["099720109477"], "name_pattern": "ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*",  "arch": "x86_64", "label": "Ubuntu 24.04 LTS"},
+        "ubuntu-20.04":     {"owners": ["099720109477"], "name_pattern": "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*",   "arch": "x86_64", "label": "Ubuntu 20.04 LTS"},
+        "ubuntu-22.04-arm": {"owners": ["099720109477"], "name_pattern": "ubuntu/images/hvm-ssd*/ubuntu-jammy-22.04-arm64-server-*",  "arch": "arm64",  "label": "Ubuntu 22.04 LTS (ARM)"},
+        # Debian (Debian = 136693071363)
+        "debian-12":        {"owners": ["136693071363"], "name_pattern": "debian-12-amd64-*",                                          "arch": "x86_64", "label": "Debian 12 Bookworm"},
+        "debian-11":        {"owners": ["136693071363"], "name_pattern": "debian-11-amd64-*",                                          "arch": "x86_64", "label": "Debian 11 Bullseye"},
+        # Amazon Linux (amazon = 137112412989)
+        "amazon-linux-2023": {"owners": ["137112412989"], "name_pattern": "al2023-ami-2023*-x86_64",                                   "arch": "x86_64", "label": "Amazon Linux 2023"},
+        "amazon-linux-2":    {"owners": ["137112412989"], "name_pattern": "amzn2-ami-hvm-*-x86_64-gp2",                                "arch": "x86_64", "label": "Amazon Linux 2"},
+        # CentOS (CentOS = 125523088429), Rocky (Rocky = 792107900819), AlmaLinux (Alma = 764336703387)
+        "rocky-9":          {"owners": ["792107900819"], "name_pattern": "Rocky-9-EC2-Base-*.x86_64",                                  "arch": "x86_64", "label": "Rocky Linux 9"},
+        "alma-9":           {"owners": ["764336703387"], "name_pattern": "AlmaLinux OS 9.*-*",                                         "arch": "x86_64", "label": "AlmaLinux 9"},
+        # Windows (amazon = 801119661308 for Win Server)
+        "windows-2022":     {"owners": ["801119661308"], "name_pattern": "Windows_Server-2022-English-Full-Base-*",                    "arch": "x86_64", "label": "Windows Server 2022", "platform": "windows"},
+        "windows-2019":     {"owners": ["801119661308"], "name_pattern": "Windows_Server-2019-English-Full-Base-*",                    "arch": "x86_64", "label": "Windows Server 2019", "platform": "windows"},
+    }
+
+    def list_amis_for_region(self, region: str) -> list:
+        """按区域查询常用 AMI - 返回每个模板对应的最新 AMI ID。
+        前端创建实例时按区域拉一次, 用户选择想用哪个发行版 + 架构。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        ec2 = self._get_client("ec2", region)
+        out = []
+
+        def _query(key, tpl):
+            try:
+                resp = ec2.describe_images(
+                    Owners=tpl["owners"],
+                    Filters=[
+                        {"Name": "name", "Values": [tpl["name_pattern"]]},
+                        {"Name": "state", "Values": ["available"]},
+                        {"Name": "architecture", "Values": [tpl["arch"]]},
+                    ],
+                    MaxResults=20,
+                )
+                images = sorted(resp.get("Images", []), key=lambda x: x.get("CreationDate", ""), reverse=True)
+                if not images:
+                    return None
+                im = images[0]
+                return {
+                    "key": key,
+                    "label": tpl["label"],
+                    "ami_id": im["ImageId"],
+                    "name": im.get("Name", ""),
+                    "arch": tpl["arch"],
+                    "platform": tpl.get("platform", "linux"),
+                    "creation_date": im.get("CreationDate", ""),
+                    "description": im.get("Description", "") or im.get("Name", ""),
+                    "root_device_type": im.get("RootDeviceType", "ebs"),
+                }
+            except Exception as e:
+                logger.warning(f"AMI query {key} in {region} failed: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(_query, k, v): k for k, v in self.AMI_TEMPLATES.items()}
+            for fut in as_completed(futs):
+                r = fut.result()
+                if r:
+                    out.append(r)
+
+        # 按 label 友好排序: Ubuntu → Debian → AmazonLinux → Rocky → Alma → Windows
+        order = ["Ubuntu", "Debian", "Amazon", "Rocky", "Alma", "Windows"]
+        def _rank(item):
+            label = item["label"]
+            for i, p in enumerate(order):
+                if label.startswith(p):
+                    return i
+            return 99
+        out.sort(key=lambda x: (_rank(x), x["label"]))
+        return out
+
+    def _ensure_security_group_with_cidrs(self, region: str, allow_cidrs: list = None, enable_ipv6: bool = False) -> str:
+        """支持自定义 CIDR 段 + IPv6 的安全组。
+        allow_cidrs=None / [] → 默认 0.0.0.0/0 全开
+        否则只放行 CIDR 列表 + 22 端口。"""
+        ec2 = self._get_client("ec2", region)
+        sg_name = DEFAULT_SG_NAME
+        if allow_cidrs:
+            # 限定 CIDR 时用独立 SG (避免污染默认 SG)
+            sg_name = f"{DEFAULT_SG_NAME}-restricted-{abs(hash(','.join(sorted(allow_cidrs)))) % 100000}"
+
+        # 找现有 SG
+        try:
+            resp = ec2.describe_security_groups(
+                Filters=[{"Name": "group-name", "Values": [sg_name]}]
+            )
+            if resp["SecurityGroups"]:
+                return resp["SecurityGroups"][0]["GroupId"]
+        except Exception:
+            pass
+
+        resp = ec2.create_security_group(
+            GroupName=sg_name, Description=f"DePIN SG ({'restricted' if allow_cidrs else 'open'})"
+        )
+        sg_id = resp["GroupId"]
+
+        ranges_v4 = [{"CidrIp": c} for c in allow_cidrs] if allow_cidrs else [{"CidrIp": "0.0.0.0/0"}]
+        ranges_v6 = [{"CidrIpv6": "::/0"}] if (enable_ipv6 and not allow_cidrs) else []
+
+        perms = []
+        for fp, tp in [(22, 22), (80, 80), (443, 443), (3000, 9999)]:
+            p = {"IpProtocol": "tcp", "FromPort": fp, "ToPort": tp, "IpRanges": ranges_v4}
+            if ranges_v6:
+                p["Ipv6Ranges"] = ranges_v6
+            perms.append(p)
+        # ICMP (允许 ping)
+        perms.append({"IpProtocol": "icmp", "FromPort": -1, "ToPort": -1, "IpRanges": ranges_v4})
+        try:
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=perms)
+        except Exception as e:
+            logger.warning(f"authorize SG ingress failed: {e}")
+        return sg_id
+
     def launch_instance(
         self,
         region: str = None,
@@ -359,68 +480,257 @@ class AwsManager:
         user_data: str = None,
         volume_size: int = 20,
         volume_type: str = "gp3",
-    ) -> Instance:
+        ami_id: str = None,
+        ami_key: str = None,
+        password: str = None,
+        spot: bool = False,
+        enable_ipv6: bool = False,
+        static_ip: bool = False,
+        allow_cidrs: list = None,
+        instance_name: str = None,
+        count: int = 1,
+        gfw_check: bool = False,
+    ) -> dict:
+        """启动 EC2 实例 (增强版, 支持 Lightsail-like 各种选项)
+
+        参数:
+            ami_id    用户直接指定的 AMI ID (优先级最高)
+            ami_key   AMI_TEMPLATES 里的 key (如 "ubuntu-22.04" / "windows-2022")
+            password  Linux 设置 ubuntu/admin 密码; Windows 设置 Administrator 密码
+            spot      使用 Spot 实例 (省钱但可能被中断)
+            enable_ipv6 关联 IPv6 地址
+            static_ip   分配 EIP (按用量计费, 实例停机时收费)
+            allow_cidrs 入站白名单 IP (列表), 留空 = 0.0.0.0/0 全开
+            count       同区域同时开 N 台
+            gfw_check   开机后探测中国大陆是否封锁该 IP, 写入 tag
+
+        返回:
+            {
+                "instances": [{...}],   # 与原 list_instances_detailed 同结构
+                "errors": [...]
+            }
+        """
         region = region or self.account.default_region
-        ami_id = UBUNTU_AMIS.get(region)
+        count = max(1, min(int(count or 1), 50))   # 限 50 台
+
+        # 1) AMI: 优先 ami_id, 然后 ami_key, 最后默认 Ubuntu 22.04
         if not ami_id:
-            # 动态查找最新 Ubuntu AMI
-            ec2 = self._get_client("ec2", region)
-            resp = ec2.describe_images(
-                Filters=[
-                    {"Name": "name", "Values": ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]},
-                    {"Name": "state", "Values": ["available"]},
-                ],
-                Owners=["099720109477"],
-            )
-            images = sorted(resp["Images"], key=lambda x: x["CreationDate"], reverse=True)
-            ami_id = images[0]["ImageId"] if images else None
-            if not ami_id:
-                raise ValueError(f"No Ubuntu AMI found in region {region}")
+            if ami_key and ami_key in self.AMI_TEMPLATES:
+                # 按区域查这个 key 的最新 AMI
+                tpl = self.AMI_TEMPLATES[ami_key]
+                ec2 = self._get_client("ec2", region)
+                resp = ec2.describe_images(
+                    Owners=tpl["owners"],
+                    Filters=[
+                        {"Name": "name", "Values": [tpl["name_pattern"]]},
+                        {"Name": "state", "Values": ["available"]},
+                        {"Name": "architecture", "Values": [tpl["arch"]]},
+                    ],
+                    MaxResults=20,
+                )
+                images = sorted(resp.get("Images", []), key=lambda x: x.get("CreationDate", ""), reverse=True)
+                if not images:
+                    raise ValueError(f"区域 {region} 没找到 {ami_key} 对应的 AMI")
+                ami_id = images[0]["ImageId"]
+            else:
+                # 默认 Ubuntu 22.04
+                ami_id = UBUNTU_AMIS.get(region)
+                if not ami_id:
+                    ec2 = self._get_client("ec2", region)
+                    resp = ec2.describe_images(
+                        Filters=[
+                            {"Name": "name", "Values": ["ubuntu/images/hvm-ssd*/ubuntu-jammy-22.04-amd64-server-*"]},
+                            {"Name": "state", "Values": ["available"]},
+                        ],
+                        Owners=["099720109477"],
+                    )
+                    images = sorted(resp["Images"], key=lambda x: x["CreationDate"], reverse=True)
+                    ami_id = images[0]["ImageId"] if images else None
+                    if not ami_id:
+                        raise ValueError(f"No Ubuntu AMI found in region {region}")
 
-        sg_id = self._ensure_security_group(region)
-        key_name, private_key = self._ensure_key_pair(region)
-        ud = user_data or DEFAULT_USER_DATA
-
+        # 2) 推断平台 (linux / windows) - 用于密码设置和 user_data
         ec2 = self._get_client("ec2", region)
-        resp = ec2.run_instances(
-            ImageId=ami_id,
-            InstanceType=instance_type,
-            MinCount=1,
-            MaxCount=1,
-            KeyName=key_name,
-            SecurityGroupIds=[sg_id],
-            UserData=ud,
-            BlockDeviceMappings=[{
-                "DeviceName": "/dev/sda1",
+        platform = "linux"
+        try:
+            img_resp = ec2.describe_images(ImageIds=[ami_id])
+            if img_resp.get("Images"):
+                pf = (img_resp["Images"][0].get("PlatformDetails", "") or "").lower()
+                if "windows" in pf:
+                    platform = "windows"
+        except Exception:
+            pass
+
+        # 3) 安全组 (支持 CIDR 白名单)
+        sg_id = self._ensure_security_group_with_cidrs(region, allow_cidrs=allow_cidrs, enable_ipv6=enable_ipv6)
+
+        # 4) 密钥对
+        key_name, private_key = self._ensure_key_pair(region)
+
+        # 5) UserData: Linux 设密码 + 装 docker; Windows 用 PowerShell 设密码
+        ud = user_data
+        if platform == "linux":
+            ud_parts = [user_data] if user_data else [DEFAULT_USER_DATA]
+            if password:
+                # 给 ubuntu 用户设密码并允许 SSH 密码登录
+                ud_parts.append(f"""
+echo 'ubuntu:{password}' | chpasswd
+echo 'root:{password}' | chpasswd
+sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+systemctl restart ssh || systemctl restart sshd
+""".strip())
+            ud = "\n".join(p for p in ud_parts if p)
+        else:
+            # Windows: 用 <powershell> 设密码
+            if password:
+                ud = f"""<powershell>
+$Password = ConvertTo-SecureString '{password}' -AsPlainText -Force
+Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
+</powershell>"""
+
+        # 6) 网络接口 (IPv6 / 公网 IP)
+        network_interfaces = [{
+            "DeviceIndex": 0,
+            "AssociatePublicIpAddress": True,
+            "Groups": [sg_id],
+            "DeleteOnTermination": True,
+        }]
+        if enable_ipv6:
+            network_interfaces[0]["Ipv6AddressCount"] = 1
+
+        # 7) Spot 实例
+        market_options = {}
+        if spot:
+            market_options = {
+                "MarketType": "spot",
+                "SpotOptions": {"SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate"},
+            }
+
+        # 8) 名称 (按数量 -1 / -2 后缀)
+        base_name = instance_name or f"depin-{self.account.name or self.account.id}"
+
+        # 9) 启动
+        run_kwargs = {
+            "ImageId": ami_id,
+            "InstanceType": instance_type,
+            "MinCount": count,
+            "MaxCount": count,
+            "KeyName": key_name,
+            "UserData": ud or "",
+            "NetworkInterfaces": network_interfaces,
+            "BlockDeviceMappings": [{
+                "DeviceName": "/dev/sda1" if platform == "linux" else "/dev/sda1",
                 "Ebs": {
                     "VolumeSize": volume_size,
                     "VolumeType": volume_type,
                     "DeleteOnTermination": True,
                 },
             }],
-            TagSpecifications=[{
+            "TagSpecifications": [{
                 "ResourceType": "instance",
                 "Tags": [
-                    {"Key": "Name", "Value": f"depin-{self.account.name}"},
+                    {"Key": "Name", "Value": base_name},
                     {"Key": "ManagedBy", "Value": "aws-depin-manager"},
                 ],
             }],
-        )
+        }
+        if market_options:
+            run_kwargs["InstanceMarketOptions"] = market_options
 
-        inst_data = resp["Instances"][0]
-        instance = Instance(
-            account_id=self.account.id,
-            instance_id=inst_data["InstanceId"],
-            region=region,
-            instance_type=instance_type,
-            state=inst_data["State"]["Name"],
-            key_name=key_name,
-            private_key=private_key,
+        resp = ec2.run_instances(**run_kwargs)
+
+        # 10) 多台时给每台改名 (-1, -2, -3...)
+        instances_data = resp.get("Instances", [])
+        instance_ids = [i["InstanceId"] for i in instances_data]
+        if count > 1:
+            try:
+                for idx, iid in enumerate(instance_ids, 1):
+                    ec2.create_tags(Resources=[iid], Tags=[{"Key": "Name", "Value": f"{base_name}-{idx}"}])
+            except Exception as e:
+                logger.warning(f"rename instances failed: {e}")
+
+        # 11) 静态 IP (EIP) - 可选, 仅第 1 台
+        if static_ip and instance_ids:
+            try:
+                # 等实例进入 running 才能 associate
+                allocate_resp = ec2.allocate_address(Domain="vpc")
+                eip_alloc_id = allocate_resp["AllocationId"]
+                # 异步关联, 不阻塞主流程
+                import threading
+                def _assoc():
+                    import time as _t
+                    for _ in range(30):
+                        try:
+                            ec2.associate_address(InstanceId=instance_ids[0], AllocationId=eip_alloc_id)
+                            return
+                        except Exception:
+                            _t.sleep(3)
+                threading.Thread(target=_assoc, daemon=True).start()
+            except Exception as e:
+                logger.warning(f"allocate EIP failed: {e}")
+
+        # 12) 写入数据库 (每台一条)
+        out_instances = []
+        for idx, inst_data in enumerate(instances_data):
+            try:
+                instance = Instance(
+                    account_id=self.account.id,
+                    instance_id=inst_data["InstanceId"],
+                    region=region,
+                    instance_type=instance_type,
+                    state=inst_data.get("State", {}).get("Name", "pending"),
+                    key_name=key_name,
+                    private_key=private_key,
+                )
+                self.db.add(instance)
+                self.db.commit()
+                self.db.refresh(instance)
+                out_instances.append({
+                    "id": instance.id,
+                    "instance_id": instance.instance_id,
+                    "region": region,
+                    "state": instance.state,
+                    "instance_type": instance_type,
+                    "name": f"{base_name}-{idx+1}" if count > 1 else base_name,
+                    "ami_id": ami_id,
+                    "platform": platform,
+                    "spot": bool(spot),
+                    "ipv6": bool(enable_ipv6),
+                    "static_ip": bool(static_ip),
+                })
+            except Exception as e:
+                logger.warning(f"save instance {inst_data.get('InstanceId')} failed: {e}")
+                self.db.rollback()
+
+        return {
+            "ok": True,
+            "count": len(out_instances),
+            "instances": out_instances,
+            "platform": platform,
+            "ami_id": ami_id,
+            "key_name": key_name,
+            "region": region,
+        }
+
+    # 兼容旧调用 (只返回单个 Instance) - 用于 batch-launch / 单台 launch
+    def launch_instance_legacy(
+        self,
+        region: str = None,
+        instance_type: str = "t3.micro",
+        user_data: str = None,
+        volume_size: int = 20,
+        volume_type: str = "gp3",
+    ) -> Instance:
+        result = self.launch_instance(
+            region=region, instance_type=instance_type, user_data=user_data,
+            volume_size=volume_size, volume_type=volume_type, count=1,
         )
-        self.db.add(instance)
-        self.db.commit()
-        self.db.refresh(instance)
-        return instance
+        if not result.get("instances"):
+            raise RuntimeError("启动失败, 没有返回实例")
+        first = result["instances"][0]
+        return self.db.query(Instance).get(first["id"])
+
 
     def get_instance_status(self, instance_id: str, region: str) -> dict:
         ec2 = self._get_client("ec2", region)

@@ -556,11 +556,12 @@ def list_instances(account_id: Optional[int] = None, user: User = Depends(get_cu
 
 @app.post("/api/instances/launch")
 async def launch_instance(data: LaunchRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """简单创建 (兼容旧 UI) - 默认 Ubuntu 22.04, 1 台"""
     account = _get_user_account(db, user, data.account_id)
     loop = asyncio.get_event_loop()
     def _launch():
         mgr = AwsManager(account, db)
-        return mgr.launch_instance(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
+        return mgr.launch_instance_legacy(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
     instance = await loop.run_in_executor(executor, _launch)
     return {
         "id": instance.id, "instance_id": instance.instance_id,
@@ -582,7 +583,7 @@ async def batch_launch(data: BatchLaunchRequest, user: User = Depends(get_curren
                 try:
                     acc = s.query(AwsAccount).get(account.id)
                     mgr = AwsManager(acc, s)
-                    inst = mgr.launch_instance(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
+                    inst = mgr.launch_instance_legacy(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
                     return {"id": inst.id, "instance_id": inst.instance_id, "region": inst.region}
                 finally:
                     s.close()
@@ -594,6 +595,85 @@ async def batch_launch(data: BatchLaunchRequest, user: User = Depends(get_curren
     tasks = [_launch_one(i) for i in range(data.count)]
     await asyncio.gather(*tasks)
     return {"launched": results, "errors": errors}
+
+
+# ==================== 高级创建 EC2 (账号详情面板用) ====================
+
+class LaunchAdvancedRequest(BaseModel):
+    account_id: int
+    region: str
+    instance_type: str
+    ami_id: Optional[str] = None        # AMI ID (优先级最高)
+    ami_key: Optional[str] = None       # AMI 模板 key (如 "ubuntu-22.04")
+    password: Optional[str] = None      # SSH/RDP 密码
+    instance_name: Optional[str] = None
+    spot: bool = False
+    enable_ipv6: bool = False
+    static_ip: bool = False
+    allow_cidrs: Optional[list[str]] = None  # 入站 IP 白名单
+    user_data: Optional[str] = None
+    count: int = 1
+    volume_size: int = 20
+    volume_type: str = "gp3"
+    gfw_check: bool = False
+
+
+@app.post("/api/instances/launch-advanced")
+async def launch_advanced(
+    data: LaunchAdvancedRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """高级创建 EC2 实例 - 像 Lightsail 创建表单一样, 支持密码/Spot/IPv6/EIP/CIDR/AMI模板/数量"""
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+
+    def _do():
+        mgr = AwsManager(account, db)
+        return mgr.launch_instance(
+            region=data.region,
+            instance_type=data.instance_type,
+            ami_id=data.ami_id,
+            ami_key=data.ami_key,
+            password=data.password,
+            instance_name=data.instance_name,
+            spot=data.spot,
+            enable_ipv6=data.enable_ipv6,
+            static_ip=data.static_ip,
+            allow_cidrs=data.allow_cidrs,
+            user_data=data.user_data,
+            count=data.count,
+            volume_size=data.volume_size,
+            volume_type=data.volume_type,
+            gfw_check=data.gfw_check,
+        )
+
+    try:
+        result = await loop.run_in_executor(executor, _do)
+    except Exception as e:
+        raise HTTPException(400, f"创建 EC2 实例失败: {str(e)[:300]}")
+    return result
+
+
+@app.get("/api/accounts/{account_id}/amis")
+async def list_amis_for_region(
+    account_id: int,
+    region: str = Query(..., description="区域代码"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """按区域查询常用 AMI 列表 (Ubuntu/Debian/AmazonLinux/Rocky/Alma/Windows 等)"""
+    account = _get_user_account(db, user, account_id)
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(executor, lambda: AwsManager(account, db).list_amis_for_region(region))
+    except Exception as e:
+        raise HTTPException(400, f"查询 AMI 失败: {str(e)[:300]}")
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "public, max-age=300"},  # AMI 列表缓存 5 分钟
+    )
+
 
 @app.post("/api/instances/{instance_id}/sync")
 async def sync_instance(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):

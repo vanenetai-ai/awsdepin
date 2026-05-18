@@ -489,8 +489,10 @@
                 <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:4px">
                     <input type="checkbox" id="acct-inst-managed-only" onchange="loadAccountInstancesDetail()"> 仅本平台创建
                 </label>
+                <button type="button" class="btn btn-primary" onclick="showCreateEc2Modal()">+ 创建实例</button>
                 <button type="button" class="btn btn-secondary" onclick="loadAccountInstancesDetail()">🔄 刷新</button>
             </div>
+
             <div id="acct-instances-summary" style="margin-bottom:10px;display:flex;gap:10px;flex-wrap:wrap"></div>
             <div id="acct-instances-list">
                 <div style="text-align:center;padding:30px;color:var(--text2)">点击「刷新」加载实例</div>
@@ -611,7 +613,112 @@
         </div>
     </div>
 
+    <!-- 创建 EC2 实例 Modal (账号详情面板用 - 高级版) -->
+    <div class="modal-overlay" id="ec2-create-modal">
+        <div class="modal" style="width:780px;max-height:92vh;overflow-y:auto">
+            <div class="modal-header">
+                <h3>🖥 创建 EC2 实例 (高级)</h3>
+                <button class="modal-close" onclick="hideModal('ec2-create-modal')">&times;</button>
+            </div>
+            <div id="ec2-create-acc-hint" style="padding:4px 0 10px;color:var(--text2);font-size:13px;border-bottom:1px solid var(--border);margin-bottom:12px"></div>
+            <form onsubmit="ec2CreateAdvanced(event)">
+                <input type="hidden" id="ec2c-account-id">
+
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>实例名称</label>
+                        <input type="text" id="ec2c-name" placeholder="depin-xxx (默认账号名)">
+                    </div>
+                    <div class="form-group" style="flex:0 0 120px">
+                        <label>数量</label>
+                        <input type="number" id="ec2c-count" value="1" min="1" max="50">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>区域 *</label>
+                    <select id="ec2c-region" required onchange="onEc2CreateRegionChange()">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group" style="flex:2">
+                        <label>实例类型分类</label>
+                        <select id="ec2c-type-category" onchange="filterEc2CreateTypes()">
+                            <option value="">全部分类</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="flex:3">
+                        <label>实例类型 *</label>
+                        <select id="ec2c-type" required>
+                            <option value="">加载中...</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>镜像 (AMI) *</label>
+                    <select id="ec2c-ami" required>
+                        <option value="ubuntu-22.04">Ubuntu 22.04 LTS (默认)</option>
+                    </select>
+                    <div style="font-size:11px;color:var(--text2);margin-top:3px">选择区域后自动加载该区域可用 AMI</div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>密码 (SSH/RDP 登录)</label>
+                        <input type="text" id="ec2c-password" placeholder="留空则只用密钥登录" autocomplete="new-password">
+                    </div>
+                    <div class="form-group" style="flex:1">
+                        <label>磁盘大小 (GiB)</label>
+                        <input type="number" id="ec2c-volume-size" value="20" min="8" max="16384">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>磁盘类型</label>
+                        <select id="ec2c-volume-type">
+                            <option value="gp3">gp3 (通用 SSD, 推荐)</option>
+                            <option value="gp2">gp2 (通用 SSD)</option>
+                            <option value="io1">io1 (高性能)</option>
+                            <option value="io2">io2 (高性能)</option>
+                            <option value="st1">st1 (吞吐 HDD)</option>
+                            <option value="sc1">sc1 (冷存 HDD)</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="flex:1;display:flex;flex-direction:column;gap:4px;justify-content:flex-end;padding-bottom:6px">
+                        <label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer;margin:0">
+                            <input type="checkbox" id="ec2c-spot"> 💰 Spot 实例 (省 50-90%, 可能被中断)
+                        </label>
+                        <label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer;margin:0">
+                            <input type="checkbox" id="ec2c-ipv6"> 🌐 启用 IPv6
+                        </label>
+                        <label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer;margin:0">
+                            <input type="checkbox" id="ec2c-static-ip"> 📌 静态 IP (EIP, 实例停机时收费)
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>开机脚本 (User Data, 可选)</label>
+                    <textarea id="ec2c-userdata" rows="4" placeholder="#!/bin/bash&#10;# 留空则用默认: 自动安装 docker"></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>入站 IP 白名单 CIDR (可选, 一行一个)</label>
+                    <textarea id="ec2c-cidrs" rows="2" placeholder="留空 = 0.0.0.0/0 全开&#10;3.2.1.0/24&#10;1.2.3.4/32"></textarea>
+                    <div style="font-size:11px;color:var(--text2);margin-top:3px">填了就只放行这些 IP, 实例会用单独的安全组</div>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-block">🚀 创建实例</button>
+            </form>
+        </div>
+    </div>
+
     <!-- Edit Account Modal -->
+
     <div class="modal-overlay" id="edit-account-modal">
         <div class="modal">
             <div class="modal-header">

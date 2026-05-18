@@ -2446,5 +2446,175 @@ async function lightsailLaunch(e) {
     } finally { hideLoading(); }
 }
 
+// ==================== EC2 高级创建 (账号实例面板用) ====================
+
+// 缓存: 区域 → AMI 列表
+const _ec2cAmiCache = {};
+let _ec2cTypesAll = [];
+
+async function showCreateEc2Modal() {
+    if (!_acctInstAccountId) { toast('请先在账号详情面板打开此功能', 'error'); return; }
+    // 找到账号信息(填默认区域 / 名称)
+    const acc = (accountsCache || []).find(a => a.id === _acctInstAccountId);
+    document.getElementById('ec2c-account-id').value = _acctInstAccountId;
+    document.getElementById('ec2-create-acc-hint').innerHTML =
+        `账号: <b>${escapeHtml((acc?.email || acc?.name || '#' + _acctInstAccountId))}</b>` +
+        ` · AccountID: ${acc?.aws_account_id || '-'} · 默认区域: ${acc?.default_region || '-'}`;
+
+    // 默认值
+    document.getElementById('ec2c-name').value = '';
+    document.getElementById('ec2c-count').value = 1;
+    document.getElementById('ec2c-password').value = '';
+    document.getElementById('ec2c-volume-size').value = 20;
+    document.getElementById('ec2c-volume-type').value = 'gp3';
+    document.getElementById('ec2c-spot').checked = false;
+    document.getElementById('ec2c-ipv6').checked = false;
+    document.getElementById('ec2c-static-ip').checked = false;
+    document.getElementById('ec2c-userdata').value = '';
+    document.getElementById('ec2c-cidrs').value = '';
+
+    showModal('ec2-create-modal');
+
+    // 1) 加载区域: 复用 acct-inst-region-filter (扫描得到的 region 列表)
+    const regions = await ec2cLoadRegions();
+    const sel = document.getElementById('ec2c-region');
+    const def = (acc?.default_region || regions[0] || 'us-east-1');
+    sel.innerHTML = regions.map(r => `<option value="${r.code}" ${r.code === def ? 'selected' : ''}>${r.label}</option>`).join('');
+
+    // 2) 加载实例类型 (类别 + 全部)
+    if (!_ec2cTypesAll.length) {
+        try { _ec2cTypesAll = await api('/instances/types'); }
+        catch (e) { _ec2cTypesAll = []; }
+    }
+    const cats = [...new Set(_ec2cTypesAll.map(t => t.category))];
+    const catSel = document.getElementById('ec2c-type-category');
+    catSel.innerHTML = '<option value="">全部分类</option>' +
+        cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    catSel.value = '通用突发';   // 默认通用突发 (t系列)
+    filterEc2CreateTypes();
+    document.getElementById('ec2c-type').value = 't3.micro';
+
+    // 3) 区域 AMI
+    onEc2CreateRegionChange();
+}
+
+async function ec2cLoadRegions() {
+    // 优先用 AwsManager.list_enabled_regions 返回的列表 (走/accounts/{id}/regions)
+    try {
+        const list = await api(`/accounts/${_acctInstAccountId}/regions`);
+        // list 是 region code 数组
+        const map = {
+            'us-east-1':'🇺🇸 美国 弗吉尼亚','us-east-2':'🇺🇸 美国 俄亥俄',
+            'us-west-1':'🇺🇸 美国 加利福尼亚','us-west-2':'🇺🇸 美国 俄勒冈',
+            'ap-south-1':'🇮🇳 印度 孟买','ap-northeast-1':'🇯🇵 日本 东京',
+            'ap-northeast-2':'🇰🇷 韩国 首尔','ap-northeast-3':'🇯🇵 日本 大阪',
+            'ap-southeast-1':'🇸🇬 新加坡','ap-southeast-2':'🇦🇺 澳大利亚 悉尼',
+            'ap-southeast-3':'🇮🇩 印尼 雅加达','ap-southeast-4':'🇦🇺 澳大利亚 墨尔本',
+            'ap-east-1':'🇭🇰 香港','ca-central-1':'🇨🇦 加拿大 中部',
+            'eu-central-1':'🇩🇪 德国 法兰克福','eu-central-2':'🇨🇭 瑞士 苏黎世',
+            'eu-west-1':'🇮🇪 爱尔兰','eu-west-2':'🇬🇧 英国 伦敦',
+            'eu-west-3':'🇫🇷 法国 巴黎','eu-north-1':'🇸🇪 瑞典 斯德哥尔摩',
+            'eu-south-1':'🇮🇹 意大利 米兰','eu-south-2':'🇪🇸 西班牙',
+            'sa-east-1':'🇧🇷 巴西 圣保罗','me-south-1':'🇧🇭 巴林',
+            'me-central-1':'🇦🇪 阿联酋','af-south-1':'🇿🇦 南非 开普敦',
+            'il-central-1':'🇮🇱 以色列 特拉维夫',
+        };
+        return list.map(r => ({ code: r, label: `${map[r] || r} (${r})` }));
+    } catch (e) {
+        return [
+            { code: 'us-east-1', label: 'us-east-1' },
+            { code: 'us-east-2', label: 'us-east-2' },
+            { code: 'us-west-2', label: 'us-west-2' },
+        ];
+    }
+}
+
+function filterEc2CreateTypes() {
+    const cat = document.getElementById('ec2c-type-category').value;
+    const sel = document.getElementById('ec2c-type');
+    const list = cat ? _ec2cTypesAll.filter(t => t.category === cat) : _ec2cTypesAll;
+    sel.innerHTML = list.map(t => `<option value="${t.type}">${t.type} (${t.vcpu}C/${t.mem})</option>`).join('');
+}
+
+async function onEc2CreateRegionChange() {
+    const region = document.getElementById('ec2c-region').value;
+    if (!region) return;
+    const sel = document.getElementById('ec2c-ami');
+    if (_ec2cAmiCache[region]) {
+        renderEc2cAmis(_ec2cAmiCache[region]);
+        return;
+    }
+    sel.innerHTML = '<option value="">正在加载该区域 AMI...</option>';
+    try {
+        const list = await api(`/accounts/${_acctInstAccountId}/amis?region=${region}`);
+        _ec2cAmiCache[region] = list || [];
+        renderEc2cAmis(_ec2cAmiCache[region]);
+    } catch (e) {
+        sel.innerHTML = `<option value="ubuntu-22.04">Ubuntu 22.04 LTS (默认, 加载失败回退)</option>`;
+    }
+}
+
+function renderEc2cAmis(list) {
+    const sel = document.getElementById('ec2c-ami');
+    if (!list || !list.length) {
+        sel.innerHTML = '<option value="ubuntu-22.04">Ubuntu 22.04 LTS (默认)</option>';
+        return;
+    }
+    // value 用 ami_id (后端 launch_instance 优先用 ami_id)
+    sel.innerHTML = list.map(a => {
+        const archTag = a.arch === 'arm64' ? '[ARM]' : '';
+        return `<option value="${a.ami_id}" data-key="${a.key}">${escapeHtml(a.label)} ${archTag} · ${a.ami_id}</option>`;
+    }).join('');
+}
+
+async function ec2CreateAdvanced(e) {
+    e.preventDefault();
+    if (!_acctInstAccountId) { toast('账号丢失，请重新打开', 'error'); return; }
+
+    const region = document.getElementById('ec2c-region').value;
+    const type = document.getElementById('ec2c-type').value;
+    if (!region || !type) { toast('请选择区域和实例类型', 'error'); return; }
+
+    const cidrsText = (document.getElementById('ec2c-cidrs').value || '').trim();
+    const cidrs = cidrsText ? cidrsText.split(/\s*[\n,]\s*/).filter(Boolean) : null;
+
+    // ami: 选项 value = ami_id, data-key 是 ami_key
+    const amiSel = document.getElementById('ec2c-ami');
+    const amiOption = amiSel.options[amiSel.selectedIndex];
+    const amiVal = amiSel.value || '';
+    const amiKey = amiOption?.dataset?.key || '';
+
+    const data = {
+        account_id: _acctInstAccountId,
+        region,
+        instance_type: type,
+        ami_id: (amiVal && amiVal.startsWith('ami-')) ? amiVal : null,
+        ami_key: (amiVal && !amiVal.startsWith('ami-')) ? amiVal : (amiKey || null),
+        password: document.getElementById('ec2c-password').value || null,
+        instance_name: document.getElementById('ec2c-name').value || null,
+        spot: document.getElementById('ec2c-spot').checked,
+        enable_ipv6: document.getElementById('ec2c-ipv6').checked,
+        static_ip: document.getElementById('ec2c-static-ip').checked,
+        allow_cidrs: cidrs,
+        user_data: document.getElementById('ec2c-userdata').value || null,
+        count: parseInt(document.getElementById('ec2c-count').value) || 1,
+        volume_size: parseInt(document.getElementById('ec2c-volume-size').value) || 20,
+        volume_type: document.getElementById('ec2c-volume-type').value,
+    };
+
+    showLoading(`正在 ${region} 创建 ${data.count} 台 ${type} 实例...`);
+    try {
+        const res = await api('/instances/launch-advanced', { method: 'POST', body: JSON.stringify(data) });
+        const ids = (res.instances || []).map(i => i.instance_id).join(', ');
+        toast(`✅ 已创建 ${res.count || data.count} 台 ${res.platform || ''} 实例: ${ids}`, 'success');
+        hideModal('ec2-create-modal');
+        setTimeout(loadAccountInstancesDetail, 2500);
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally { hideLoading(); }
+}
+
 // ==================== Init ====================
 if (checkAuth()) { showUserInfo(); loadDashboard(); setTimeout(initSearchSelects, 100); }
+
+
