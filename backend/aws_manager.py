@@ -1137,11 +1137,78 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             except Exception:
                 return None
 
-        # 并行执行所有检测任务 (比之前 11 → 5 个任务, 整体快 3-5 倍)
+        def _task_invoice_email():
+            """发票接收人邮箱 - AWSBillingReadOnlyAccess 涵盖
+            invoicing:BatchGetInvoiceProfile 返回 AccountId → InvoiceProfile.ReceiverEmail,
+            通常 = root 邮箱; 是绕过 account:GetPrimaryEmail 的备选邮箱来源.
+            """
+            try:
+                inv = self._make_detect_client("invoicing", "us-east-1")
+            except Exception as e:
+                logger.debug(f"invoicing client init failed: {e}")
+                return None
+            try:
+                resp = inv.batch_get_invoice_profile(AccountIds=[account_id])
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if "accessdenied" in low or "not authorized" in low:
+                    raise   # 让上层把错误归类为 denied
+                if "validationexception" in low or "resourcenotfoundexception" in low:
+                    return None
+                raise
+            for prof in (resp.get("Profiles", []) or []):
+                # ReceiverEmail / Email / EmailAddress 不同版本字段名都可能
+                for k in ("ReceiverEmail", "Email", "EmailAddress"):
+                    v = prof.get(k) if isinstance(prof, dict) else None
+                    if v and "@" in v and "amazonaws" not in v.lower():
+                        return v
+            return None
+
+        def _task_tax_email():
+            """税务注册联系人邮箱 - AWSBillingReadOnlyAccess 涵盖
+            taxsettings:GetTaxRegistration 返回 TaxRegistration.AdditionalTaxInformation,
+            其中 PointOfContact.EmailAddress 通常 = 账号主邮箱 (尤其欧盟 / 巴西 / 印度 / 沙特账号).
+            """
+            try:
+                tx = self._make_detect_client("taxsettings", "us-east-1")
+            except Exception as e:
+                logger.debug(f"taxsettings client init failed: {e}")
+                return None
+            try:
+                resp = tx.get_tax_registration()
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if "accessdenied" in low or "not authorized" in low:
+                    raise
+                if "resourcenotfoundexception" in low or "tax registration not found" in low:
+                    return None
+                raise
+            tr = resp.get("TaxRegistration", {}) or {}
+            # 1) PointOfContact 嵌套在 AdditionalTaxInformation 下
+            ati = tr.get("AdditionalTaxInformation", {}) or {}
+            for sub_key in ati.keys():
+                sub = ati.get(sub_key)
+                if isinstance(sub, dict):
+                    poc = sub.get("PointOfContact", {}) or {}
+                    em = poc.get("EmailAddress")
+                    if em and "@" in em and "amazonaws" not in em.lower():
+                        return em
+            # 2) 顶层也偶尔有
+            for k in ("EmailAddress", "ContactEmail"):
+                v = tr.get(k)
+                if v and "@" in v:
+                    return v
+            return None
+
+        # 并行执行所有检测任务 (5 → 7 个, 多两个邮箱来源)
         task_map = {
             "email_primary":     _task_primary_email,
             "email_alt_billing": _task_alt_billing,
             "email_org":         _task_org_email,
+            "email_invoice":     _task_invoice_email,
+            "email_tax":         _task_tax_email,
             "contact_info":      _task_contact_info,
             "creation_time":     _task_creation_time,
         }
@@ -1176,7 +1243,19 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
         ci_name  = ci.get("name")   if isinstance(ci, dict) else None
         ci_country = ci.get("country") if isinstance(ci, dict) else None
 
-        ordered_email_keys = ("email_primary", "email_alt_billing", "email_org")
+        # 优先级 (从高到低):
+        #   1) email_primary    = account:GetPrimaryEmail (root 真实主邮箱, 最权威)
+        #   2) email_alt_billing = AlternateContact[BILLING] (账号买卖常驻邮箱)
+        #   3) email_invoice    = invoicing:BatchGetInvoiceProfile.ReceiverEmail (发票收件人 = root 邮箱)
+        #   4) email_tax        = taxsettings:GetTaxRegistration PointOfContact 邮箱
+        #   5) email_org        = Organizations 主账号邮箱
+        ordered_email_keys = (
+            "email_primary",
+            "email_alt_billing",
+            "email_invoice",
+            "email_tax",
+            "email_org",
+        )
         diagnosis = {}
         for k in ordered_email_keys:
             v = results.get(k)
@@ -2056,6 +2135,34 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
             ],
             "console_enable": "https://console.aws.amazon.com/cost-management/home#/cost-explorer",
             "console_note": "需要先在控制台 Billing → Cost Explorer 点 Enable Cost Explorer, 约 24h 后才能 API 查询.",
+        },
+        "invoicing_email": {
+            "title": "🧾 Invoicing (发票收件邮箱 = root 邮箱备选)",
+            "essential": False,
+            "actions": [
+                "invoicing:BatchGetInvoiceProfile",
+                "invoicing:ListInvoiceUnits",
+                "invoicing:GetInvoiceUnit",
+            ],
+            "probes": [
+                # 用空 AccountIds 探测权限 (服务会返回 ValidationException, 但不是 AccessDenied → 视为有权限)
+                ("invoicing", "us-east-1", "batch_get_invoice_profile", {"AccountIds": []}),
+            ],
+            "console_note": "AWSBillingReadOnlyAccess 已包含; 这是 account:GetPrimaryEmail 之外能拿到 root 邮箱的备选 API",
+        },
+        "tax_email": {
+            "title": "🏛 Tax Settings (税务联系人邮箱)",
+            "essential": False,
+            "actions": [
+                "tax:GetTaxRegistration",
+                "tax:GetTaxInheritance",
+                "taxsettings:GetTaxRegistration",
+                "taxsettings:ListTaxRegistrations",
+            ],
+            "probes": [
+                ("taxsettings", "us-east-1", "get_tax_registration", {}),
+            ],
+            "console_note": "AWSBillingReadOnlyAccess 已包含; 欧盟/巴西/印度/沙特账号常在税务联系人填 root 邮箱",
         },
         "free_tier": {
             "title": "🎁 Free Tier 用量",
