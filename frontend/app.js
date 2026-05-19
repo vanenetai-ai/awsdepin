@@ -1351,6 +1351,35 @@ async function detectAllAccounts() {
     finally { hideLoading(); if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
 }
 
+/**
+ * ♻️ 重置"假性失效"账号
+ *
+ * 当服务器到 AWS 的网络抖动 (中国直连被 GFW reset / 代理掉线 / DNS 超时) 时,
+ * 之前的 detect 逻辑会把账号误判为 invalid_credentials, 显示"AK/SK 失效".
+ * 这个按钮把所有 status_reason 含网络错误关键字的账号一键重置为 unknown,
+ * 然后再点"检测全部"就能恢复原状态.
+ */
+async function resetInvalidAccounts() {
+    if (!confirm('把所有"因网络问题被误判为失效"的账号重置为未知?\n(只重置因网络错误失败的; 真的 AK/SK 失效不会被重置)\n\n之后建议再点一次"🔍 检测全部"重新核对.')) return;
+    const btn = event?.target;
+    if (btn) { btn.classList.add('loading'); btn.textContent = '重置中...'; }
+    showLoading('正在重置假性失效账号...');
+    try {
+        const res = await api('/accounts/reset-status', { method: 'POST' });
+        if (res.reset > 0) {
+            toast(`已重置 ${res.reset} 个账号 (跳过 ${res.skipped} 个真失效或正常的)`, 'success');
+        } else {
+            toast(`没有需要重置的账号 (共 ${res.total} 个全部状态正常)`, 'info');
+        }
+        await loadAccounts();
+    } catch (e) {
+        toast('重置失败: ' + (e.message || e), 'error');
+    } finally {
+        hideLoading();
+        if (btn) { btn.classList.remove('loading'); btn.textContent = '♻️ 重置失效'; }
+    }
+}
+
 // ==================== AI Detection (简化: 只查 us-east-1 Bedrock) ====================
 let _aiAccountId = null;
 let _aiRegion = 'us-east-1';

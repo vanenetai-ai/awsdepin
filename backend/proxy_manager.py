@@ -1,18 +1,27 @@
 import random
 from datetime import datetime
+from typing import Optional
 from sqlalchemy.orm import Session
 from models import Proxy
 
 
 class ProxyManager:
-    """旋转代理管理器 - 轮询/随机选择可用代理"""
+    """旋转代理管理器 - 轮询/随机选择可用代理.
 
-    def __init__(self, db: Session):
+    重要: 必须按 user_id 隔离, 避免 A 用户用到 B 用户的代理。
+    所有 AwsManager / LightsailManager 必须传 user_id 进来。
+    """
+
+    def __init__(self, db: Session, user_id: Optional[int] = None):
         self.db = db
+        self.user_id = user_id  # None = 不限用户 (兼容老调用, 但调用方应当尽量传)
         self._index = 0
 
     def get_all(self):
-        return self.db.query(Proxy).filter(Proxy.is_active == True).all()
+        q = self.db.query(Proxy).filter(Proxy.is_active == True)
+        if self.user_id is not None:
+            q = q.filter(Proxy.user_id == self.user_id)
+        return q.all()
 
     def get_next_proxy(self) -> dict | None:
         """轮询获取下一个代理"""

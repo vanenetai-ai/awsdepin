@@ -70,18 +70,59 @@ usermod -aG docker ubuntu
 """
 
 
+class ProxyRequiredError(Exception):
+    """没有可用代理时抛出 - 防止 boto3 走服务器出口 IP 直连 AWS.
+
+    我们的设计原则是: **所有 AWS API 调用必须经过代理**。这样:
+      1) 服务器真实 IP 不暴露给 AWS (避免风控关联多账号)
+      2) 不同账号可以走不同出口 IP, 模拟"各自登陆"
+      3) 中国直连 AWS 经常被 GFW reset, 代理能稳定多了
+
+    一旦代理池为空 / 全部禁用 / 用户没有自己的代理, 立刻抛这个错误,
+    上层用 try/except 转成 400 提示用户"先去代理管理添加代理"。
+    """
+    pass
+
+
 class AwsManager:
-    def __init__(self, account: AwsAccount, db: Session, use_proxy: bool = True):
+    def __init__(
+        self,
+        account: AwsAccount,
+        db: Session,
+        use_proxy: bool = True,
+        require_proxy: bool = True,
+    ):
+        """
+        Args:
+            account: AWS 账号
+            db: SQLAlchemy 会话
+            use_proxy: 是否启用代理 (默认 True)
+            require_proxy: 启用代理但没找到时, 是否直接抛 ProxyRequiredError.
+                           True (默认) = 严格模式, 没代理就拒绝调 AWS, 不走服务器直连.
+                           False = 宽松模式, 没代理就直连服务器出口 IP (仅 telegram_bot 等本地任务用).
+        """
         self.account = account
         self.db = db
         self.proxy_config = None
         self._client_cache = {}
         self._resource_cache = {}
+        self.use_proxy = use_proxy
+        self.require_proxy = require_proxy
         if use_proxy:
-            pm = ProxyManager(db)
+            # 关键: 按账号所属用户隔离代理, 避免 A 用户用到 B 用户的代理
+            user_id = getattr(account, "user_id", None)
+            pm = ProxyManager(db, user_id=user_id)
             self.proxy_config = pm.get_proxy_for_boto3()
+            if not self.proxy_config and require_proxy:
+                raise ProxyRequiredError(
+                    "代理池为空: 该账号所属用户没有任何启用中的代理。"
+                    "请先到「代理管理」页面添加可用代理, 否则所有 AWS 调用会暴露服务器真实 IP。"
+                )
 
     def _get_client(self, service: str, region: str = None):
+        # 安全网: 即便有人手动把 proxy_config 改 None 也拒绝调 AWS
+        if self.use_proxy and self.require_proxy and not self.proxy_config:
+            raise ProxyRequiredError("代理已失效, 拒绝直连 AWS")
         region = region or self.account.default_region
         cache_key = f"{service}:{region}"
         if cache_key in self._client_cache:
@@ -105,6 +146,8 @@ class AwsManager:
         return client
 
     def _get_resource(self, service: str, region: str = None):
+        if self.use_proxy and self.require_proxy and not self.proxy_config:
+            raise ProxyRequiredError("代理已失效, 拒绝直连 AWS")
         region = region or self.account.default_region
         cache_key = f"{service}:{region}"
         if cache_key in self._resource_cache:
@@ -149,6 +192,9 @@ class AwsManager:
     def _classify_credential_error(err: str) -> str:
         """根据 AWS 报错文本判断账号状态"""
         s = (err or "").lower()
+        # ✅ 先识别"网络层错误"——这类错误跟 AK/SK 是否有效无关, 不能据此把账号判失效
+        if AwsManager._is_network_error(err):
+            return "network_error"
         # AK/SK 失效
         invalid_markers = [
             "invalidclienttokenid",
@@ -176,6 +222,57 @@ class AwsManager:
             if m in s:
                 return "disabled"
         return "unknown"
+
+    @staticmethod
+    def _is_network_error(err: str) -> bool:
+        """判断错误是否为网络层错误 (连接被 reset/超时/TLS失败/代理失败 等), 与 AK/SK 是否有效无关.
+
+        典型场景:
+        - 服务器在中国直连 AWS, 被 GFW reset:
+          'Connection was closed before we received a valid response from endpoint URL'
+          'EndpointConnectionError'
+        - 代理或网络抖动:
+          'ConnectTimeoutError' / 'ReadTimeoutError' / 'ConnectionResetError' / 'ProxyConnectionError'
+        - DNS 失败 / TLS 握手失败:
+          'NameResolutionError' / 'SSLError' / 'BadStatusLine'
+        """
+        if not err:
+            return False
+        s = err.lower()
+        markers = [
+            "connection was closed before we received",
+            "endpointconnectionerror",
+            "could not connect to the endpoint url",
+            "connecttimeout",
+            "readtimeout",
+            "connection reset",
+            "connectionreseterror",
+            "connection aborted",
+            "remote end closed connection",
+            "broken pipe",
+            "max retries exceeded",
+            "name or service not known",
+            "nameresolutionerror",
+            "temporary failure in name resolution",
+            "no route to host",
+            "network is unreachable",
+            "ssl: ",
+            "sslerror",
+            "ssl handshake",
+            "certificate verify failed",
+            "proxyconnectionerror",
+            "proxy",
+            "407 proxy authentication",
+            "badstatusline",
+            "httpsconnectionpool",
+            "tunnel connection failed",
+            "got socket error",
+            "newconnectionerror",
+        ]
+        for m in markers:
+            if m in s:
+                return True
+        return False
 
     def list_regions(self) -> list:
         """列出已启用的区域 (含 opt-in 已开启的)"""
@@ -1002,21 +1099,41 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
         except Exception as e:
             err_str = str(e)
             logger.error(f"STS failed: {e}")
-            if "proxy" in err_str.lower() or "407" in err_str or "ProxyConnectionError" in err_str:
-                info["_errors"].append(f"代理连接失败: {err_str[:150]}")
-                info["_proxy_error"] = True
-                # 代理错误不是账号问题，状态保持 unknown
-            else:
-                info["_errors"].append(f"AWS 连接失败: {err_str[:150]}")
-                # AK/SK 失效或账号被禁用 → 写入数据库
-                status = self._classify_credential_error(err_str)
-                self.account.account_status = status if status != "unknown" else "invalid_credentials"
+            status = self._classify_credential_error(err_str)
+            # 1) 代理或网络错误 → 不修改账号状态, 仅记录到 _errors / _proxy_error
+            if status == "network_error" or "proxy" in err_str.lower() or "407" in err_str or "ProxyConnectionError" in err_str:
+                info["_proxy_error"] = "proxy" in err_str.lower() or "407" in err_str
+                if info["_proxy_error"]:
+                    info["_errors"].append(f"代理连接失败: {err_str[:150]}")
+                else:
+                    info["_errors"].append(f"网络连接失败 (与 AK/SK 是否有效无关): {err_str[:200]}")
+                # ⚠️ 重要: 网络层错误绝不能据此把账号判定为 invalid_credentials
+                info["_network_error"] = True
+                # 修复历史误判: 如果之前因为网络错误被错误标成了 invalid_credentials, 重置为 unknown
+                # (status_reason 含网络错误关键字 → 之前的 invalid_credentials 是误判)
+                if self.account.account_status == "invalid_credentials":
+                    old_reason = (self.account.status_reason or "").lower()
+                    if self._is_network_error(old_reason) or not old_reason:
+                        self.account.account_status = "unknown"
+                        self.account.status_reason = "上次因网络错误被误判为失效, 已重置. 待网络恢复后重新检测"
+                        self.account.status_checked_at = datetime.utcnow()
+                        try:
+                            self.db.commit()
+                        except Exception:
+                            self.db.rollback()
+            elif status in ("invalid_credentials", "disabled"):
+                # 2) 真的是 AK/SK 失效 / 账号被禁用 → 写库
+                info["_errors"].append(f"凭证失效或账号被禁用: {err_str[:200]}")
+                self.account.account_status = status
                 self.account.status_reason = err_str[:300]
                 self.account.status_checked_at = datetime.utcnow()
                 try:
                     self.db.commit()
                 except Exception:
                     self.db.rollback()
+            else:
+                # 3) 未知错误 → 不写死成 invalid_credentials, 保持原状态, 让用户重试
+                info["_errors"].append(f"AWS 调用失败 (原因不明, 未修改账号状态): {err_str[:200]}")
             info["account_status"] = self.account.account_status
             return info
 

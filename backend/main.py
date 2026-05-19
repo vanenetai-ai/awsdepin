@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from typing import Optional
 from database import get_db, init_db, SessionLocal
 from models import User, AwsAccount, Instance, Proxy, DepinProject, DepinTask
-from aws_manager import AwsManager
+from aws_manager import AwsManager, ProxyRequiredError
 from lightsail_manager import LightsailManager, LIGHTSAIL_REGIONS
 from proxy_manager import ProxyManager
 from depin_manager import DepinManager
@@ -41,6 +41,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AWS DePIN Manager", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ==================== 全局异常处理 ====================
+
+@app.exception_handler(ProxyRequiredError)
+async def _proxy_required_handler(request, exc: ProxyRequiredError):
+    """没代理时直接拒绝调 AWS, 把异常转成 400 让前端提示用户去添加代理.
+
+    设计原则: 所有 AWS API 调用必须走代理, 绝不允许 fallback 到服务器出口 IP,
+    避免暴露真实服务器 IP 给 AWS 风控关联多个账号。
+    """
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc) or "代理池为空, 请先到「代理管理」添加代理"},
+    )
 
 
 # ==================== Schemas ====================
@@ -217,11 +232,10 @@ def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(
 
 @app.post("/api/accounts")
 async def create_account(data: AccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # 检查代理池是否有可用代理
-    from proxy_manager import ProxyManager
-    pm = ProxyManager(db)
+    # 检查代理池是否有可用代理 (按当前登录用户隔离, 避免用到别人的代理)
+    pm = ProxyManager(db, user_id=user.id)
     if not pm.get_all():
-        raise HTTPException(400, "请先添加代理！账号操作必须通过代理进行")
+        raise HTTPException(400, "请先在「代理管理」添加代理。所有 AWS 调用都会经过你自己的代理, 防止泄露服务器真实 IP。")
 
     account = AwsAccount(user_id=user.id, **data.model_dump())
     db.add(account)
@@ -262,11 +276,10 @@ def delete_account(account_id: int, user: User = Depends(get_current_user), db: 
 @app.post("/api/accounts/batch")
 async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """批量添加账号 - 并发验证检测，大幅提速"""
-    # 检查代理池
-    from proxy_manager import ProxyManager
-    pm = ProxyManager(db)
+    # 检查代理池 (按当前用户隔离)
+    pm = ProxyManager(db, user_id=user.id)
     if not pm.get_all():
-        raise HTTPException(400, "请先添加代理！账号操作必须通过代理进行")
+        raise HTTPException(400, "请先在「代理管理」添加代理。所有 AWS 调用都会经过你自己的代理, 防止泄露服务器真实 IP。")
 
     lines = [l.strip() for l in data.text.strip().split('\n') if l.strip()]
     created, errors = [], []
@@ -557,6 +570,34 @@ def list_account_groups(user: User = Depends(get_current_user), db: Session = De
     accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).all()
     groups = sorted(set(a.group_name for a in accounts if a.group_name))
     return groups
+
+@app.post("/api/accounts/reset-status")
+def reset_accounts_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """一键修复"假性失效"——把所有 status_reason 含网络错误关键字的账号重置为 unknown.
+
+    场景: 服务器到 AWS 的网络抖动 (中国直连被 GFW reset、代理掉线、DNS 超时 等) 时,
+    detect_account_info 之前会把账号误判为 invalid_credentials, 导致前端显示"AK/SK 失效".
+    新版逻辑已经会自动忽略网络错误, 但**已经被错误标记的存量账号**需要这个端点一键重置.
+    """
+    accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id).all()
+    reset = 0
+    skipped = 0
+    for a in accounts:
+        if a.account_status != "invalid_credentials":
+            skipped += 1
+            continue
+        reason = (a.status_reason or "").lower()
+        # 没有 status_reason (旧账号) 也一并重置, 让用户能再点一次"检测"
+        if not reason or AwsManager._is_network_error(reason):
+            a.account_status = "unknown"
+            a.status_reason = "已手动重置, 等待重新检测"
+            from datetime import datetime as _dt
+            a.status_checked_at = _dt.utcnow()
+            reset += 1
+        else:
+            skipped += 1
+    db.commit()
+    return {"reset": reset, "skipped": skipped, "total": len(accounts)}
 
 
 # ==================== Instances ====================

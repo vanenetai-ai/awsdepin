@@ -58,6 +58,7 @@
                     </select>
                     <button class="btn btn-secondary" id="vcpu-view-btn" onclick="toggleVcpuGroupView()" title="切换 vCPU 分组视图">📊 vCPU 分组</button>
                     <button class="btn btn-secondary" onclick="detectAllAccounts()">🔍 检测全部</button>
+                    <button class="btn btn-secondary" onclick="resetInvalidAccounts()" title="把因网络问题被误判为失效的账号重置为未知 (服务器到 AWS 网络抖动时常见)">♻️ 重置失效</button>
                     <button class="btn btn-secondary" onclick="loadAllCredits()" title="查询所有账号的 AWS Credit 抵扣额度">💎 查 Credit</button>
                     <button class="btn btn-secondary" onclick="toggleSelectAll()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="showModal('batch-account-modal')">📋 批量添加</button>

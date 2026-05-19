@@ -13,6 +13,7 @@ from botocore.config import Config
 from sqlalchemy.orm import Session
 from models import AwsAccount
 from proxy_manager import ProxyManager
+from aws_manager import ProxyRequiredError
 
 logger = logging.getLogger(__name__)
 
@@ -132,16 +133,33 @@ systemctl enable docker && systemctl start docker
 
 
 class LightsailManager:
-    def __init__(self, account: AwsAccount, db: Session, use_proxy: bool = True):
+    def __init__(
+        self,
+        account: AwsAccount,
+        db: Session,
+        use_proxy: bool = True,
+        require_proxy: bool = True,
+    ):
+        """同 AwsManager: 默认强制走代理, 没代理直接抛 ProxyRequiredError, 防止暴露服务器 IP."""
         self.account = account
         self.db = db
         self.proxy_config = None
         self._client_cache = {}
+        self.use_proxy = use_proxy
+        self.require_proxy = require_proxy
         if use_proxy:
-            pm = ProxyManager(db)
+            user_id = getattr(account, "user_id", None)
+            pm = ProxyManager(db, user_id=user_id)
             self.proxy_config = pm.get_proxy_for_boto3()
+            if not self.proxy_config and require_proxy:
+                raise ProxyRequiredError(
+                    "代理池为空: 该账号所属用户没有任何启用中的代理。"
+                    "请先到「代理管理」页面添加可用代理, 否则所有 AWS 调用会暴露服务器真实 IP。"
+                )
 
     def _get_client(self, region: str = None):
+        if self.use_proxy and self.require_proxy and not self.proxy_config:
+            raise ProxyRequiredError("代理已失效, 拒绝直连 AWS")
         region = region or self.account.default_region
         # Lightsail 在某些区域不支持，用 us-east-1 兜底
         if region not in LIGHTSAIL_REGIONS:
