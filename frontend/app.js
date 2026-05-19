@@ -7,14 +7,48 @@ function logout() { localStorage.removeItem('auth_token'); localStorage.removeIt
 function showUserInfo() { const el = document.getElementById('user-info'); if (el) el.textContent = localStorage.getItem('user_name') || '用户'; }
 
 // ==================== Utils ====================
+function _formatApiError(err, fallback) {
+    // FastAPI 422 的 detail 是 [{loc, msg, type}, ...]
+    const d = err && err.detail !== undefined ? err.detail : err;
+    if (typeof d === 'string') return d;
+    if (Array.isArray(d)) {
+        return d.map(x => {
+            if (typeof x === 'string') return x;
+            const loc = Array.isArray(x.loc) ? x.loc.slice(-1).join('.') : (x.loc || '');
+            return loc ? `${loc}: ${x.msg || JSON.stringify(x)}` : (x.msg || JSON.stringify(x));
+        }).join('; ');
+    }
+    if (d && typeof d === 'object') {
+        return d.msg || d.message || d.error || JSON.stringify(d);
+    }
+    return fallback || '请求失败';
+}
+
 async function api(path, opts = {}) {
     const token = getToken();
     const headers = { 'Content-Type': 'application/json', ...(token ? { 'Authorization': 'Bearer ' + token } : {}), ...opts.headers };
-    const res = await fetch(API + path, { ...opts, headers });
+    let res;
+    try {
+        res = await fetch(API + path, { ...opts, headers });
+    } catch (e) {
+        // 网络层错误 (断网/CORS/服务器没起来)
+        throw new Error('网络错误: ' + (e.message || e));
+    }
     if (res.status === 401) { logout(); throw new Error('登录已过期'); }
-    if (!res.ok) { const err = await res.json().catch(() => ({ detail: res.statusText })); throw new Error(err.detail || '请求失败'); }
+    if (!res.ok) {
+        let err;
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('application/json')) {
+            err = await res.json().catch(() => null);
+        } else {
+            const txt = await res.text().catch(() => '');
+            err = { detail: txt || res.statusText };
+        }
+        throw new Error(_formatApiError(err, `HTTP ${res.status} ${res.statusText}`));
+    }
     return res.json();
 }
+
 
 function showLoading(text = '处理中，请稍候...') {
     const el = document.getElementById('global-loading');
