@@ -219,16 +219,35 @@ def _get_user_account(db: Session, user: User, account_id: int) -> AwsAccount:
         raise HTTPException(404, "Account not found")
     return account
 
-def _get_user_instance(db: Session, user: User, instance_id: int) -> Instance:
-    instance = (
-        db.query(Instance)
-        .join(AwsAccount)
-        .filter(Instance.id == instance_id, AwsAccount.user_id == user.id)
-        .first()
-    )
-    if not instance:
-        raise HTTPException(404, "Instance not found")
-    return instance
+def _get_user_instance(db: Session, user: User, instance_id) -> Instance:
+    """按 DB 主键 (int) 或 AWS instance_id (i-xxx 字符串) 查找用户的实例.
+
+    历史 bug: 此函数原本只接 int, 前端误把 AWS i-xxx 传进来时 FastAPI 422 报
+    "instance_id: Input should be a valid integer". 现在两种格式都支持.
+    """
+    q = db.query(Instance).join(AwsAccount).filter(AwsAccount.user_id == user.id)
+
+    # 1) 纯数字字符串或 int → DB 主键查
+    sid = str(instance_id)
+    if sid.isdigit():
+        instance = q.filter(Instance.id == int(sid)).first()
+        if instance:
+            return instance
+        # 数字也可能是数据库找不到 (已删除), 但记录里有 i-xxx 形式也兜底试一遍下面
+
+    # 2) AWS instance_id (i-xxx) → 按字符串列查
+    if sid.startswith("i-"):
+        instance = q.filter(Instance.instance_id == sid).first()
+        if instance:
+            return instance
+        raise HTTPException(
+            404,
+            f"找不到 AWS 实例 {sid} 的本地记录。如果是外部 EC2 (非本程序创建), "
+            f"请用主面板的「终止外部实例」按钮 或 POST /api/instances/direct/terminate "
+            f"(需带 account_id + region + instance_id)"
+        )
+
+    raise HTTPException(404, f"找不到实例 {sid} (本地 DB ID 或 AWS instance_id 都没匹配)")
 
 def _get_user_proxy(db: Session, user: User, proxy_id: int) -> Proxy:
     proxy = db.query(Proxy).filter(
@@ -806,7 +825,7 @@ async def list_amis_for_region(
 
 
 @app.post("/api/instances/{instance_id}/sync")
-async def sync_instance(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def sync_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     instance = _get_user_instance(db, user, instance_id)
     loop = asyncio.get_event_loop()
     def _sync():
@@ -816,21 +835,21 @@ async def sync_instance(instance_id: int, user: User = Depends(get_current_user)
     return {"state": instance.state, "public_ip": instance.public_ip}
 
 @app.post("/api/instances/{instance_id}/start")
-async def start_instance(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def start_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     instance = _get_user_instance(db, user, instance_id)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).start_instance(instance.instance_id, instance.region))
     return {"ok": True}
 
 @app.post("/api/instances/{instance_id}/stop")
-async def stop_instance(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def stop_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     instance = _get_user_instance(db, user, instance_id)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).stop_instance(instance.instance_id, instance.region))
     return {"ok": True}
 
 @app.post("/api/instances/{instance_id}/terminate")
-async def terminate_instance(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def terminate_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     instance = _get_user_instance(db, user, instance_id)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).terminate_instance(instance.instance_id, instance.region))
@@ -839,7 +858,7 @@ async def terminate_instance(instance_id: int, user: User = Depends(get_current_
     return {"ok": True}
 
 @app.post("/api/instances/{instance_id}/reboot")
-async def reboot_instance(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def reboot_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     instance = _get_user_instance(db, user, instance_id)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).reboot_instance(instance.instance_id, instance.region))
@@ -925,8 +944,8 @@ async def batch_stop(instance_ids: list[int], user: User = Depends(get_current_u
     return {"stopped": results, "errors": errors}
 
 @app.delete("/api/instances/{instance_id}")
-def delete_instance_record(instance_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """删除实例记录 (仅从数据库删除，不终止 AWS 实例)"""
+def delete_instance_record(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """删除实例记录 (仅从数据库删除，不终止 AWS 实例). 接受 DB 主键或 i-xxx."""
     instance = _get_user_instance(db, user, instance_id)
     db.delete(instance)
     db.commit()

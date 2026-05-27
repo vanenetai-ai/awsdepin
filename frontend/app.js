@@ -2188,6 +2188,48 @@ async function stopInstance(id) { showLoading('正在停止实例...'); try { aw
 async function terminateInstance(id) { if (!confirm('确定终止？')) return; showLoading('正在终止实例...'); try { await api(`/instances/${id}/terminate`, { method: 'POST' }); toast('已终止'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 async function syncAllInstances() { showLoading('正在同步所有实例...'); try { const res = await api('/instances/sync-all', { method: 'POST' }); toast(`已同步 ${res.synced} 个`); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
+// 外部 EC2 操作 (start/stop/reboot/terminate 不在本地 DB 的实例)
+async function showExternalEc2Modal() {
+    // 加载账号下拉
+    try {
+        const accs = await api('/accounts');
+        const sel = document.getElementById('ext-ec2-account');
+        sel.innerHTML = '<option value="">-- 请选择账号 --</option>' + (accs || []).map(a =>
+            `<option value="${a.id}">${escapeHtml(a.email || a.name || '#' + a.id)}${a.aws_account_id ? ' · ' + a.aws_account_id : ''}${a.default_region ? ' · ' + a.default_region : ''}</option>`
+        ).join('');
+        // 默认实例 ID 输入框置空
+        document.getElementById('ext-ec2-instance-id').value = '';
+        document.getElementById('ext-ec2-action').value = 'terminate';
+        showModal('external-ec2-modal');
+    } catch (e) {
+        toast('加载账号列表失败: ' + e.message, 'error');
+    }
+}
+async function externalEc2Action(e) {
+    e.preventDefault();
+    const accountId = parseInt(document.getElementById('ext-ec2-account').value, 10);
+    const region = document.getElementById('ext-ec2-region').value;
+    const instanceId = (document.getElementById('ext-ec2-instance-id').value || '').trim();
+    const action = document.getElementById('ext-ec2-action').value;
+    if (!accountId) { toast('请选择账号', 'error'); return; }
+    if (!instanceId.startsWith('i-')) { toast('实例 ID 必须是 i-xxx 格式', 'error'); return; }
+    const labels = { start: '启动', stop: '停止', reboot: '重启', terminate: '终止' };
+    if (action === 'terminate' && !confirm(`⚠️ 确定终止 EC2 实例 ${instanceId} (${region})？\n此操作不可恢复！`)) return;
+    showLoading(`正在${labels[action]} ${instanceId}...`);
+    try {
+        await api(`/instances/direct/${action}`, {
+            method: 'POST',
+            body: JSON.stringify({ account_id: accountId, instance_id: instanceId, region }),
+        });
+        toast(`${labels[action]}指令已发送 (AWS 异步执行, 状态变化需要几秒)`);
+        hideModal('external-ec2-modal');
+        // 如果该实例在本地 DB 也存在, 刷新一下列表
+        setTimeout(loadInstances, 2000);
+    } catch (e) {
+        toast(`${labels[action]}失败: ${e.message}`, 'error');
+    } finally { hideLoading(); }
+}
+
 // ==================== Proxies ====================
 async function loadProxies() {
     try {

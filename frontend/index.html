@@ -80,6 +80,7 @@
                     <input type="text" id="instance-search" class="search-input" placeholder="🔍 搜索账号/实例ID/IP..." oninput="filterInstances()">
                     <button class="btn btn-secondary" onclick="toggleSelectAllInstances()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="syncAllInstances()">🔄 同步全部</button>
+                    <button class="btn btn-secondary" onclick="showExternalEc2Modal()" title="对不在本地 DB 的外部 EC2 执行操作 (start/stop/reboot/terminate)">🛠 操作外部实例</button>
                     <button class="btn btn-primary" onclick="showModal('launch-modal')">+ 启动实例</button>
                 </div>
             </div>
@@ -156,6 +157,62 @@
     </main>
 
     <!-- Modals -->
+
+    <!-- 外部 EC2 操作 Modal: 对不在本地 DB 的实例执行 start/stop/reboot/terminate -->
+    <div class="modal-overlay" id="external-ec2-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>🛠 操作外部 EC2 实例</h3>
+                <button class="modal-close" onclick="hideModal('external-ec2-modal')">&times;</button>
+            </div>
+            <div style="padding:0 0 12px;color:var(--text2);font-size:13px;line-height:1.6">
+                用于操作<b>不是本程序创建</b>的 EC2 实例 (例如在 AWS 控制台手动开的, 或被其他工具创建的).
+                需要提供该实例所属的本平台账号 + AWS 区域 + 实例 ID.
+            </div>
+            <form onsubmit="externalEc2Action(event)">
+                <div class="form-group">
+                    <label>所属账号 *</label>
+                    <select id="ext-ec2-account" required>
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <div class="form-group" style="flex:1">
+                        <label>AWS 区域 *</label>
+                        <select id="ext-ec2-region" required>
+                            <option value="us-east-1">us-east-1 (弗吉尼亚)</option>
+                            <option value="us-east-2">us-east-2 (俄亥俄)</option>
+                            <option value="us-west-1">us-west-1 (加州)</option>
+                            <option value="us-west-2">us-west-2 (俄勒冈)</option>
+                            <option value="ap-northeast-1">ap-northeast-1 (东京)</option>
+                            <option value="ap-northeast-2">ap-northeast-2 (首尔)</option>
+                            <option value="ap-southeast-1">ap-southeast-1 (新加坡)</option>
+                            <option value="ap-southeast-2">ap-southeast-2 (悉尼)</option>
+                            <option value="eu-west-1">eu-west-1 (爱尔兰)</option>
+                            <option value="eu-central-1">eu-central-1 (法兰克福)</option>
+                            <option value="ap-south-1">ap-south-1 (孟买)</option>
+                            <option value="sa-east-1">sa-east-1 (圣保罗)</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="flex:2">
+                        <label>实例 ID (i-xxxxxxxx) *</label>
+                        <input type="text" id="ext-ec2-instance-id" required placeholder="i-0123456789abcdef0" pattern="i-[0-9a-f]{8,17}">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>操作 *</label>
+                    <select id="ext-ec2-action" required>
+                        <option value="terminate">🗑 终止 (terminate, 不可恢复)</option>
+                        <option value="stop">⏹ 停止 (stop)</option>
+                        <option value="start">▶ 启动 (start)</option>
+                        <option value="reboot">🔄 重启 (reboot)</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">执行</button>
+            </form>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="account-modal">
         <div class="modal">
             <div class="modal-header">
