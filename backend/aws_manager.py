@@ -118,50 +118,69 @@ class ProxyRequiredError(Exception):
 
 
 class AwsManager:
+    """严格代理模式. 全局硬约束: 没有可用代理就不能调任何 AWS API.
+
+    设计 (不可绕过):
+    - __init__ 拿不到代理 → 抛 ProxyRequiredError, 实例根本建不出来
+    - _get_client / _get_resource / _make_detect_client 三个 boto3 入口都强制
+      proxy_config 必须非空, 否则抛 ProxyRequiredError
+    - 历史 use_proxy / require_proxy 参数保留但不再生效 (传 False 会被忽略并打日志),
+      避免任何调用代码意外绕过.
+    """
+
     def __init__(
         self,
         account: AwsAccount,
         db: Session,
-        use_proxy: bool = True,
-        require_proxy: bool = True,
+        use_proxy: bool = True,        # 保留入参兼容旧代码, 但已强制 True
+        require_proxy: bool = True,    # 同上, 已强制 True
     ):
-        """
+        """严格代理模式: 没代理就拒绝建实例.
+
         Args:
             account: AWS 账号
             db: SQLAlchemy 会话
-            use_proxy: 是否启用代理 (默认 True)
-            require_proxy: 启用代理但没找到时, 是否直接抛 ProxyRequiredError.
-                           True (默认) = 严格模式, 没代理就拒绝调 AWS, 不走服务器直连.
-                           False = 宽松模式, 没代理就直连服务器出口 IP (仅 telegram_bot 等本地任务用).
+            use_proxy / require_proxy: 已废弃, 传 False 会被忽略并打 warning.
+                之前的"宽松模式"已被彻底关闭 (用户明确要求: 没走代理任何账号操作都不能通过).
         """
+        if not use_proxy or not require_proxy:
+            logger.warning(
+                f"AwsManager: use_proxy={use_proxy} / require_proxy={require_proxy} 已废弃, "
+                f"严格代理模式下被忽略. 调用栈: {account.id if account else '?'}"
+            )
+
         self.account = account
         self.db = db
         self.proxy_config = None
         self.proxy_id: int = 0   # 当前选中的代理 ID, 业务层可用于上报 success/failure
         self._client_cache = {}
         self._resource_cache = {}
-        self.use_proxy = use_proxy
-        self.require_proxy = require_proxy
-        if use_proxy:
-            # P1 修复: 按账号 id hash 稳定选代理 (同账号永远走同代理, 防 AWS 风控关联)
-            # P3 修复: ProxyManager 内部用独立 engine connection 写 last_used_at, 不污染 db
-            user_id = getattr(account, "user_id", None)
-            pm = ProxyManager(db, user_id=user_id)
-            p = pm.get_proxy_for_account(account.id) if getattr(account, "id", None) else pm.get_proxy_round_robin()
-            if p:
-                self.proxy_config = {"http": p["url"], "https": p["url"]}
-                self.proxy_id = p["id"]
-            if not self.proxy_config and require_proxy:
-                raise ProxyRequiredError(
-                    "代理池为空 (或仅有 socks5 但 PySocks 未安装): 该用户没有可用代理。"
-                    "请先到「代理管理」页面添加可用代理 (并确保 pip install PySocks 后重启), "
-                    "否则所有 AWS 调用会暴露服务器真实 IP。"
-                )
+        # 强制 True - 任何调用都必须走代理
+        self.use_proxy = True
+        self.require_proxy = True
+
+        # P1 修复: 按账号 id hash 稳定选代理 (同账号永远走同代理, 防 AWS 风控关联)
+        # P3 修复: ProxyManager 内部用独立 engine connection 写 last_used_at, 不污染 db
+        user_id = getattr(account, "user_id", None)
+        pm = ProxyManager(db, user_id=user_id)
+        p = pm.get_proxy_for_account(account.id) if getattr(account, "id", None) else pm.get_proxy_round_robin()
+        if p:
+            self.proxy_config = {"http": p["url"], "https": p["url"]}
+            self.proxy_id = p["id"]
+        if not self.proxy_config:
+            raise ProxyRequiredError(
+                "代理池为空 (或仅有 socks5 但 PySocks 未安装, 或所有代理已被 quarantine): "
+                "该用户没有可用代理。请先到「代理管理」页面添加可用代理 (并确保 pip install PySocks 后重启), "
+                "否则所有 AWS 调用会暴露服务器真实 IP。"
+            )
+
+    def _assert_proxy(self):
+        """所有 boto3 入口的硬性守门: 没代理就拒绝, 不接受任何借口."""
+        if not self.proxy_config:
+            raise ProxyRequiredError("代理已失效或被清空, 拒绝直连 AWS (严格代理模式)")
 
     def _get_client(self, service: str, region: str = None):
-        # 安全网: 即便有人手动把 proxy_config 改 None 也拒绝调 AWS
-        if self.use_proxy and self.require_proxy and not self.proxy_config:
-            raise ProxyRequiredError("代理已失效, 拒绝直连 AWS")
+        self._assert_proxy()
         region = region or self.account.default_region
         cache_key = f"{service}:{region}"
         if cache_key in self._client_cache:
@@ -172,8 +191,7 @@ class AwsManager:
             config_kwargs = {"connect_timeout": 10, "read_timeout": 30, "retries": {"max_attempts": 2}}
         else:
             config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
-        if self.proxy_config:
-            config_kwargs["proxies"] = self.proxy_config
+        config_kwargs["proxies"] = self.proxy_config   # 强制带上, 不再走 if-else
         client = boto3.client(
             service,
             aws_access_key_id=self.account.access_key_id,
@@ -185,21 +203,18 @@ class AwsManager:
         return client
 
     def _get_resource(self, service: str, region: str = None):
-        if self.use_proxy and self.require_proxy and not self.proxy_config:
-            raise ProxyRequiredError("代理已失效, 拒绝直连 AWS")
+        self._assert_proxy()
         region = region or self.account.default_region
         cache_key = f"{service}:{region}"
         if cache_key in self._resource_cache:
             return self._resource_cache[cache_key]
-        config_kwargs = {}
-        if self.proxy_config:
-            config_kwargs["proxies"] = self.proxy_config
+        config_kwargs = {"proxies": self.proxy_config}   # 强制带上
         resource = boto3.resource(
             service,
             aws_access_key_id=self.account.access_key_id,
             aws_secret_access_key=self.account.secret_access_key,
             region_name=region,
-            config=Config(**config_kwargs) if config_kwargs else None,
+            config=Config(**config_kwargs),
         )
         self._resource_cache[cache_key] = resource
         return resource
@@ -1110,15 +1125,19 @@ Get-LocalUser -Name 'Administrator' | Set-LocalUser -Password $Password
         return {"regions": regions_data, "total_vcpus": total_vcpus, "max_on_demand": max_on_demand, "total_usage": total_usage}
 
     def _make_detect_client(self, service: str, region: str = None):
-        """为并行检测创建独立的 boto3 client（不使用缓存，线程安全）"""
+        """为并行检测创建独立的 boto3 client（不使用缓存，线程安全）.
+
+        严格代理: 没 proxy_config 直接抛错. 历史 bug 是这里只用 `if self.proxy_config`,
+        proxy_config 为空时静默走服务器真实 IP — 直接堵死.
+        """
+        self._assert_proxy()
         region = region or self.account.default_region
         slow_services = {"service-quotas", "iam", "account", "organizations", "support", "budgets", "bedrock", "sso-admin", "license-manager"}
         if service in slow_services:
             config_kwargs = {"connect_timeout": 10, "read_timeout": 30, "retries": {"max_attempts": 2}}
         else:
             config_kwargs = {"connect_timeout": 5, "read_timeout": 10, "retries": {"max_attempts": 1}}
-        if self.proxy_config:
-            config_kwargs["proxies"] = self.proxy_config
+        config_kwargs["proxies"] = self.proxy_config   # 强制
         return boto3.client(
             service,
             aws_access_key_id=self.account.access_key_id,

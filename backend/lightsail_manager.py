@@ -133,48 +133,56 @@ systemctl enable docker && systemctl start docker
 
 
 class LightsailManager:
+    """严格代理模式. 同 AwsManager 一样不可绕过."""
+
     def __init__(
         self,
         account: AwsAccount,
         db: Session,
-        use_proxy: bool = True,
-        require_proxy: bool = True,
+        use_proxy: bool = True,        # 已废弃, 传 False 会被忽略
+        require_proxy: bool = True,    # 已废弃, 传 False 会被忽略
     ):
-        """同 AwsManager: 默认强制走代理, 没代理直接抛 ProxyRequiredError, 防止暴露服务器 IP."""
+        if not use_proxy or not require_proxy:
+            logger.warning(
+                f"LightsailManager: use_proxy={use_proxy} / require_proxy={require_proxy} 已废弃, "
+                f"严格代理模式下被忽略."
+            )
+
         self.account = account
         self.db = db
         self.proxy_config = None
-        self.proxy_id: int = 0   # 当前选中的代理 ID
+        self.proxy_id: int = 0
         self._client_cache = {}
-        self.use_proxy = use_proxy
-        self.require_proxy = require_proxy
-        if use_proxy:
-            # P1 修复: 按账号 id hash 稳定选代理 (同账号永远走同代理, 防 AWS 风控关联)
-            user_id = getattr(account, "user_id", None)
-            pm = ProxyManager(db, user_id=user_id)
-            p = pm.get_proxy_for_account(account.id) if getattr(account, "id", None) else pm.get_proxy_round_robin()
-            if p:
-                self.proxy_config = {"http": p["url"], "https": p["url"]}
-                self.proxy_id = p["id"]
-            if not self.proxy_config and require_proxy:
-                raise ProxyRequiredError(
-                    "代理池为空 (或仅有 socks5 但 PySocks 未安装): 该用户没有可用代理。"
-                    "请先到「代理管理」页面添加可用代理 (并确保 pip install PySocks 后重启), "
-                    "否则所有 AWS 调用会暴露服务器真实 IP。"
-                )
+        self.use_proxy = True
+        self.require_proxy = True
+
+        # P1 修复: 按账号 id hash 稳定选代理 (同账号永远走同代理, 防 AWS 风控关联)
+        user_id = getattr(account, "user_id", None)
+        pm = ProxyManager(db, user_id=user_id)
+        p = pm.get_proxy_for_account(account.id) if getattr(account, "id", None) else pm.get_proxy_round_robin()
+        if p:
+            self.proxy_config = {"http": p["url"], "https": p["url"]}
+            self.proxy_id = p["id"]
+        if not self.proxy_config:
+            raise ProxyRequiredError(
+                "代理池为空 (或仅有 socks5 但 PySocks 未安装, 或所有代理已被 quarantine): "
+                "该用户没有可用代理。请先到「代理管理」页面添加可用代理 (并确保 pip install PySocks 后重启), "
+                "否则所有 AWS 调用会暴露服务器真实 IP。"
+            )
+
+    def _assert_proxy(self):
+        if not self.proxy_config:
+            raise ProxyRequiredError("代理已失效或被清空, 拒绝直连 AWS (严格代理模式)")
 
     def _get_client(self, region: str = None):
-        if self.use_proxy and self.require_proxy and not self.proxy_config:
-            raise ProxyRequiredError("代理已失效, 拒绝直连 AWS")
+        self._assert_proxy()
         region = region or self.account.default_region
         # Lightsail 在某些区域不支持，用 us-east-1 兜底
         if region not in LIGHTSAIL_REGIONS:
             region = "us-east-1"
         if region in self._client_cache:
             return self._client_cache[region]
-        config_kwargs = {"connect_timeout": 8, "read_timeout": 30, "retries": {"max_attempts": 2}}
-        if self.proxy_config:
-            config_kwargs["proxies"] = self.proxy_config
+        config_kwargs = {"connect_timeout": 8, "read_timeout": 30, "retries": {"max_attempts": 2}, "proxies": self.proxy_config}
         client = boto3.client(
             "lightsail",
             aws_access_key_id=self.account.access_key_id,
