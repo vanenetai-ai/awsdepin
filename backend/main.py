@@ -867,6 +867,163 @@ async def list_amis_for_region(
     )
 
 
+# ====================================================================================
+# EC2 Direct API: 通用入口, 不依赖本地 Instance 表
+#
+# ⚠️ 路由顺序极其重要!
+# 这组 /api/instances/direct/{action} 路由必须定义在 /api/instances/{instance_id}/{action}
+# 之前, 否则 FastAPI 会先匹配后者, 把 "direct" 当成 instance_id, 返回 "找不到实例 direct".
+# (FastAPI 按定义顺序匹配, 不会自动让字面量优先于参数.)
+# ====================================================================================
+
+class Ec2DirectAction(BaseModel):
+    account_id: int
+    instance_id: str
+    region: str
+    force: Optional[bool] = False  # terminate 时, 实例开了 termination protection 会自动关闭再终止
+
+
+def _humanize_aws_error(action_label: str, instance_id: str, region: str, exc: Exception) -> HTTPException:
+    """把 boto3 ClientError 转成对用户可读的 HTTPException"""
+    msg = str(exc)
+    low = msg.lower()
+    # InvalidInstanceID.NotFound 通常是 region 不对 (前端传错区域)
+    if "invalidinstanceid.notfound" in low or "does not exist" in low:
+        return HTTPException(404, f"实例 {instance_id} 在区域 {region} 不存在 (区域可能传错; 同一账号在不同区域是隔离的)")
+    if "invalidinstanceid.malformed" in low:
+        return HTTPException(400, f"实例 ID 格式无效: {instance_id}")
+    if "incorrectinstancestate" in low or "is not in a state from which it can be" in low:
+        return HTTPException(409, f"实例 {instance_id} 当前状态无法执行{action_label} (例如已停止/已终止/启动中)")
+    if "operationnotpermitted" in low and "terminationprotection" in low.replace(" ", ""):
+        return HTTPException(409, f"实例 {instance_id} 开启了【终止保护】, 请先在 AWS 控制台关闭 disableApiTermination 再操作")
+    if "unauthorizedoperation" in low or "accessdenied" in low or "not authorized to perform" in low:
+        # 提取出缺失的 action 名称, 帮用户排查权限
+        import re as _re
+        m = _re.search(r"perform:\s*([\w:-]+)", msg)
+        action = m.group(1) if m else "ec2:*"
+        return HTTPException(403, f"AK/SK 缺权限 {action}, 无法{action_label}该实例 (建议授予 AmazonEC2FullAccess)")
+    if "optinrequired" in low or "the security token included in the request is invalid" in low:
+        return HTTPException(401, f"AK/SK 失效或区域 {region} 未启用 (opt-in)")
+    if "throttling" in low or "requestlimitexceeded" in low:
+        return HTTPException(429, f"AWS API 限流, 请稍后重试")
+    # 兜底: 截短错误并把 AWS Error Code 提到前面
+    if "(" in msg and ")" in msg:
+        # boto3 错误格式: "An error occurred (XxxException) when calling the StopInstances operation: ..."
+        return HTTPException(500, msg.split("\n")[0][:300])
+    return HTTPException(500, f"{action_label}失败: {msg[:200]}")
+
+
+def _ec2_direct_action(db: Session, user: User, data: "Ec2DirectAction", method_name: str, action_label: str):
+    """4 个 direct 端点公用的封装: 取 account → 调 AwsManager → 同步 DB 状态 → 友好错误"""
+    account = _get_user_account(db, user, data.account_id)
+    mgr = AwsManager(account, db)
+    try:
+        method = getattr(mgr, method_name)
+        if method_name == "terminate_instance":
+            method(data.instance_id, data.region)   # terminate 不收 force, 已在签名层处理
+        else:
+            method(data.instance_id, data.region)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"EC2 {method_name} {data.instance_id}@{data.region} failed: {e}")
+        raise _humanize_aws_error(action_label, data.instance_id, data.region, e)
+
+    # 同步本地 Instance (如果存在) 的状态, 避免 UI 刷新前显示旧状态
+    try:
+        local = db.query(Instance).filter(
+            Instance.account_id == account.id,
+            Instance.instance_id == data.instance_id,
+        ).first()
+        if local:
+            if method_name == "terminate_instance":
+                local.state = "shutting-down"
+            elif method_name == "stop_instance":
+                local.state = "stopping"
+            elif method_name == "start_instance":
+                local.state = "pending"
+            elif method_name == "reboot_instance":
+                local.state = "rebooting"
+            db.commit()
+    except Exception:
+        db.rollback()
+
+
+@app.post("/api/instances/direct/start")
+async def ec2_direct_start(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """通过 instance_id + region 直接启动一个 EC2 实例 (不需要本地 Instance 记录)"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: _ec2_direct_action(db, user, data, "start_instance", "启动"))
+    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "start"}
+
+
+@app.post("/api/instances/direct/stop")
+async def ec2_direct_stop(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: _ec2_direct_action(db, user, data, "stop_instance", "停止"))
+    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "stop"}
+
+
+@app.post("/api/instances/direct/reboot")
+async def ec2_direct_reboot(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: _ec2_direct_action(db, user, data, "reboot_instance", "重启"))
+    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "reboot"}
+
+
+@app.post("/api/instances/direct/terminate")
+async def ec2_direct_terminate(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """终止实例; 若开了 termination protection 会先关闭再终止 (data.force=True)"""
+    account = _get_user_account(db, user, data.account_id)
+    loop = asyncio.get_event_loop()
+
+    def _do():
+        mgr = AwsManager(account, db)
+        try:
+            mgr.terminate_instance(data.instance_id, data.region)
+        except Exception as e:
+            err = str(e).lower()
+            # termination protection: 自动关掉再终止
+            if "operationnotpermitted" in err and "terminationprotection" in err.replace(" ", ""):
+                if data.force:
+                    try:
+                        ec2 = mgr._get_client("ec2", data.region)
+                        ec2.modify_instance_attribute(
+                            InstanceId=data.instance_id,
+                            DisableApiTermination={"Value": False},
+                        )
+                        mgr.terminate_instance(data.instance_id, data.region)
+                        return
+                    except Exception as e2:
+                        raise _humanize_aws_error("终止 (强制)", data.instance_id, data.region, e2)
+                else:
+                    raise HTTPException(
+                        409,
+                        f"实例 {data.instance_id} 开启了【终止保护】; 请用 force=true 重试或在控制台手动关闭",
+                    )
+            logger.warning(f"EC2 terminate {data.instance_id}@{data.region} failed: {e}")
+            raise _humanize_aws_error("终止", data.instance_id, data.region, e)
+
+        # 同步本地状态
+        try:
+            local = db.query(Instance).filter(
+                Instance.account_id == account.id,
+                Instance.instance_id == data.instance_id,
+            ).first()
+            if local:
+                local.state = "shutting-down"
+                db.commit()
+        except Exception:
+            db.rollback()
+
+    await loop.run_in_executor(executor, _do)
+    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "terminate"}
+
+
+# ====================================================================================
+# 旧风格端点: /api/instances/{instance_id}/{action} - 必须放在 direct/* 之后
+# ====================================================================================
+
 @app.post("/api/instances/{instance_id}/sync")
 async def sync_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     instance = _get_user_instance(db, user, instance_id)
@@ -1030,149 +1187,6 @@ def batch_delete_instances(data: BatchDeleteRequest, user: User = Depends(get_cu
             deleted += 1
     db.commit()
     return {"deleted": deleted}
-
-class Ec2DirectAction(BaseModel):
-    account_id: int
-    instance_id: str
-    region: str
-    force: Optional[bool] = False  # terminate 时, 实例开了 termination protection 会自动关闭再终止
-
-
-def _humanize_aws_error(action_label: str, instance_id: str, region: str, exc: Exception) -> HTTPException:
-    """把 boto3 ClientError 转成对用户可读的 HTTPException"""
-    msg = str(exc)
-    low = msg.lower()
-    # InvalidInstanceID.NotFound 通常是 region 不对 (前端传错区域)
-    if "invalidinstanceid.notfound" in low or "does not exist" in low:
-        return HTTPException(404, f"实例 {instance_id} 在区域 {region} 不存在 (区域可能传错; 同一账号在不同区域是隔离的)")
-    if "invalidinstanceid.malformed" in low:
-        return HTTPException(400, f"实例 ID 格式无效: {instance_id}")
-    if "incorrectinstancestate" in low or "is not in a state from which it can be" in low:
-        return HTTPException(409, f"实例 {instance_id} 当前状态无法执行{action_label} (例如已停止/已终止/启动中)")
-    if "operationnotpermitted" in low and "terminationprotection" in low.replace(" ", ""):
-        return HTTPException(409, f"实例 {instance_id} 开启了【终止保护】, 请先在 AWS 控制台关闭 disableApiTermination 再操作")
-    if "unauthorizedoperation" in low or "accessdenied" in low or "not authorized to perform" in low:
-        # 提取出缺失的 action 名称, 帮用户排查权限
-        import re as _re
-        m = _re.search(r"perform:\s*([\w:-]+)", msg)
-        action = m.group(1) if m else "ec2:*"
-        return HTTPException(403, f"AK/SK 缺权限 {action}, 无法{action_label}该实例 (建议授予 AmazonEC2FullAccess)")
-    if "optinrequired" in low or "the security token included in the request is invalid" in low:
-        return HTTPException(401, f"AK/SK 失效或区域 {region} 未启用 (opt-in)")
-    if "throttling" in low or "requestlimitexceeded" in low:
-        return HTTPException(429, f"AWS API 限流, 请稍后重试")
-    # 兜底: 截短错误并把 AWS Error Code 提到前面
-    if "(" in msg and ")" in msg:
-        # boto3 错误格式: "An error occurred (XxxException) when calling the StopInstances operation: ..."
-        return HTTPException(500, msg.split("\n")[0][:300])
-    return HTTPException(500, f"{action_label}失败: {msg[:200]}")
-
-
-def _ec2_direct_action(db: Session, user: User, data: "Ec2DirectAction", method_name: str, action_label: str):
-    """4 个 direct 端点公用的封装: 取 account → 调 AwsManager → 同步 DB 状态 → 友好错误"""
-    account = _get_user_account(db, user, data.account_id)
-    mgr = AwsManager(account, db)
-    try:
-        method = getattr(mgr, method_name)
-        if method_name == "terminate_instance":
-            method(data.instance_id, data.region)   # terminate 不收 force, 已在签名层处理
-        else:
-            method(data.instance_id, data.region)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"EC2 {method_name} {data.instance_id}@{data.region} failed: {e}")
-        raise _humanize_aws_error(action_label, data.instance_id, data.region, e)
-
-    # 同步本地 Instance (如果存在) 的状态, 避免 UI 刷新前显示旧状态
-    try:
-        local = db.query(Instance).filter(
-            Instance.account_id == account.id,
-            Instance.instance_id == data.instance_id,
-        ).first()
-        if local:
-            if method_name == "terminate_instance":
-                local.state = "shutting-down"
-            elif method_name == "stop_instance":
-                local.state = "stopping"
-            elif method_name == "start_instance":
-                local.state = "pending"
-            elif method_name == "reboot_instance":
-                local.state = "rebooting"
-            db.commit()
-    except Exception:
-        db.rollback()
-
-
-@app.post("/api/instances/direct/start")
-async def ec2_direct_start(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """通过 instance_id + region 直接启动一个 EC2 实例 (不需要本地 Instance 记录)"""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: _ec2_direct_action(db, user, data, "start_instance", "启动"))
-    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "start"}
-
-
-@app.post("/api/instances/direct/stop")
-async def ec2_direct_stop(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: _ec2_direct_action(db, user, data, "stop_instance", "停止"))
-    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "stop"}
-
-
-@app.post("/api/instances/direct/reboot")
-async def ec2_direct_reboot(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: _ec2_direct_action(db, user, data, "reboot_instance", "重启"))
-    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "reboot"}
-
-
-@app.post("/api/instances/direct/terminate")
-async def ec2_direct_terminate(data: Ec2DirectAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """终止实例; 若开了 termination protection 会先关闭再终止 (data.force=True)"""
-    account = _get_user_account(db, user, data.account_id)
-    loop = asyncio.get_event_loop()
-
-    def _do():
-        mgr = AwsManager(account, db)
-        try:
-            mgr.terminate_instance(data.instance_id, data.region)
-        except Exception as e:
-            err = str(e).lower()
-            # termination protection: 自动关掉再终止
-            if "operationnotpermitted" in err and "terminationprotection" in err.replace(" ", ""):
-                if data.force:
-                    try:
-                        ec2 = mgr._get_client("ec2", data.region)
-                        ec2.modify_instance_attribute(
-                            InstanceId=data.instance_id,
-                            DisableApiTermination={"Value": False},
-                        )
-                        mgr.terminate_instance(data.instance_id, data.region)
-                        return
-                    except Exception as e2:
-                        raise _humanize_aws_error("终止 (强制)", data.instance_id, data.region, e2)
-                else:
-                    raise HTTPException(
-                        409,
-                        f"实例 {data.instance_id} 开启了【终止保护】; 请用 force=true 重试或在控制台手动关闭",
-                    )
-            logger.warning(f"EC2 terminate {data.instance_id}@{data.region} failed: {e}")
-            raise _humanize_aws_error("终止", data.instance_id, data.region, e)
-
-        # 同步本地状态
-        try:
-            local = db.query(Instance).filter(
-                Instance.account_id == account.id,
-                Instance.instance_id == data.instance_id,
-            ).first()
-            if local:
-                local.state = "shutting-down"
-                db.commit()
-        except Exception:
-            db.rollback()
-
-    await loop.run_in_executor(executor, _do)
-    return {"ok": True, "instance_id": data.instance_id, "region": data.region, "action": "terminate"}
 
 
 @app.get("/api/accounts/{account_id}/ec2-detail")
