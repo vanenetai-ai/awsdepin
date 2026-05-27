@@ -224,6 +224,11 @@ def _get_user_instance(db: Session, user: User, instance_id) -> Instance:
 
     历史 bug: 此函数原本只接 int, 前端误把 AWS i-xxx 传进来时 FastAPI 422 报
     "instance_id: Input should be a valid integer". 现在两种格式都支持.
+
+    当 i-xxx 不在本地 DB (例如手动开的外部 EC2) 时, 不直接抛 404; 改为返回
+    "虚拟" Instance: 用户名下的某个账号 + 这个 i-xxx (region/account 未知).
+    调用方需要自己处理这种情况 — 比如调 direct API 时跨账号扫描.
+    实际上更好的做法是让前端直接调 direct API; 这里只是兜底防止旧前端报错.
     """
     q = db.query(Instance).join(AwsAccount).filter(AwsAccount.user_id == user.id)
 
@@ -233,7 +238,6 @@ def _get_user_instance(db: Session, user: User, instance_id) -> Instance:
         instance = q.filter(Instance.id == int(sid)).first()
         if instance:
             return instance
-        # 数字也可能是数据库找不到 (已删除), 但记录里有 i-xxx 形式也兜底试一遍下面
 
     # 2) AWS instance_id (i-xxx) → 按字符串列查
     if sid.startswith("i-"):
@@ -242,12 +246,51 @@ def _get_user_instance(db: Session, user: User, instance_id) -> Instance:
             return instance
         raise HTTPException(
             404,
-            f"找不到 AWS 实例 {sid} 的本地记录。如果是外部 EC2 (非本程序创建), "
-            f"请用主面板的「终止外部实例」按钮 或 POST /api/instances/direct/terminate "
-            f"(需带 account_id + region + instance_id)"
+            f"实例 {sid} 不在本地数据库 (可能是外部 EC2, 未通过本程序创建). "
+            f"请用「实例」页顶部的「🛠 手动操作 EC2」按钮 (需带 account + region + i-xxx), "
+            f"或刷新浏览器 (Ctrl+Shift+R) 让新版前端生效 — 新版会自动用 direct API."
         )
 
     raise HTTPException(404, f"找不到实例 {sid} (本地 DB ID 或 AWS instance_id 都没匹配)")
+
+
+def _find_instance_across_accounts(db: Session, user: User, aws_instance_id: str) -> tuple:
+    """跨用户所有账号的所有区域查 AWS 实例; 返回 (account, region) 或 (None, None).
+
+    用于"旧前端发起 /api/instances/i-xxx/terminate"且实例不在本地 DB 的兜底场景.
+    扫描代价高 (每账号每区域一次 DescribeInstances), 仅在普通查找失败时调用.
+    并发上限保护; 一旦命中立即返回.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    accounts = db.query(AwsAccount).filter(AwsAccount.user_id == user.id, AwsAccount.is_active == True).all()  # noqa: E712
+    if not accounts:
+        return (None, None)
+
+    def _check_account(acc):
+        try:
+            mgr = AwsManager(acc, db)
+            for region in (acc.default_region, "us-east-1", "us-east-2", "us-west-2", "ap-southeast-1", "ap-northeast-1", "eu-west-1"):
+                try:
+                    ec2 = mgr._get_client("ec2", region)
+                    resp = ec2.describe_instances(InstanceIds=[aws_instance_id])
+                    if resp.get("Reservations"):
+                        return (acc, region)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(accounts))) as pool:
+        futs = {pool.submit(_check_account, a): a for a in accounts}
+        for fut in as_completed(futs):
+            r = fut.result()
+            if r:
+                # 取消其他, 直接返回
+                for f in futs:
+                    f.cancel()
+                return r
+    return (None, None)
 
 def _get_user_proxy(db: Session, user: User, proxy_id: int) -> Proxy:
     proxy = db.query(Proxy).filter(
@@ -834,35 +877,60 @@ async def sync_instance(instance_id: str, user: User = Depends(get_current_user)
     await loop.run_in_executor(executor, _sync)
     return {"state": instance.state, "public_ip": instance.public_ip}
 
+async def _legacy_instance_op(instance_id: str, user: User, db: Session, method_name: str, action_label: str, set_state_after: str = None):
+    """旧风格端点 /api/instances/{id}/{action} 的统一入口.
+
+    1) 尝试按 DB 主键 / Instance.instance_id 在本地表里找
+    2) 找不到 + id 是 i-xxx 格式 → 跨用户所有账号搜 (兜底, 兼容老前端)
+    3) 仍找不到 → 404 友好提示
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        instance = _get_user_instance(db, user, instance_id)
+    except HTTPException as e:
+        if e.status_code != 404 or not str(instance_id).startswith("i-"):
+            raise
+        # 兜底: 跨账号搜
+        logger.info(f"[legacy-{method_name}] {instance_id} not in DB, scanning all user accounts...")
+        acc, region = await loop.run_in_executor(executor, lambda: _find_instance_across_accounts(db, user, str(instance_id)))
+        if not acc:
+            raise HTTPException(
+                404,
+                f"实例 {instance_id} 在你所有账号的常用区域里都找不到. "
+                f"如确认实例存在, 请用「🛠 手动操作 EC2」按钮指定准确的 account + region."
+            )
+        def _do():
+            mgr = AwsManager(acc, db)
+            getattr(mgr, method_name)(str(instance_id), region)
+        await loop.run_in_executor(executor, _do)
+        return {"ok": True, "instance_id": instance_id, "region": region, "account_id": acc.id, "via": "cross-account-scan"}
+
+    # 正常路径: 用本地记录
+    def _do_local():
+        mgr = AwsManager(instance.account, db)
+        getattr(mgr, method_name)(instance.instance_id, instance.region)
+    await loop.run_in_executor(executor, _do_local)
+    if set_state_after:
+        instance.state = set_state_after
+        db.commit()
+    return {"ok": True}
+
+
 @app.post("/api/instances/{instance_id}/start")
 async def start_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    instance = _get_user_instance(db, user, instance_id)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).start_instance(instance.instance_id, instance.region))
-    return {"ok": True}
+    return await _legacy_instance_op(instance_id, user, db, "start_instance", "启动")
 
 @app.post("/api/instances/{instance_id}/stop")
 async def stop_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    instance = _get_user_instance(db, user, instance_id)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).stop_instance(instance.instance_id, instance.region))
-    return {"ok": True}
+    return await _legacy_instance_op(instance_id, user, db, "stop_instance", "停止")
 
 @app.post("/api/instances/{instance_id}/terminate")
 async def terminate_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    instance = _get_user_instance(db, user, instance_id)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).terminate_instance(instance.instance_id, instance.region))
-    instance.state = "terminated"
-    db.commit()
-    return {"ok": True}
+    return await _legacy_instance_op(instance_id, user, db, "terminate_instance", "终止", set_state_after="terminated")
 
 @app.post("/api/instances/{instance_id}/reboot")
 async def reboot_instance(instance_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    instance = _get_user_instance(db, user, instance_id)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, lambda: AwsManager(instance.account, db).reboot_instance(instance.instance_id, instance.region))
-    return {"ok": True}
+    return await _legacy_instance_op(instance_id, user, db, "reboot_instance", "重启")
 
 @app.post("/api/instances/sync-all")
 async def sync_all_instances(user: User = Depends(get_current_user), db: Session = Depends(get_db)):

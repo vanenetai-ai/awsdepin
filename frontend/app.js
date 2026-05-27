@@ -1,5 +1,11 @@
 const API = '/api';
 
+// 版本号 - 用于排查"浏览器是否拿到新版前端".
+// 在 DevTools Console 里输入 APP_VERSION 看到这个值就说明你在用新版.
+const APP_VERSION = '2025-05-28-unified-direct-api';
+console.log(`%c[AWS DePIN Manager] frontend version: ${APP_VERSION}`, 'color:#4caf50;font-weight:bold');
+window.APP_VERSION = APP_VERSION;
+
 // ==================== Auth ====================
 function getToken() { return localStorage.getItem('auth_token') || ''; }
 function checkAuth() { if (!getToken()) { window.location.href = '/login.html'; return false; } return true; }
