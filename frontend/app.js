@@ -1116,14 +1116,11 @@ async function loadAccountInstancesDetail() {
     if (!_acctInstAccountId) return;
     const body = document.getElementById('acct-instances-list');
     const summary = document.getElementById('acct-instances-summary');
-    // 修复: 复选框「仅本平台创建」逻辑
-    //   不勾 (默认) → 显示账号下所有 EC2 实例 → all_managed=true
-    //   勾选        → 只显示带 ManagedBy 标签的本平台实例 → all_managed=false
-    const onlyManaged = !!document.getElementById('acct-inst-managed-only')?.checked;
+    // 永远拉全部实例 (含外部), 在前端按 acct-inst-managed-filter 过滤. 这样切过滤不用重查 AWS.
     body.innerHTML = `<div style="text-align:center;padding:30px"><div class="spinner"></div><div style="margin-top:12px;color:var(--text2)">正在并发扫描所有区域 EC2 实例（约 10-30 秒）...</div></div>`;
     summary.innerHTML = '';
     try {
-        const url = `/accounts/${_acctInstAccountId}/ec2-detail?all_managed=${onlyManaged ? 'false' : 'true'}&_ts=${Date.now()}`;
+        const url = `/accounts/${_acctInstAccountId}/ec2-detail?all_managed=true&_ts=${Date.now()}`;
         const res = await api(url);
 
         _acctInstData = res.instances || [];
@@ -1145,6 +1142,9 @@ async function loadAccountInstancesDetail() {
     }
 }
 
+// 当前过滤后的列表 (供批量操作复用, 不再走一遍 filter)
+let _acctInstFiltered = [];
+
 function renderAcctInstances() {
     const body = document.getElementById('acct-instances-list');
     const summary = document.getElementById('acct-instances-summary');
@@ -1152,11 +1152,14 @@ function renderAcctInstances() {
 
     const region = document.getElementById('acct-inst-region-filter').value;
     const state = document.getElementById('acct-inst-state-filter').value;
+    const managedFilter = document.getElementById('acct-inst-managed-filter')?.value || 'all';
     const q = (document.getElementById('acct-inst-search').value || '').toLowerCase();
 
     let list = _acctInstData;
     if (region) list = list.filter(i => i.region === region);
     if (state) list = list.filter(i => i.state === state);
+    if (managedFilter === 'external') list = list.filter(i => !i.managed);
+    else if (managedFilter === 'managed') list = list.filter(i => i.managed);
     if (q) list = list.filter(i =>
         (i.instance_id || '').toLowerCase().includes(q) ||
         (i.name || '').toLowerCase().includes(q) ||
@@ -1165,16 +1168,25 @@ function renderAcctInstances() {
         (i.public_dns || '').toLowerCase().includes(q)
     );
 
+    _acctInstFiltered = list;
+
     // 摘要
     const states = {};
-    for (const i of list) states[i.state] = (states[i.state] || 0) + 1;
+    let externalCount = 0;
+    for (const i of list) {
+        states[i.state] = (states[i.state] || 0) + 1;
+        if (!i.managed) externalCount++;
+    }
     const stateBadges = Object.entries(states).map(([s, c]) => {
         const color = s === 'running' ? 'green' : (s === 'stopped' ? 'red' : (s === 'pending' ? 'yellow' : 'gray'));
         return `<span class="badge badge-${color}">${s} ${c}</span>`;
     }).join('');
+    const extBadge = externalCount > 0
+        ? `<span class="badge" style="background:#c0392b;color:#fff" title="非本程序创建">🌐 外部 ${externalCount}</span>`
+        : '';
     summary.innerHTML = `
         <div class="stat-card" style="padding:10px 14px;flex:0 0 auto"><div class="label">实例总数</div><div class="value blue" style="font-size:20px">${list.length}</div></div>
-        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${stateBadges}</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${stateBadges}${extBadge}</div>
     `;
 
     if (!list.length) {
@@ -1183,6 +1195,59 @@ function renderAcctInstances() {
     }
 
     body.innerHTML = list.map(_renderAcctInstanceCard).join('');
+}
+
+// 批量终止当前筛选条件下的所有实例 (二次确认 + 并行)
+async function batchTerminateFiltered() {
+    if (!_acctInstFiltered || !_acctInstFiltered.length) {
+        toast('当前筛选条件下没有实例', 'error');
+        return;
+    }
+    // 只终止还没 terminated 的
+    const targets = _acctInstFiltered.filter(i => i.state !== 'terminated' && i.state !== 'shutting-down');
+    if (!targets.length) {
+        toast('筛选项里的实例都已经终止了', 'error');
+        return;
+    }
+    const externalCount = targets.filter(i => !i.managed).length;
+    const managedCount = targets.length - externalCount;
+    const msg = `⚠️ 即将终止 ${targets.length} 个 EC2 实例:\n` +
+                `  · 外部实例 (非本平台): ${externalCount}\n` +
+                `  · 本平台实例: ${managedCount}\n\n` +
+                `此操作【不可恢复】。继续？`;
+    if (!confirm(msg)) return;
+    if (targets.length > 5 && !confirm(`再次确认: 终止 ${targets.length} 个实例?`)) return;
+
+    showLoading(`正在终止 ${targets.length} 个实例...`);
+    let ok = 0, fail = 0;
+    const errors = [];
+    // 并发上限 10, 防止打爆代理
+    const CONC = 10;
+    let idx = 0;
+    async function worker() {
+        while (idx < targets.length) {
+            const cur = targets[idx++];
+            try {
+                await api(`/instances/direct/terminate`, {
+                    method: 'POST',
+                    body: JSON.stringify({ account_id: _acctInstAccountId, instance_id: cur.instance_id, region: cur.region }),
+                });
+                ok++;
+            } catch (e) {
+                fail++;
+                errors.push(`${cur.instance_id} (${cur.region}): ${e.message}`);
+            }
+        }
+    }
+    await Promise.all(Array.from({length: Math.min(CONC, targets.length)}, () => worker()));
+    hideLoading();
+    if (fail === 0) {
+        toast(`✅ 已发送终止指令: ${ok} 个`);
+    } else {
+        toast(`部分失败: ${ok} 成功 / ${fail} 失败. 第一个错误: ${errors[0] || ''}`, 'error');
+        console.error('Batch terminate errors:', errors);
+    }
+    setTimeout(loadAccountInstancesDetail, 2500);
 }
 
 function _humanDuration(launchTimeIso) {
@@ -1223,15 +1288,19 @@ function _renderAcctInstanceCard(i) {
     const escIid = (i.instance_id || '').replace(/'/g, "\\'");
     const escRegion = (i.region || '').replace(/'/g, "\\'");
 
+    // 边框颜色突出: 外部实例描红, 让用户一眼能挑出来
+    const cardBorder = i.managed ? '' : 'border-left:3px solid #c0392b;';
     return `
-    <div class="acc-card" style="margin-bottom:12px">
+    <div class="acc-card" style="margin-bottom:12px;${cardBorder}">
         <div class="acc-card-header">
             <div class="acc-card-left" style="flex-wrap:wrap">
                 <span class="acc-num">🖥</span>
                 <span class="acc-name" title="${name}"><b>${name.length > 32 ? name.substring(0,32)+'...' : name}</b></span>
                 <span class="badge badge-${stateColor}">${i.state}</span>
                 <span class="acc-flag">${i.region}</span>
-                ${i.managed ? '<span class="badge badge-blue" style="font-size:10px">本平台</span>' : ''}
+                ${i.managed
+                    ? '<span class="badge badge-blue" style="font-size:10px" title="本程序创建, 带 ManagedBy 标签">✓ 本平台</span>'
+                    : '<span class="badge" style="font-size:10px;background:#c0392b;color:#fff" title="非本程序创建 (AWS 控制台或其他工具创建), 操作走 AWS Direct API">🌐 外部</span>'}
                 <span class="acc-age" title="${launchStr}">⏱ ${uptime}</span>
             </div>
         </div>
@@ -1257,10 +1326,10 @@ function _renderAcctInstanceCard(i) {
             <div><span style="color:var(--text2)">AMI</span> <code style="font-size:11px">${i.image_id || '-'}</code></div>
         </div>
         <div class="acc-card-footer" style="flex-wrap:wrap">
-            ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="acctInstAction('${escIid}','${escRegion}','start')">▶ 启动</button>` : ''}
-            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','stop')">⏹ 停止</button>` : ''}
-            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','reboot')">🔄 重启</button>` : ''}
-            ${i.state !== 'terminated' ? `<button class="btn btn-sm btn-danger" onclick="acctInstAction('${escIid}','${escRegion}','terminate')">🗑 终止</button>` : ''}
+            ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="acctInstAction('${escIid}','${escRegion}','start')" title="${i.managed ? '' : '走 AWS Direct API'}">▶ 启动</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','stop')" title="${i.managed ? '' : '走 AWS Direct API'}">⏹ 停止</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','reboot')" title="${i.managed ? '' : '走 AWS Direct API'}">🔄 重启</button>` : ''}
+            ${i.state !== 'terminated' ? `<button class="btn btn-sm btn-danger" onclick="acctInstAction('${escIid}','${escRegion}','terminate')" title="${i.managed ? '终止 (不可恢复)' : '终止外部实例 (走 AWS Direct API, 不可恢复)'}">🗑 终止${i.managed ? '' : '(外部)'}</button>` : ''}
             <button class="btn btn-sm btn-secondary" onclick="copyToClipboard('${escIid}', this)" title="复制实例 ID">📋 ID</button>
             ${publicIp !== '-' ? `<button class="btn btn-sm btn-secondary" onclick="copyToClipboard('ssh -i depin-key-${escRegion}.pem ubuntu@${publicIp}', this)" title="复制 SSH 命令">SSH</button>` : ''}
         </div>

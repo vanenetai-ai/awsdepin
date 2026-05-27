@@ -546,10 +546,13 @@
                     <option value="terminated">已终止</option>
                 </select>
                 <input type="text" id="acct-inst-search" class="search-input" placeholder="🔍 搜索 ID / IP / 名称" oninput="renderAcctInstances()">
+                <select id="acct-inst-managed-filter" class="search-input" onchange="renderAcctInstances()" style="width:auto;min-width:140px" title="按是否本平台创建过滤">
+                    <option value="all">全部 (本平台 + 外部)</option>
+                    <option value="external">仅外部 (非本平台)</option>
+                    <option value="managed">仅本平台</option>
+                </select>
                 <span style="flex:1"></span>
-                <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:4px">
-                    <input type="checkbox" id="acct-inst-managed-only" onchange="loadAccountInstancesDetail()"> 仅本平台创建
-                </label>
+                <button type="button" class="btn btn-danger" onclick="batchTerminateFiltered()" title="终止当前筛选条件下显示的所有实例 (危险!)">🗑 终止筛选项</button>
                 <button type="button" class="btn btn-primary" onclick="showCreateEc2Modal()">+ 创建实例</button>
                 <button type="button" class="btn btn-secondary" onclick="loadAccountInstancesDetail()">🔄 刷新</button>
             </div>
