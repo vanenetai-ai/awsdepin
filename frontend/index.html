@@ -80,7 +80,7 @@
                     <input type="text" id="instance-search" class="search-input" placeholder="🔍 搜索账号/实例ID/IP..." oninput="filterInstances()">
                     <button class="btn btn-secondary" onclick="toggleSelectAllInstances()">☑ 全选</button>
                     <button class="btn btn-secondary" onclick="syncAllInstances()">🔄 同步全部</button>
-                    <button class="btn btn-secondary" onclick="showExternalEc2Modal()" title="对不在本地 DB 的外部 EC2 执行操作 (start/stop/reboot/terminate)">🛠 操作外部实例</button>
+                    <button class="btn btn-secondary" onclick="showExternalEc2Modal()" title="手动输入 account/region/i-xxx 直接操作 (start/stop/reboot/terminate). 适用于不在列表里的实例.">🛠 手动操作 EC2</button>
                     <button class="btn btn-primary" onclick="showModal('launch-modal')">+ 启动实例</button>
                 </div>
             </div>
@@ -158,16 +158,16 @@
 
     <!-- Modals -->
 
-    <!-- 外部 EC2 操作 Modal: 对不在本地 DB 的实例执行 start/stop/reboot/terminate -->
+    <!-- 手动操作 EC2 Modal: 输入 account+region+i-xxx 直接调 AWS API, 不需要实例在本地 DB -->
     <div class="modal-overlay" id="external-ec2-modal">
         <div class="modal">
             <div class="modal-header">
-                <h3>🛠 操作外部 EC2 实例</h3>
+                <h3>🛠 手动操作 EC2 实例</h3>
                 <button class="modal-close" onclick="hideModal('external-ec2-modal')">&times;</button>
             </div>
             <div style="padding:0 0 12px;color:var(--text2);font-size:13px;line-height:1.6">
-                用于操作<b>不是本程序创建</b>的 EC2 实例 (例如在 AWS 控制台手动开的, 或被其他工具创建的).
-                需要提供该实例所属的本平台账号 + AWS 区域 + 实例 ID.
+                直接对任意 EC2 实例执行 start / stop / reboot / terminate. 走 AWS Direct API,
+                <b>不需要</b>实例在本地数据库. 适用于实例没出现在列表里、或不想等区域扫描的场景.
             </div>
             <form onsubmit="externalEc2Action(event)">
                 <div class="form-group">
@@ -546,11 +546,6 @@
                     <option value="terminated">已终止</option>
                 </select>
                 <input type="text" id="acct-inst-search" class="search-input" placeholder="🔍 搜索 ID / IP / 名称" oninput="renderAcctInstances()">
-                <select id="acct-inst-managed-filter" class="search-input" onchange="renderAcctInstances()" style="width:auto;min-width:140px" title="按是否本平台创建过滤">
-                    <option value="all">全部 (本平台 + 外部)</option>
-                    <option value="external">仅外部 (非本平台)</option>
-                    <option value="managed">仅本平台</option>
-                </select>
                 <span style="flex:1"></span>
                 <button type="button" class="btn btn-danger" onclick="batchTerminateFiltered()" title="终止当前筛选条件下显示的所有实例 (危险!)">🗑 终止筛选项</button>
                 <button type="button" class="btn btn-primary" onclick="showCreateEc2Modal()">+ 创建实例</button>

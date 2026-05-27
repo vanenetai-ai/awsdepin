@@ -1152,14 +1152,11 @@ function renderAcctInstances() {
 
     const region = document.getElementById('acct-inst-region-filter').value;
     const state = document.getElementById('acct-inst-state-filter').value;
-    const managedFilter = document.getElementById('acct-inst-managed-filter')?.value || 'all';
     const q = (document.getElementById('acct-inst-search').value || '').toLowerCase();
 
     let list = _acctInstData;
     if (region) list = list.filter(i => i.region === region);
     if (state) list = list.filter(i => i.state === state);
-    if (managedFilter === 'external') list = list.filter(i => !i.managed);
-    else if (managedFilter === 'managed') list = list.filter(i => i.managed);
     if (q) list = list.filter(i =>
         (i.instance_id || '').toLowerCase().includes(q) ||
         (i.name || '').toLowerCase().includes(q) ||
@@ -1172,21 +1169,14 @@ function renderAcctInstances() {
 
     // 摘要
     const states = {};
-    let externalCount = 0;
-    for (const i of list) {
-        states[i.state] = (states[i.state] || 0) + 1;
-        if (!i.managed) externalCount++;
-    }
+    for (const i of list) states[i.state] = (states[i.state] || 0) + 1;
     const stateBadges = Object.entries(states).map(([s, c]) => {
         const color = s === 'running' ? 'green' : (s === 'stopped' ? 'red' : (s === 'pending' ? 'yellow' : 'gray'));
         return `<span class="badge badge-${color}">${s} ${c}</span>`;
     }).join('');
-    const extBadge = externalCount > 0
-        ? `<span class="badge" style="background:#c0392b;color:#fff" title="非本程序创建">🌐 外部 ${externalCount}</span>`
-        : '';
     summary.innerHTML = `
         <div class="stat-card" style="padding:10px 14px;flex:0 0 auto"><div class="label">实例总数</div><div class="value blue" style="font-size:20px">${list.length}</div></div>
-        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${stateBadges}${extBadge}</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">${stateBadges}</div>
     `;
 
     if (!list.length) {
@@ -1288,19 +1278,14 @@ function _renderAcctInstanceCard(i) {
     const escIid = (i.instance_id || '').replace(/'/g, "\\'");
     const escRegion = (i.region || '').replace(/'/g, "\\'");
 
-    // 边框颜色突出: 外部实例描红, 让用户一眼能挑出来
-    const cardBorder = i.managed ? '' : 'border-left:3px solid #c0392b;';
     return `
-    <div class="acc-card" style="margin-bottom:12px;${cardBorder}">
+    <div class="acc-card" style="margin-bottom:12px">
         <div class="acc-card-header">
             <div class="acc-card-left" style="flex-wrap:wrap">
                 <span class="acc-num">🖥</span>
                 <span class="acc-name" title="${name}"><b>${name.length > 32 ? name.substring(0,32)+'...' : name}</b></span>
                 <span class="badge badge-${stateColor}">${i.state}</span>
                 <span class="acc-flag">${i.region}</span>
-                ${i.managed
-                    ? '<span class="badge badge-blue" style="font-size:10px" title="本程序创建, 带 ManagedBy 标签">✓ 本平台</span>'
-                    : '<span class="badge" style="font-size:10px;background:#c0392b;color:#fff" title="非本程序创建 (AWS 控制台或其他工具创建), 操作走 AWS Direct API">🌐 外部</span>'}
                 <span class="acc-age" title="${launchStr}">⏱ ${uptime}</span>
             </div>
         </div>
@@ -1326,10 +1311,10 @@ function _renderAcctInstanceCard(i) {
             <div><span style="color:var(--text2)">AMI</span> <code style="font-size:11px">${i.image_id || '-'}</code></div>
         </div>
         <div class="acc-card-footer" style="flex-wrap:wrap">
-            ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="acctInstAction('${escIid}','${escRegion}','start')" title="${i.managed ? '' : '走 AWS Direct API'}">▶ 启动</button>` : ''}
-            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','stop')" title="${i.managed ? '' : '走 AWS Direct API'}">⏹ 停止</button>` : ''}
-            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','reboot')" title="${i.managed ? '' : '走 AWS Direct API'}">🔄 重启</button>` : ''}
-            ${i.state !== 'terminated' ? `<button class="btn btn-sm btn-danger" onclick="acctInstAction('${escIid}','${escRegion}','terminate')" title="${i.managed ? '终止 (不可恢复)' : '终止外部实例 (走 AWS Direct API, 不可恢复)'}">🗑 终止${i.managed ? '' : '(外部)'}</button>` : ''}
+            ${i.state === 'stopped' ? `<button class="btn btn-sm btn-primary" onclick="acctInstAction('${escIid}','${escRegion}','start')">▶ 启动</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','stop')">⏹ 停止</button>` : ''}
+            ${i.state === 'running' ? `<button class="btn btn-sm btn-secondary" onclick="acctInstAction('${escIid}','${escRegion}','reboot')">🔄 重启</button>` : ''}
+            ${i.state !== 'terminated' ? `<button class="btn btn-sm btn-danger" onclick="acctInstAction('${escIid}','${escRegion}','terminate')" title="终止 (不可恢复)">🗑 终止</button>` : ''}
             <button class="btn btn-sm btn-secondary" onclick="copyToClipboard('${escIid}', this)" title="复制实例 ID">📋 ID</button>
             ${publicIp !== '-' ? `<button class="btn btn-sm btn-secondary" onclick="copyToClipboard('ssh -i depin-key-${escRegion}.pem ubuntu@${publicIp}', this)" title="复制 SSH 命令">SSH</button>` : ''}
         </div>
@@ -2252,9 +2237,32 @@ async function launchInstance(e) {
     finally { hideLoading(); }
 }
 async function syncInstance(id) { showLoading('正在同步实例...'); try { const res = await api(`/instances/${id}/sync`, { method: 'POST' }); toast(`已同步: ${res.state}`); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
-async function startInstance(id) { showLoading('正在启动实例...'); try { await api(`/instances/${id}/start`, { method: 'POST' }); toast('启动指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
-async function stopInstance(id) { showLoading('正在停止实例...'); try { await api(`/instances/${id}/stop`, { method: 'POST' }); toast('停止指令已发送'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
-async function terminateInstance(id) { if (!confirm('确定终止？')) return; showLoading('正在终止实例...'); try { await api(`/instances/${id}/terminate`, { method: 'POST' }); toast('已终止'); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
+// 统一所有 EC2 操作走 direct API (account_id + AWS instance_id + region):
+// - 不分本平台/外部, 同一套逻辑
+// - 即使本地 DB 记录脏了也能操作真实的 AWS 实例
+// 入参 id 是本地 DB 主键, 从 instancesCache 拿 account_id / instance_id / region
+async function _instanceAction(dbId, action) {
+    const i = (instancesCache || []).find(x => x.id === dbId);
+    if (!i) { toast('找不到实例信息, 请刷新列表', 'error'); return; }
+    if (!i.instance_id) { toast(`实例 #${dbId} 在 AWS 上的 ID 缺失, 无法操作`, 'error'); return; }
+    const labels = { start: '启动', stop: '停止', reboot: '重启', terminate: '终止' };
+    if (action === 'terminate' && !confirm(`⚠️ 确定终止 ${i.instance_id} (${i.region})？此操作不可恢复！`)) return;
+    showLoading(`正在${labels[action]}实例...`);
+    try {
+        await api(`/instances/direct/${action}`, {
+            method: 'POST',
+            body: JSON.stringify({ account_id: i.account_id, instance_id: i.instance_id, region: i.region }),
+        });
+        toast(`${labels[action]}指令已发送`);
+        setTimeout(loadInstances, 2000);
+    } catch (e) {
+        toast(`${labels[action]}失败: ${e.message}`, 'error');
+    } finally { hideLoading(); }
+}
+async function startInstance(id) { return _instanceAction(id, 'start'); }
+async function stopInstance(id) { return _instanceAction(id, 'stop'); }
+async function rebootInstance(id) { return _instanceAction(id, 'reboot'); }
+async function terminateInstance(id) { return _instanceAction(id, 'terminate'); }
 async function syncAllInstances() { showLoading('正在同步所有实例...'); try { const res = await api('/instances/sync-all', { method: 'POST' }); toast(`已同步 ${res.synced} 个`); loadInstances(); } catch (e) { toast(e.message, 'error'); } finally { hideLoading(); } }
 
 // 外部 EC2 操作 (start/stop/reboot/terminate 不在本地 DB 的实例)
