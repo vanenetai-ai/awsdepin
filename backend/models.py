@@ -103,6 +103,13 @@ class Proxy(Base):
     last_used_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # 健康追踪 (后台定时检查 + 业务调用上报)
+    fail_count = Column(Integer, default=0)        # 连续失败次数, 达到阈值会被 quarantine
+    last_check_at = Column(DateTime)               # 上次健康检查时间
+    last_check_ok = Column(Boolean)                # 上次健康检查是否成功
+    last_check_ip = Column(String(50))             # 上次测出的出口 IP
+    last_error = Column(Text)                      # 上次失败的错误信息
+
     user = relationship("User", back_populates="proxies")
 
 

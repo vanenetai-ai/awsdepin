@@ -115,7 +115,7 @@
                     <thead>
                         <tr>
                             <th>ID</th><th>协议</th><th>地址</th><th>端口</th>
-                            <th>用户名</th><th>状态</th><th>最后使用</th><th>操作</th>
+                            <th>用户名</th><th>状态</th><th>健康</th><th>出口 IP</th><th>失败次数</th><th>操作</th>
                         </tr>
                     </thead>
                     <tbody></tbody>
@@ -239,18 +239,21 @@
                 <div class="form-row">
                     <div class="form-group" style="flex:1">
                         <label>磁盘大小 (GiB)</label>
-                        <input type="number" id="launch-volume-size" value="20" min="8" max="16384" placeholder="20">
+                        <input type="number" id="launch-volume-size" value="20" min="1" max="65536" placeholder="20">
+                        <div style="font-size:11px;color:var(--text2);margin-top:3px">
+                            gp3 / io2 上限 65536 GiB (64 TiB); gp2 / io1 / st1 / sc1 上限 16384 GiB; standard 上限 1024 GiB
+                        </div>
                     </div>
                     <div class="form-group" style="flex:1">
                         <label>磁盘类型</label>
                         <select id="launch-volume-type">
-                            <option value="gp3">gp3 (通用SSD, 推荐)</option>
-                            <option value="gp2">gp2 (通用SSD)</option>
-                            <option value="io1">io1 (高性能SSD)</option>
-                            <option value="io2">io2 (高性能SSD)</option>
-                            <option value="st1">st1 (吞吐优化HDD)</option>
-                            <option value="sc1">sc1 (冷存储HDD)</option>
-                            <option value="standard">standard (磁介质)</option>
+                            <option value="gp3">gp3 (通用SSD, 推荐, 最大 64 TiB)</option>
+                            <option value="gp2">gp2 (通用SSD, 最大 16 TiB)</option>
+                            <option value="io1">io1 (高性能SSD, 最大 16 TiB)</option>
+                            <option value="io2">io2 (高性能SSD, 最大 64 TiB, 自动 Block Express)</option>
+                            <option value="st1">st1 (吞吐优化HDD, 最大 16 TiB)</option>
+                            <option value="sc1">sc1 (冷存储HDD, 最大 16 TiB)</option>
+                            <option value="standard">standard (磁介质, 最大 1 TiB)</option>
                         </select>
                     </div>
                 </div>
@@ -673,7 +676,10 @@
                     </div>
                     <div class="form-group" style="flex:1">
                         <label>磁盘大小 (GiB)</label>
-                        <input type="number" id="ec2c-volume-size" value="20" min="8" max="16384">
+                        <input type="number" id="ec2c-volume-size" value="20" min="1" max="65536">
+                        <div style="font-size:11px;color:var(--text2);margin-top:3px">
+                            gp3 / io2 最大 65536 (64 TiB); 其他类型 ≤ 16384
+                        </div>
                     </div>
                 </div>
 
@@ -681,12 +687,12 @@
                     <div class="form-group" style="flex:1">
                         <label>磁盘类型</label>
                         <select id="ec2c-volume-type">
-                            <option value="gp3">gp3 (通用 SSD, 推荐)</option>
-                            <option value="gp2">gp2 (通用 SSD)</option>
-                            <option value="io1">io1 (高性能)</option>
-                            <option value="io2">io2 (高性能)</option>
-                            <option value="st1">st1 (吞吐 HDD)</option>
-                            <option value="sc1">sc1 (冷存 HDD)</option>
+                            <option value="gp3">gp3 (通用 SSD, 推荐, ≤64 TiB)</option>
+                            <option value="gp2">gp2 (通用 SSD, ≤16 TiB)</option>
+                            <option value="io1">io1 (高性能, ≤16 TiB)</option>
+                            <option value="io2">io2 (高性能, ≤64 TiB)</option>
+                            <option value="st1">st1 (吞吐 HDD, ≤16 TiB)</option>
+                            <option value="sc1">sc1 (冷存 HDD, ≤16 TiB)</option>
                         </select>
                     </div>
                     <div class="form-group" style="flex:1;display:flex;flex-direction:column;gap:4px;justify-content:flex-end;padding-bottom:6px">

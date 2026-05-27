@@ -14,7 +14,7 @@ from database import get_db, init_db, SessionLocal
 from models import User, AwsAccount, Instance, Proxy, DepinProject, DepinTask
 from aws_manager import AwsManager, ProxyRequiredError
 from lightsail_manager import LightsailManager, LIGHTSAIL_REGIONS
-from proxy_manager import ProxyManager
+from proxy_manager import ProxyManager, PYSOCKS_AVAILABLE
 from depin_manager import DepinManager
 from auth import get_current_user, create_token, get_or_create_user, get_user_by_token
 from telegram_bot import start_bot, stop_bot, get_bot_token, set_bot_token, is_bot_configured, verify_bot_token, restart_bot
@@ -22,8 +22,39 @@ from telegram_bot import start_bot, stop_bot, get_bot_token, set_bot_token, is_b
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 线程池用于并发执行 AWS 等阻塞操作
-executor = ThreadPoolExecutor(max_workers=50)
+# P4 修复: 线程池 / 数据库连接池 / 批量并发 三者必须对齐, 否则会 QueuePool overflow.
+# database.py: pool_size=30, max_overflow=20 (合计 50 个 connection)
+# executor: 30 worker  ← 主力并发
+# BATCH_SEMAPHORE: 20  ← batch 端点 (留 10 给单点请求, 避免饿死)
+executor = ThreadPoolExecutor(max_workers=30)
+BATCH_SEMAPHORE = asyncio.Semaphore(20)
+
+
+async def _batch_run(coros: list):
+    """对一组协程做带 Semaphore 限并发的 asyncio.gather, 防止打爆数据库/代理."""
+    async def _bounded(c):
+        async with BATCH_SEMAPHORE:
+            return await c
+    return await asyncio.gather(*[_bounded(c) for c in coros])
+
+
+# 后台调度器: 代理健康检查 (P5 修复)
+_scheduler = None
+
+
+def _proxy_health_check_job():
+    """每 10 分钟跑一次: 遍历所有 active 代理, ping api.ipify.org 写健康状态."""
+    s = SessionLocal()
+    try:
+        proxies = s.query(Proxy).filter(Proxy.is_active == True).all()  # noqa: E712
+        for p in proxies:
+            ok, ip, err = ProxyManager.check_one(p, timeout=10)
+            ProxyManager.report_health_check(p.id, ok, ip, err)
+        logger.info(f"[proxy-health] checked {len(proxies)} proxies")
+    except Exception as e:
+        logger.error(f"[proxy-health] job failed: {e}")
+    finally:
+        s.close()
 
 
 @asynccontextmanager
@@ -36,7 +67,31 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     await start_bot()
+
+    # P5: 启动代理健康检查后台 job
+    global _scheduler
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        _scheduler = AsyncIOScheduler()
+        _scheduler.add_job(_proxy_health_check_job, "interval", minutes=10, id="proxy-health", coalesce=True, max_instances=1)
+        _scheduler.start()
+        logger.info("Proxy health check scheduler started (every 10 min)")
+    except Exception as e:
+        logger.error(f"Failed to start proxy health scheduler: {e}")
+
+    if not PYSOCKS_AVAILABLE:
+        logger.warning(
+            "=" * 60 + "\n"
+            "WARNING: PySocks 未安装! socks5 代理会被拒用 (避免静默 IP 泄漏).\n"
+            "如果你有 socks5 代理 (例如 IPRoyal), 请执行:\n"
+            "    pip install PySocks==1.7.1\n"
+            "然后重启服务.\n"
+            + "=" * 60
+        )
+
     yield
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
     await stop_bot()
 
 app = FastAPI(title="AWS DePIN Manager", version="2.0.0", lifespan=lifespan)
@@ -124,6 +179,7 @@ class BatchAccountCreate(BaseModel):
 
 class BatchProxyCreate(BaseModel):
     text: str  # 多行文本，每行一个代理
+    default_protocol: Optional[str] = "auto"   # "auto" / "http" / "https" / "socks5"
 
 
 # ==================== Auth ====================
@@ -334,7 +390,7 @@ async def batch_create_accounts(data: BatchAccountCreate, user: User = Depends(g
         except Exception as e:
             errors.append({"line": idx+1, "error": str(e)})
 
-    await asyncio.gather(*[_verify_one(idx, name, aid) for idx, name, aid in accounts_to_verify])
+    await _batch_run([_verify_one(idx, name, aid) for idx, name, aid in accounts_to_verify])
     return {"created": created, "errors": errors}
 
 
@@ -561,7 +617,7 @@ async def detect_all_accounts(user: User = Depends(get_current_user), db: Sessio
         except Exception as e:
             errors.append({"id": acc.id, "error": str(e)[:100]})
 
-    await asyncio.gather(*[_detect_one(a) for a in accounts])
+    await _batch_run([_detect_one(a) for a in accounts])
     return {"detected": len(results), "errors": len(errors), "results": results}
 
 @app.get("/api/accounts/groups")
@@ -629,7 +685,12 @@ async def launch_instance(data: LaunchRequest, user: User = Depends(get_current_
     def _launch():
         mgr = AwsManager(account, db)
         return mgr.launch_instance_legacy(region=data.region, instance_type=data.instance_type, volume_size=data.volume_size, volume_type=data.volume_type)
-    instance = await loop.run_in_executor(executor, _launch)
+    try:
+        instance = await loop.run_in_executor(executor, _launch)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"创建实例失败: {str(e)[:300]}")
     return {
         "id": instance.id, "instance_id": instance.instance_id,
         "region": instance.region, "state": instance.state,
@@ -659,8 +720,7 @@ async def batch_launch(data: BatchLaunchRequest, user: User = Depends(get_curren
         except Exception as e:
             errors.append({"index": idx, "error": str(e)})
 
-    tasks = [_launch_one(i) for i in range(data.count)]
-    await asyncio.gather(*tasks)
+    await _batch_run([_launch_one(i) for i in range(data.count)])
     return {"launched": results, "errors": errors}
 
 
@@ -717,6 +777,9 @@ async def launch_advanced(
 
     try:
         result = await loop.run_in_executor(executor, _do)
+    except ValueError as e:
+        # 我们自己抛的友好校验错误 (如磁盘大小超限), 原样返回
+        raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(400, f"创建 EC2 实例失败: {str(e)[:300]}")
     return result
@@ -806,7 +869,7 @@ async def sync_all_instances(user: User = Depends(get_current_user), db: Session
         except Exception as e:
             logger.error(f"Sync {inst.instance_id} failed: {e}")
 
-    await asyncio.gather(*[_sync_one(i) for i in instances])
+    await _batch_run([_sync_one(i) for i in instances])
     return {"synced": len(instances)}
 
 @app.post("/api/instances/batch-start")
@@ -832,7 +895,7 @@ async def batch_start(instance_ids: list[int], user: User = Depends(get_current_
         except Exception as e:
             errors.append({"id": iid, "error": str(e)})
 
-    await asyncio.gather(*[_start_one(i) for i in instance_ids])
+    await _batch_run([_start_one(i) for i in instance_ids])
     return {"started": results, "errors": errors}
 
 @app.post("/api/instances/batch-stop")
@@ -858,7 +921,7 @@ async def batch_stop(instance_ids: list[int], user: User = Depends(get_current_u
         except Exception as e:
             errors.append({"id": iid, "error": str(e)})
 
-    await asyncio.gather(*[_stop_one(i) for i in instance_ids])
+    await _batch_run([_stop_one(i) for i in instance_ids])
     return {"stopped": results, "errors": errors}
 
 @app.delete("/api/instances/{instance_id}")
@@ -1397,12 +1460,21 @@ async def lightsail_open_ports(
 
 @app.get("/api/proxies")
 def list_proxies(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    proxies = db.query(Proxy).filter(Proxy.user_id == user.id).all()
+    proxies = db.query(Proxy).filter(Proxy.user_id == user.id).order_by(Proxy.id).all()
+    fail_threshold = ProxyManager.FAIL_THRESHOLD
     return [
         {
             "id": p.id, "protocol": p.protocol, "host": p.host, "port": p.port,
             "username": p.username or "", "is_active": p.is_active,
             "last_used_at": str(p.last_used_at) if p.last_used_at else None,
+            # 新增: 健康追踪字段 (P5)
+            "fail_count": p.fail_count or 0,
+            "last_check_at": str(p.last_check_at) if p.last_check_at else None,
+            "last_check_ok": p.last_check_ok,
+            "last_check_ip": p.last_check_ip or "",
+            "last_error": (p.last_error or "")[:200],
+            "quarantined": (p.fail_count or 0) >= fail_threshold,
+            "fail_threshold": fail_threshold,
         }
         for p in proxies
     ]
@@ -1425,33 +1497,41 @@ def batch_create_proxies(proxies: list[ProxyCreate], user: User = Depends(get_cu
     db.commit()
     return {"created": len(created)}
 
-def _smart_parse_proxy(line: str) -> dict:
+def _smart_parse_proxy(line: str, default_protocol: str = "auto") -> dict:
     """智能解析代理字符串，支持各种格式:
     host:port
-    host:port:user:pass
+    host:port:user:pass               ← IPRoyal / 大多数住宅代理常用格式
     user:pass@host:port
     protocol://host:port
     protocol://user:pass@host:port
-    protocol://host:port:user:pass
     host port (空格分隔)
-    protocol host port user pass (空格分隔)
+
+    default_protocol:
+        "auto" — 根据端口猜 (1080/1081/7890/7891 → socks5; 443/8443 → https; 其他 → http)
+        "http" / "https" / "socks5" — 强制指定 (批量粘贴时用户已选好类型)
     """
     line = line.strip()
     if not line:
         raise ValueError("空行")
 
-    protocol, host, port, username, password = "http", "", 0, None, None
+    # 起始协议: 优先 URL 前缀, 否则用 default_protocol (auto 留到最后猜)
+    protocol, host, port, username, password = None, "", 0, None, None
+    explicit_protocol = False
 
-    # 检测协议前缀
     if "://" in line:
         proto, rest = line.split("://", 1)
         protocol = proto.lower().replace("socks5h", "socks5")
         if protocol not in ("http", "https", "socks5", "socks4"):
             protocol = "http"
+        explicit_protocol = True
     else:
         rest = line
-        # 根据常见端口猜测协议
-        # 先解析完再判断
+        # default_protocol 不是 auto 就直接采用 (用户在前端已显式选了)
+        if default_protocol in ("http", "https", "socks5"):
+            protocol = default_protocol
+            explicit_protocol = True
+        else:
+            protocol = None   # 留到最后端口猜测阶段
 
     # 处理 user:pass@host:port 格式
     if "@" in rest:
@@ -1470,50 +1550,67 @@ def _smart_parse_proxy(line: str) -> dict:
             port = int(parts[1])
             if len(parts) >= 4 and not username:
                 username, password = parts[2], parts[3]
-            return {"protocol": protocol, "host": host, "port": port, "username": username, "password": password}
+            return _finalize_parsed(protocol, host, port, username, password, explicit_protocol)
 
     # 用冒号分隔
     parts = rest.split(":")
     if len(parts) == 2:
         host, port = parts[0], int(parts[1])
     elif len(parts) == 3:
-        # 可能是 host:port:user 或 ip:port:something
         host, port = parts[0], int(parts[1])
         username = parts[2]
     elif len(parts) == 4:
         host, port = parts[0], int(parts[1])
         username, password = parts[2], parts[3]
     elif len(parts) >= 5:
-        # host:port:user:pass:protocol 或其他
         host, port = parts[0], int(parts[1])
         username, password = parts[2], parts[3]
         if parts[4].lower() in ("http", "https", "socks5", "socks4"):
             protocol = parts[4].lower()
+            explicit_protocol = True
     else:
         raise ValueError(f"无法解析: {line}")
 
     if not host or port <= 0:
         raise ValueError(f"无效的地址或端口: {line}")
 
-    # 根据端口猜测协议 (如果没有显式指定)
-    if "://" not in line:
+    return _finalize_parsed(protocol, host, port, username, password, explicit_protocol)
+
+
+def _finalize_parsed(protocol, host, port, username, password, explicit):
+    """确定最终协议: 如果没有显式指定, 根据端口猜.
+
+    新策略 (修复原 bug): IPRoyal / SmartProxy / 大多数住宅代理用 4 段格式 host:port:user:pass,
+    端口通常是 4 位数 (12321 / 7777 / 10001 等). 原代码默认 http → boto3 当 HTTP 代理用 →
+    根本连不上 (socks5 端口拒 HTTP 报文). 改进: 有 user:pass 且端口非常见 HTTP 端口时, 倾向 socks5.
+    """
+    if not explicit and not protocol:
+        # 端口白名单
         if port in (1080, 1081, 7890, 7891):
             protocol = "socks5"
         elif port in (443, 8443):
             protocol = "https"
-
-    return {"protocol": protocol, "host": host, "port": port, "username": username, "password": password}
+        elif port in (80, 8080, 3128, 8000, 8888, 8118):
+            protocol = "http"
+        elif username and password and port > 10000:
+            # 启发式: 大端口+带认证 → 大概率是住宅代理 (IPRoyal/SmartProxy/Bright Data 等)
+            # 默认 socks5 比默认 http 安全得多 (走错协议会连不上, 但不会暴露 IP)
+            protocol = "socks5"
+        else:
+            protocol = "http"
+    return {"protocol": protocol or "http", "host": host, "port": port, "username": username, "password": password}
 
 
 @app.post("/api/proxies/batch-text")
 def batch_create_proxies_text(data: BatchProxyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """批量添加代理 - 智能识别各种格式"""
+    """批量添加代理 - 智能识别各种格式. 可在 default_protocol 显式指定协议."""
     lines = [l.strip() for l in data.text.strip().split('\n') if l.strip()]
     created, errors = [], []
+    default_protocol = (getattr(data, "default_protocol", None) or "auto").lower()
 
     for idx, line in enumerate(lines):
         try:
-            parsed = _smart_parse_proxy(line)
+            parsed = _smart_parse_proxy(line, default_protocol=default_protocol)
             proxy = Proxy(user_id=user.id, **parsed)
             db.add(proxy)
             created.append({"host": parsed["host"], "port": parsed["port"], "protocol": parsed["protocol"]})
@@ -1527,52 +1624,43 @@ def batch_create_proxies_text(data: BatchProxyCreate, user: User = Depends(get_c
 
 @app.post("/api/proxies/{proxy_id}/test")
 async def test_proxy(proxy_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """测试代理是否可用，返回出口IP"""
+    """测试代理是否可用，返回出口IP. socks5 用 socks5h:// (DNS 走代理, 防泄漏).
+    成功/失败会更新 last_check_at / last_check_ok / last_check_ip / last_error / fail_count.
+    """
     proxy = _get_user_proxy(db, user, proxy_id)
+    if proxy.protocol == "socks5" and not PYSOCKS_AVAILABLE:
+        return {"ok": False, "error": "PySocks 未安装, socks5 代理无法使用 (pip install PySocks==1.7.1)", "proxy": f"{proxy.host}:{proxy.port}"}
     loop = asyncio.get_event_loop()
 
     def _test():
-        import httpx as hx
-        auth = ""
-        if proxy.username and proxy.password:
-            auth = f"{proxy.username}:{proxy.password}@"
-        proxy_url = f"{proxy.protocol}://{auth}{proxy.host}:{proxy.port}"
-        try:
-            with hx.Client(proxies={"http://": proxy_url, "https://": proxy_url}, timeout=15) as client:
-                resp = client.get("https://api.ipify.org?format=json")
-                ip = resp.json().get("ip", "unknown")
-                return {"ok": True, "ip": ip, "proxy": f"{proxy.host}:{proxy.port}"}
-        except Exception as e:
-            return {"ok": False, "error": str(e), "proxy": f"{proxy.host}:{proxy.port}"}
+        ok, ip, err = ProxyManager.check_one(proxy, timeout=15)
+        ProxyManager.report_health_check(proxy.id, ok, ip, err)
+        if ok:
+            return {"ok": True, "ip": ip, "proxy": f"{proxy.host}:{proxy.port}"}
+        return {"ok": False, "error": err, "proxy": f"{proxy.host}:{proxy.port}"}
 
     return await loop.run_in_executor(executor, _test)
 
 
 @app.post("/api/proxies/test-all")
 async def test_all_proxies(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """批量测试所有代理"""
+    """批量测试所有代理. 用 Semaphore 限并发, 避免打爆代理出口."""
     proxies = db.query(Proxy).filter(Proxy.user_id == user.id, Proxy.is_active == True).all()
     loop = asyncio.get_event_loop()
     results = []
 
     async def _test_one(p):
+        if p.protocol == "socks5" and not PYSOCKS_AVAILABLE:
+            results.append({"id": p.id, "ok": False, "error": "PySocks 未安装"})
+            return
         def do():
-            import httpx as hx
-            auth = ""
-            if p.username and p.password:
-                auth = f"{p.username}:{p.password}@"
-            proxy_url = f"{p.protocol}://{auth}{p.host}:{p.port}"
-            try:
-                with hx.Client(proxies={"http://": proxy_url, "https://": proxy_url}, timeout=10) as client:
-                    resp = client.get("https://api.ipify.org?format=json")
-                    ip = resp.json().get("ip", "unknown")
-                    return {"id": p.id, "ok": True, "ip": ip}
-            except Exception as e:
-                return {"id": p.id, "ok": False, "error": str(e)[:80]}
+            ok, ip, err = ProxyManager.check_one(p, timeout=10)
+            ProxyManager.report_health_check(p.id, ok, ip, err)
+            return {"id": p.id, "ok": ok, "ip": ip} if ok else {"id": p.id, "ok": False, "error": err[:80]}
         r = await loop.run_in_executor(executor, do)
         results.append(r)
 
-    await asyncio.gather(*[_test_one(p) for p in proxies])
+    await _batch_run([_test_one(p) for p in proxies])
     return {"results": results, "total": len(proxies), "ok": sum(1 for r in results if r["ok"])}
 
 
@@ -1687,7 +1775,7 @@ async def batch_deploy(data: BatchDeployRequest, user: User = Depends(get_curren
         except Exception as e:
             errors.append({"instance_id": iid, "error": str(e)})
 
-    await asyncio.gather(*[_deploy_one(i) for i in data.instance_ids])
+    await _batch_run([_deploy_one(i) for i in data.instance_ids])
     return {"deployed": results, "errors": errors}
 
 @app.delete("/api/tasks/{task_id}")

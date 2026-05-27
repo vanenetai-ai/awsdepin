@@ -2192,14 +2192,39 @@ async function syncAllInstances() { showLoading('正在同步所有实例...'); 
 async function loadProxies() {
     try {
         const list = await api('/proxies');
-        document.querySelector('#proxies-table tbody').innerHTML = list.map(p => `<tr>
-            <td>${p.id}</td><td>${p.protocol.toUpperCase()}</td><td>${p.host}</td><td>${p.port}</td><td>${p.username || '-'}</td>
-            <td><span class="badge ${p.is_active ? 'badge-green' : 'badge-red'}" style="cursor:pointer" onclick="toggleProxy(${p.id})">${p.is_active ? '活跃' : '禁用'}</span></td>
-            <td id="proxy-ip-${p.id}">${p.last_used_at || '-'}</td>
-            <td class="action-btns">
-                <button class="btn btn-sm btn-secondary" onclick="testProxy(${p.id})">🔍 测试</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteProxy(${p.id})">删除</button>
-            </td></tr>`).join('');
+        document.querySelector('#proxies-table tbody').innerHTML = list.map(p => {
+            // 健康标识: 隔离 → 红; 上次 ok → 绿; 上次失败但未隔离 → 黄; 未检查 → 灰
+            let healthHtml;
+            if (p.quarantined) {
+                healthHtml = `<span class="badge badge-red" title="${(p.last_error || '连续失败').replace(/"/g,'&quot;')}">🚫 隔离</span>`;
+            } else if (p.last_check_ok === true) {
+                healthHtml = `<span class="badge badge-green">✓ 健康</span>`;
+            } else if (p.last_check_ok === false) {
+                healthHtml = `<span class="badge badge-yellow" title="${(p.last_error || '').replace(/"/g,'&quot;')}">⚠ 失败</span>`;
+            } else {
+                healthHtml = `<span class="badge" style="background:#444;color:#aaa">未测</span>`;
+            }
+            const ipHtml = p.last_check_ip
+                ? `<span class="badge badge-green">${p.last_check_ip}</span>`
+                : '-';
+            const failHtml = (p.fail_count || 0) > 0
+                ? `<span style="color:${p.quarantined ? 'var(--red,#e57373)' : 'var(--yellow,#f0c674)'}">${p.fail_count}/${p.fail_threshold}</span>`
+                : '0';
+            const protoTag = p.protocol.toUpperCase() + (p.protocol === 'socks5'
+                ? '<span title="实际用 socks5h:// 走代理 DNS, 防泄漏" style="color:#7fd17f;font-size:10px;margin-left:3px">h</span>'
+                : '');
+            return `<tr>
+                <td>${p.id}</td><td>${protoTag}</td><td>${p.host}</td><td>${p.port}</td>
+                <td>${p.username || '-'}</td>
+                <td><span class="badge ${p.is_active ? 'badge-green' : 'badge-red'}" style="cursor:pointer" onclick="toggleProxy(${p.id})">${p.is_active ? '活跃' : '禁用'}</span></td>
+                <td>${healthHtml}</td>
+                <td id="proxy-ip-${p.id}">${ipHtml}</td>
+                <td>${failHtml}</td>
+                <td class="action-btns">
+                    <button class="btn btn-sm btn-secondary" onclick="testProxy(${p.id})">🔍 测试</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteProxy(${p.id})">删除</button>
+                </td></tr>`;
+        }).join('');
     } catch (e) { toast(e.message, 'error'); }
 }
 async function testProxy(id) {

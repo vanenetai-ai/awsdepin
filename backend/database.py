@@ -9,7 +9,17 @@ if DATABASE_URL.startswith("sqlite"):
     os.makedirs("data", exist_ok=True)
     connect_args = {"check_same_thread": False}
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_size=20, max_overflow=10)
+# 连接池: 与 main.py 的 ThreadPoolExecutor(max_workers=30) + Semaphore(20) 对齐.
+# pool_size + max_overflow >= worker 上限, 否则批量并发时会 QueuePool overflow.
+# pool_pre_ping 在拿连接前先发 SELECT 1 探活, 防止 PG 服务端踢掉空闲连接后取到死连接.
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_size=30,
+    max_overflow=20,
+    pool_pre_ping=True,
+    pool_recycle=1800,  # 30 分钟回收一次, 避免代理/防火墙 idle timeout
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -51,6 +61,12 @@ def _migrate_db():
         ("aws_accounts", "status_reason", "TEXT DEFAULT ''"),
         ("aws_accounts", "status_checked_at", "TIMESTAMP"),
         ("instances", "private_key", "TEXT"),
+        # Proxy 健康追踪 (新增于 P5 修复)
+        ("proxies", "fail_count", "INTEGER DEFAULT 0"),
+        ("proxies", "last_check_at", "TIMESTAMP"),
+        ("proxies", "last_check_ok", "BOOLEAN"),
+        ("proxies", "last_check_ip", "VARCHAR(50)"),
+        ("proxies", "last_error", "TEXT"),
     ]
 
     for table, column, col_type in new_columns:

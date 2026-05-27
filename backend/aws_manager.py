@@ -45,6 +45,39 @@ COUNTRY_FLAGS = {
     "DK": "🇩🇰", "GR": "🇬🇷", "UA": "🇺🇦", "BH": "🇧🇭",
 }
 
+# EBS 卷类型最大容量 (GiB) - 来自 AWS 官方文档 (2024+)
+# gp3 / io2 已提到 64 TiB; io2 在 >16 TiB 或 IOPS>64000 时 AWS 自动启用 Block Express
+EBS_MAX_VOLUME_GIB = {
+    "gp3": 65536,
+    "io2": 65536,
+    "gp2": 16384,
+    "io1": 16384,
+    "st1": 16384,
+    "sc1": 16384,
+    "standard": 1024,
+}
+EBS_MIN_VOLUME_GIB = {
+    "gp3": 1, "gp2": 1, "io1": 4, "io2": 4,
+    "st1": 125, "sc1": 125, "standard": 1,
+}
+
+
+def validate_volume_size(volume_size: int, volume_type: str) -> None:
+    """按 volume_type 校验磁盘大小, 不满足直接抛 ValueError (前端会显示中文消息)"""
+    vt = (volume_type or "gp3").lower()
+    if vt not in EBS_MAX_VOLUME_GIB:
+        raise ValueError(f"不支持的磁盘类型: {volume_type} (支持: {', '.join(EBS_MAX_VOLUME_GIB.keys())})")
+    max_gib = EBS_MAX_VOLUME_GIB[vt]
+    min_gib = EBS_MIN_VOLUME_GIB.get(vt, 1)
+    if volume_size < min_gib:
+        raise ValueError(f"{vt} 磁盘最小 {min_gib} GiB, 当前 {volume_size}")
+    if volume_size > max_gib:
+        raise ValueError(
+            f"{vt} 磁盘最大 {max_gib} GiB ({max_gib // 1024} TiB), 当前 {volume_size}. "
+            f"如需更大请选 gp3 或 io2 (上限 65536 GiB / 64 TiB)"
+        )
+
+
 # 默认安全组配置 - 开放 SSH
 DEFAULT_SG_NAME = "depin-sg"
 DEFAULT_SG_DESC = "Security group for DePIN nodes"
@@ -104,19 +137,25 @@ class AwsManager:
         self.account = account
         self.db = db
         self.proxy_config = None
+        self.proxy_id: int = 0   # 当前选中的代理 ID, 业务层可用于上报 success/failure
         self._client_cache = {}
         self._resource_cache = {}
         self.use_proxy = use_proxy
         self.require_proxy = require_proxy
         if use_proxy:
-            # 关键: 按账号所属用户隔离代理, 避免 A 用户用到 B 用户的代理
+            # P1 修复: 按账号 id hash 稳定选代理 (同账号永远走同代理, 防 AWS 风控关联)
+            # P3 修复: ProxyManager 内部用独立 engine connection 写 last_used_at, 不污染 db
             user_id = getattr(account, "user_id", None)
             pm = ProxyManager(db, user_id=user_id)
-            self.proxy_config = pm.get_proxy_for_boto3()
+            p = pm.get_proxy_for_account(account.id) if getattr(account, "id", None) else pm.get_proxy_round_robin()
+            if p:
+                self.proxy_config = {"http": p["url"], "https": p["url"]}
+                self.proxy_id = p["id"]
             if not self.proxy_config and require_proxy:
                 raise ProxyRequiredError(
-                    "代理池为空: 该账号所属用户没有任何启用中的代理。"
-                    "请先到「代理管理」页面添加可用代理, 否则所有 AWS 调用会暴露服务器真实 IP。"
+                    "代理池为空 (或仅有 socks5 但 PySocks 未安装): 该用户没有可用代理。"
+                    "请先到「代理管理」页面添加可用代理 (并确保 pip install PySocks 后重启), "
+                    "否则所有 AWS 调用会暴露服务器真实 IP。"
                 )
 
     def _get_client(self, service: str, region: str = None):
@@ -609,6 +648,9 @@ class AwsManager:
         """
         region = region or self.account.default_region
         count = max(1, min(int(count or 1), 50))   # 限 50 台
+
+        # 0) 磁盘大小按类型校验 (>40000 GiB 等大盘需要 gp3 / io2)
+        validate_volume_size(int(volume_size), volume_type)
 
         # 1) AMI: 优先 ami_id, 然后 ami_key, 最后默认 Ubuntu 22.04
         if not ami_id:

@@ -144,17 +144,23 @@ class LightsailManager:
         self.account = account
         self.db = db
         self.proxy_config = None
+        self.proxy_id: int = 0   # 当前选中的代理 ID
         self._client_cache = {}
         self.use_proxy = use_proxy
         self.require_proxy = require_proxy
         if use_proxy:
+            # P1 修复: 按账号 id hash 稳定选代理 (同账号永远走同代理, 防 AWS 风控关联)
             user_id = getattr(account, "user_id", None)
             pm = ProxyManager(db, user_id=user_id)
-            self.proxy_config = pm.get_proxy_for_boto3()
+            p = pm.get_proxy_for_account(account.id) if getattr(account, "id", None) else pm.get_proxy_round_robin()
+            if p:
+                self.proxy_config = {"http": p["url"], "https": p["url"]}
+                self.proxy_id = p["id"]
             if not self.proxy_config and require_proxy:
                 raise ProxyRequiredError(
-                    "代理池为空: 该账号所属用户没有任何启用中的代理。"
-                    "请先到「代理管理」页面添加可用代理, 否则所有 AWS 调用会暴露服务器真实 IP。"
+                    "代理池为空 (或仅有 socks5 但 PySocks 未安装): 该用户没有可用代理。"
+                    "请先到「代理管理」页面添加可用代理 (并确保 pip install PySocks 后重启), "
+                    "否则所有 AWS 调用会暴露服务器真实 IP。"
                 )
 
     def _get_client(self, region: str = None):
