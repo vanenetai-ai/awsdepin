@@ -1399,17 +1399,6 @@ async function detectAccount(id) {
     finally { hideLoading(); if (btn) btn.classList.remove('loading'); }
 }
 
-async function detectAllAccounts() {
-    const btn = event?.target;
-    if (btn) { btn.classList.add('loading'); btn.textContent = '检测中...'; }
-    showLoading('正在并发检测所有账号，请耐心等待...');
-    try {
-        const res = await api('/accounts/detect-all', { method: 'POST' });
-        toast(`检测完成: ${res.detected} 成功, ${res.errors} 失败`);
-        loadAccounts();
-    } catch (e) { toast(e.message, 'error'); }
-    finally { hideLoading(); if (btn) { btn.classList.remove('loading'); btn.textContent = '🔍 检测全部'; } }
-}
 
 /**
  * ♻️ 重置"假性失效"账号
@@ -1417,10 +1406,10 @@ async function detectAllAccounts() {
  * 当服务器到 AWS 的网络抖动 (中国直连被 GFW reset / 代理掉线 / DNS 超时) 时,
  * 之前的 detect 逻辑会把账号误判为 invalid_credentials, 显示"AK/SK 失效".
  * 这个按钮把所有 status_reason 含网络错误关键字的账号一键重置为 unknown,
- * 然后再点"检测全部"就能恢复原状态.
+ * 然后逐个点账号卡片上的检测就能恢复原状态.
  */
 async function resetInvalidAccounts() {
-    if (!confirm('把所有"因网络问题被误判为失效"的账号重置为未知?\n(只重置因网络错误失败的; 真的 AK/SK 失效不会被重置)\n\n之后建议再点一次"🔍 检测全部"重新核对.')) return;
+    if (!confirm('把所有"因网络问题被误判为失效"的账号重置为未知?\n(只重置因网络错误失败的; 真的 AK/SK 失效不会被重置)\n\n之后建议逐个重新检测核对.')) return;
     const btn = event?.target;
     if (btn) { btn.classList.add('loading'); btn.textContent = '重置中...'; }
     showLoading('正在重置假性失效账号...');
